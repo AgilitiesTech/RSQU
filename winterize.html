@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="rsqu-api" content="">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Onsite RV and trailer winterizing for $499, all included, from South Salt Lake to North Ogden and the back side of the Wasatch, Utah. See the full checklist and book with Mike Stevens.">
 <title>RV Winterizing, $499 Onsite | Mike Stevens RV &amp; Trailer Repair</title>
@@ -172,6 +173,8 @@ input::placeholder,textarea::placeholder{color:#766E66}
 
 <div id="book" style="flex: 1 1 380px; max-width: 520px; min-width: 0; background: #FFFFFF; color: #2E2924; border-radius: 8px; padding: clamp(20px, 2.4vw, 32px)">
 <form id="book-form" novalidate style="display: flex; flex-direction: column; gap: 18px">
+<div aria-hidden="true" style="position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden"><label for="website">Leave this empty</label><input id="website" name="website" type="text" tabindex="-1" autocomplete="off"></div>
+
 <div>
 <h3 style="margin: 0; font-family: 'Barlow Semi Condensed', 'Arial Narrow', Arial, sans-serif; font-weight: 700; font-size: 29px; line-height: 1.15; color: #1F1C17">Book your winterizing</h3>
 <p style="margin: 6px 0 0; font-size: 16px; line-height: 1.45; color: #5C544C">Mike will call or text to confirm a time.</p>
@@ -247,6 +250,7 @@ input::placeholder,textarea::placeholder{color:#766E66}
 </footer>
 
 </div>
+<script src="forms.js"></script>
 <script>
 (function () {
   var form = document.getElementById('book-form');
@@ -261,10 +265,20 @@ input::placeholder,textarea::placeholder{color:#766E66}
       return;
     }
     err.hidden = true;
-    // TODO: deliver the booking (e.g. POST new FormData(form) to a form backend or SMS/email service).
-    document.getElementById('w-sent-phone').textContent = phone;
-    form.hidden = true;
-    document.getElementById('w-sent').hidden = false;
+    var btn = form.querySelector('button[type="submit"]');
+    btn.disabled = true; btn.textContent = 'Sending\u2026';
+    var v = function (id) { return document.getElementById(id).value.trim(); };
+    rsquSubmit({
+      type: 'winterize', website: (form.elements.website || {}).value || '',
+      location: loc, phone: phone, name: v('w-name'), rig: v('w-rig'), preferred_date: v('w-date')
+    }).then(function (how) {
+      btn.disabled = false; btn.textContent = 'Book for $499';
+      var sent = document.getElementById('w-sent');
+      sent.querySelector('h3').textContent = how === 'sent' ? 'Request sent' : 'Tap send in your text app';
+      document.getElementById('w-sent-phone').textContent = phone + (how === 'sent' ? '' : ' once your text goes through. If your text app didn\u2019t open, call or text 801-232-4995');
+      form.hidden = true;
+      sent.hidden = false;
+    });
   });
 })();
 </script>

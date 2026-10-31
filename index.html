@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="rsqu-api" content="">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Mobile emergency RV and trailer repair from South Salt Lake to North Ogden and the back side of the Wasatch, Utah. Onsite RV winterizing for $499. Call or text Mike Stevens at 801-232-4995.">
 <title>Mike Stevens Emergency RV and Trailer Repair</title>
@@ -76,9 +77,11 @@ input::placeholder,textarea::placeholder{color:#766E66}
 <div style="padding: clamp(20px, 2.4vw, 32px)">
 
 <form id="request-form" novalidate style="display: flex; flex-direction: column; gap: 20px">
+<div aria-hidden="true" style="position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden"><label for="website">Leave this empty</label><input id="website" name="website" type="text" tabindex="-1" autocomplete="off"></div>
+
 <div>
 <h2 style="margin: 0; font-family: 'Barlow Semi Condensed', 'Arial Narrow', Arial, sans-serif; font-weight: 700; font-size: 29px; line-height: 1.15; color: #1F1C17">Send Mike the details</h2>
-<p style="margin: 6px 0 0; font-size: 16px; line-height: 1.45; color: #5C544C">He’ll call or text you back. A photo helps him bring the right parts.</p>
+<p style="margin: 6px 0 0; font-size: 16px; line-height: 1.45; color: #5C544C">He’ll call or text you back. A photo helps him bring the right parts. Diagnosis and onsite review is $129, credited toward the repair.</p>
 </div>
 
 <div>
@@ -341,7 +344,7 @@ input::placeholder,textarea::placeholder{color:#766E66}
 </div>
 <div>
 <h3 style="margin: 0 0 8px; font-family: 'Barlow Semi Condensed', 'Arial Narrow', Arial, sans-serif; font-weight: 700; font-size: 22px; line-height: 1.25; color: #1F1C17">How much does an emergency repair cost?</h3>
-<p style="margin: 0; font-size: 17px; line-height: 1.6; color: #4A433C">[Explain how Mike prices call-outs and repairs.]</p>
+<p style="margin: 0; font-size: 17px; line-height: 1.6; color: #4A433C">Mike’s diagnosis and onsite review is $129, paid up front. He finds the problem and gives you a written quote to approve and sign on the spot. If you go ahead with the repair, the $129 is credited toward the job.</p>
 </div>
 <div>
 <h3 style="margin: 0 0 8px; font-family: 'Barlow Semi Condensed', 'Arial Narrow', Arial, sans-serif; font-weight: 700; font-size: 22px; line-height: 1.25; color: #1F1C17">What if it can’t be fixed on the roadside?</h3>
@@ -384,6 +387,7 @@ input::placeholder,textarea::placeholder{color:#766E66}
 </footer>
 
 </div>
+<script src="forms.js"></script>
 <script>
 (function () {
   var form = document.getElementById('request-form');
@@ -425,10 +429,21 @@ input::placeholder,textarea::placeholder{color:#766E66}
       return;
     }
     errorEl.hidden = true;
-    // TODO: deliver the request (e.g. POST new FormData(form) to a form backend or SMS/email service).
-    document.getElementById('sent-phone').textContent = phone.value.trim();
-    form.hidden = true;
-    sentView.hidden = false;
+    var btn = form.querySelector('button[type="submit"]');
+    btn.disabled = true; btn.textContent = 'Sending\u2026';
+    var v = function (id) { return document.getElementById(id).value.trim(); };
+    rsquSubmit({
+      type: 'repair', website: (form.elements.website || {}).value || '',
+      location: loc.value.trim(), phone: phone.value.trim(), name: v('name'),
+      year: v('year'), make: v('make'), model: v('model'), issue: v('issue')
+    }, photo.files && photo.files[0]).then(function (how) {
+      btn.disabled = false; btn.textContent = 'Send to Mike';
+      document.getElementById('sent-phone').textContent = phone.value.trim();
+      sentView.querySelector('h2').textContent = how === 'sent' ? 'Sent to Mike' : 'Tap send in your text app';
+      if (how !== 'sent') document.getElementById('sent-phone').textContent = phone.value.trim() + ' once your text goes through. If your text app didn\u2019t open, call or text 801-232-4995';
+      form.hidden = true;
+      sentView.hidden = false;
+    });
   });
 
   document.getElementById('reset-form').addEventListener('click', function () {

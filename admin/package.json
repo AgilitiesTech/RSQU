@@ -1,0 +1,13 @@
+{
+  "name": "rsqu-admin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Admin dashboard for Mike Stevens Emergency RV & Trailer Repair: requests, quotes, proposals, signatures and payments.",
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "dev": "node --no-warnings --watch server.js",
+    "test": "node --no-warnings --test test/*.test.js"
+  }
+}
