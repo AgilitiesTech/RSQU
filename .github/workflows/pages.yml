@@ -6,6 +6,7 @@ on:
     paths:
       - "*.html"
       - "*.js"
+      - "img/**"
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -32,6 +33,7 @@ jobs:
         run: |
           mkdir _site
           cp *.html *.js _site/
+          cp -r img _site/
           touch _site/.nojekyll
 
       - uses: actions/configure-pages@v5

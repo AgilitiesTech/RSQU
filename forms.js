@@ -1,11 +1,14 @@
 /* Sends website requests to Mike's dashboard.
-   Set the dashboard address in each page's <meta name="rsqu-api" content="https://...">.
+   Set the dashboard address and business in each page:
+   <meta name="rsqu-api" content="https://..."> and <meta name="rsqu-business" content="mike-stevens">.
    If it isn't set, or the dashboard can't be reached, the request opens as a
    pre-filled text message to Mike instead, so nothing is lost. */
 (function () {
   var MIKE_SMS = '+18012324995';
   var meta = document.querySelector('meta[name="rsqu-api"]');
   var api = meta && meta.content ? meta.content.replace(/\/$/, '') : '';
+  var biz = document.querySelector('meta[name="rsqu-business"]');
+  var slug = biz && biz.content ? biz.content : '';
 
   function resizePhoto(file) {
     return new Promise(function (resolve) {
@@ -42,10 +45,10 @@
       location.href = 'sms:' + MIKE_SMS + '?&body=' + encodeURIComponent(smsText(data));
       return 'sms';
     }
-    if (!api) return Promise.resolve(fallback());
+    if (!api || !slug) return Promise.resolve(fallback());
     return resizePhoto(photoFile).then(function (photo) {
       if (photo) data.photo = photo;
-      return fetch(api + '/api/public/requests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+      return fetch(api + '/api/public/t/' + encodeURIComponent(slug) + '/requests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     }).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return 'sent';

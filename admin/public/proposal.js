@@ -23,7 +23,8 @@
     }
     let q;
     try { q = await api('/api/public/proposals/' + encodeURIComponent(token)); }
-    catch (e) { doc.innerHTML = `<p class="alert err">${esc(e.message)}</p><p>Questions? Call or text Mike at <a href="tel:+18012324995">801-232-4995</a>.</p>`; return; }
+    catch (e) { doc.innerHTML = `<p class="alert err">${esc(e.message)}</p>`; return; }
+    applyBrand(q.business);
     render(q);
   }
 
@@ -43,7 +44,7 @@
           ${q.location ? `<dt>Where</dt><dd>${esc(q.location)}</dd>` : ''}
         </dl>
       </section>
-      ${q.notes ? `<section class="card"><h2>What Mike found</h2><p style="white-space:pre-wrap">${esc(q.notes)}</p></section>` : ''}
+      ${q.notes ? `<section class="card"><h2>Notes</h2><p style="white-space:pre-wrap">${esc(q.notes)}</p></section>` : ''}
       <section class="card stack">
         <table class="items">
           <thead><tr><th scope="col">Work and parts</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Amount</th></tr></thead>
@@ -53,14 +54,14 @@
           <dt>Subtotal</dt><dd>${money(t.subtotal)}</dd>
           ${t.tax ? `<dt>Sales tax (${q.tax_rate_bp / 100}%)</dt><dd>${money(t.tax)}</dd>` : ''}
           <dt>Total</dt><dd>${money(t.total)}</dd>
-          ${t.credit ? `<dt>Diagnosis deposit already paid</dt><dd>−${money(t.credit)}</dd>` : ''}
+          ${t.credit ? `<dt>Deposit already paid</dt><dd>−${money(t.credit)}</dd>` : ''}
           <dt class="big">${paid ? 'Paid' : 'Balance due'}</dt><dd class="big">${money(t.balance)}</dd>
         </dl>
       </section>
       ${q.terms ? `<section class="card"><h2>Terms</h2><p class="small" style="white-space:pre-wrap">${esc(q.terms)}</p></section>` : ''}
       <section class="card stack" id="sign"></section>
       <section class="card stack no-print" id="pay"></section>
-      <p class="small muted no-print">Questions? Call or text Mike at <a href="tel:+18012324995">801-232-4995</a>. <button class="linkbtn" type="button" id="print">Print or save a copy</button></p>`;
+      <p class="small muted no-print">${contactLine(q.business)} <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer terms</a> · <button class="linkbtn" type="button" id="print">Print or save a copy</button></p>`;
     document.getElementById('print').addEventListener('click', () => window.print());
 
     const sign = document.getElementById('sign');
@@ -74,7 +75,7 @@
           <div><p id="sig-label" style="font-family:var(--cond);font-weight:600;font-size:17px;margin-bottom:4px">Sign with your finger or mouse</p>
             <canvas class="sigpad" id="pad" role="img" aria-labelledby="sig-label"></canvas>
             <button class="linkbtn" type="button" id="clear">Clear signature</button></div>
-          <label class="check"><input type="checkbox" name="agree" id="agree"> I approve this work and the total above, and I agree to the terms.</label>
+          <label class="check"><input type="checkbox" name="agree" id="agree"> <span>I approve this work and the total above, and I agree to the terms above and the <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer Terms</a>, including signing electronically.</span></label>
           <p class="alert err" id="serr" hidden></p>
           <button class="btn primary block" type="submit">Accept and sign</button>
         </form>`;
@@ -85,17 +86,22 @@
     if (paid) pay.innerHTML = `<p class="alert ok">Paid in full. Thank you!</p>`;
     else if (!signed) pay.hidden = true;
     else if (t.balance <= 0) pay.innerHTML = `<p class="alert ok">Nothing is due right now.</p>`;
-    else pay.innerHTML = `
+    else {
+      const o = q.online;
+      pay.innerHTML = `
       <h2>Pay ${money(t.balance)}</h2>
-      ${q.card_payments ? `<button class="btn primary block" type="button" id="paybtn">Pay by card or bank</button>
-      <p class="small muted">You’ll go to Stripe’s secure checkout, then come right back here.</p>` : ''}
-      <p class="small">${q.card_payments ? 'Or pay' : 'Pay'} Mike directly by cash or check.</p>
+      ${o.card_payments ? `
+        ${o.fee ? `<dl class="totals"><dt>Balance due</dt><dd>${money(t.balance)}</dd><dt>Processing Fee (${o.bp / 100}%)</dt><dd>${money(o.fee)}</dd><dt class="big">Total paid online</dt><dd class="big">${money(o.charge)}</dd></dl>` : ''}
+        <button class="btn primary block" type="button" id="paybtn">Pay ${money(o.charge)} by card or bank</button>
+        <p class="small muted">You’ll go to Stripe’s secure checkout, then come right back here.</p>
+        <p class="small">${o.fee ? `Paying by cash or check instead? No Processing Fee. Pay ${esc(q.business.name)} directly.` : `Or pay ${esc(q.business.name)} directly by cash or check.`}</p>` : `<p class="small">Pay ${esc(q.business.name)} directly by cash or check.</p>`}
       <p class="alert err" id="perr" hidden></p>`;
+    }
     const pb = document.getElementById('paybtn');
     if (pb) pb.addEventListener('click', async () => {
       pb.disabled = true; pb.textContent = 'Opening secure checkout…';
       try { const { url } = await api(`/api/public/proposals/${encodeURIComponent(token)}/checkout`, {}); location.href = url; }
-      catch (e) { const el = document.getElementById('perr'); el.textContent = e.message; el.hidden = false; pb.disabled = false; pb.textContent = 'Pay by card or bank'; }
+      catch (e) { const el = document.getElementById('perr'); el.textContent = e.message; el.hidden = false; pb.disabled = false; pb.textContent = 'Try again'; }
     });
   }
 

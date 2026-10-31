@@ -1,12 +1,14 @@
 'use strict';
 (function () {
   const view = document.getElementById('view');
+  let me = null; // { user, tenant, viewing_as, needs_agreements }
 
   // ---------- utils ----------
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const money = (c) => '$' + (Number(c || 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const toCents = (v) => Math.round(parseFloat(String(v).replace(/[^0-9.]/g, '')) * 100) || 0;
   const dollars = (c) => (Number(c || 0) / 100).toFixed(2);
+  const pct = (bp) => (Number(bp || 0) / 100).toString() + '%';
   const when = (s) => {
     if (!s) return '';
     const d = new Date(s.replace(' ', 'T') + 'Z');
@@ -24,6 +26,11 @@
   };
   const STATUS = { new: 'New', contacted: 'Contacted', quoted: 'Quoted', accepted: 'Accepted', paid: 'Paid', closed: 'Closed' };
   const QSTATUS = { draft: 'Draft', sent: 'Sent', signed: 'Signed', paid: 'Paid', void: 'Void' };
+  const FEE_MODE = { customer: 'Added to the customer’s total', absorbed: 'Taken from the business’s payout', off: 'Off' };
+  const LEGAL = '<a href="/legal/terms" target="_blank" rel="noopener">Terms of Service</a>, <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a> and <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>';
+  const isSuper = () => me && me.user.role === 'super';
+  const isOwner = () => me && (me.user.role === 'owner' || isSuper());
+  const bizName = () => (me && me.tenant ? me.tenant.name : 'Dashboard');
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -32,56 +39,173 @@
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       credentials: 'same-origin',
     });
+    if (opts.raw) return res;
     const data = await res.json().catch(() => ({}));
-    if (res.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Please log in.'); }
+    if (res.status === 401 && !opts.quiet) { me = null; showAuth('login'); throw new Error('Please log in.'); }
+    if (res.status === 428) { route(); throw new Error('Please log in.'); }
     if (!res.ok) throw new Error(data.error || 'Something went wrong.');
     return data;
   }
-
   function flash(el, msg, kind = 'ok') {
     if (!el) return;
     el.className = 'alert ' + kind; el.textContent = msg; el.hidden = false;
     if (kind === 'ok') setTimeout(() => { el.hidden = true; }, 3000);
   }
-
   async function copy(text, btn) {
     try { await navigator.clipboard.writeText(text); if (btn) { const t = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => (btn.textContent = t), 1500); } }
-    catch { window.prompt('Copy this link:', text); }
+    catch { window.prompt('Copy this:', text); }
+  }
+  function readImage(file, max = 1600) {
+    return new Promise((resolve) => {
+      if (!file) return resolve(null);
+      const img = new Image(), url = URL.createObjectURL(file);
+      img.onload = () => {
+        const s = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement('canvas');
+        c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+        resolve(c.toDataURL(file.type === 'image/png' ? 'image/png' : 'image/jpeg', 0.85));
+      };
+      img.onerror = () => resolve(null);
+      img.src = url;
+    });
   }
 
   // ---------- shell ----------
+  const ICON = {
+    requests: '<path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path>',
+    quotes: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" y1="13" x2="16" y2="13"></line><line x1="8" y1="17" x2="13" y2="17"></line>',
+    products: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>',
+    business: '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline>',
+    settings: '<circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>',
+    grid: '<rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect>',
+  };
+  const svg = (k) => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON[k]}</svg>`;
+
+  function buildChrome() {
+    const tenantMode = Boolean(me.tenant);
+    const items = tenantMode
+      ? [['requests', 'Requests', 'requests'], ['quotes', 'Quotes', 'quotes'], ['products', 'Products', 'products'], ['business', 'Business', 'business'], ['settings', 'Settings', 'settings']]
+      : [['super', 'Businesses', 'grid'], ['platform', 'Platform', 'settings']];
+    const badge = (k) => (k === 'requests' ? '<span class="badge" data-newcount hidden></span>' : '');
+    document.getElementById('topnav').innerHTML = items.map(([k, l]) => `<a href="#/${k}" data-nav="${k}">${l} ${badge(k)}</a>`).join('');
+    const bn = document.getElementById('bottomnav');
+    bn.style.gridTemplateColumns = `repeat(${items.length}, 1fr)`;
+    bn.innerHTML = items.map(([k, l, ic]) => `<a href="#/${k}" data-nav="${k}">${svg(ic)}${l}${badge(k)}</a>`).join('');
+    const logo = me.tenant && me.tenant.logo ? `<img src="/media/${esc(me.tenant.slug)}/${esc(me.tenant.logo)}" alt="" style="height:34px;border-radius:4px;background:#fff">` : '';
+    document.getElementById('brand').innerHTML = `${logo}<span>${esc(tenantMode ? me.tenant.name : 'Agilities')}<small>${tenantMode ? 'Dashboard' : 'Platform admin'}</small></span>`;
+    document.getElementById('brand').setAttribute('href', tenantMode ? '#/requests' : '#/super');
+    const top = document.getElementById('topbar');
+    top.style.background = tenantMode ? (me.tenant.primary_color || '') : '#1F1C17';
+    const va = document.getElementById('viewas');
+    va.hidden = !me.viewing_as;
+    if (me.viewing_as) {
+      va.innerHTML = `<span>Agilities admin, viewing <strong>${esc(me.tenant.name)}</strong></span><button type="button" class="btn sm gold" id="exit-viewas">Back to all businesses</button>`;
+      document.getElementById('exit-viewas').addEventListener('click', async () => { await api('/api/super/view-as', { method: 'POST', body: { tenant_id: 0 } }); location.hash = '#/super'; await loadMe(); route(); });
+    }
+    document.title = bizName();
+  }
   function setNav(name) {
     document.querySelectorAll('[data-nav]').forEach((a) => { if (a.dataset.nav === name) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   }
   function showChrome(on) {
     document.getElementById('topbar').hidden = !on;
     document.getElementById('bottomnav').hidden = !on;
+    if (!on) document.getElementById('viewas').hidden = true;
   }
   let newCount = 0;
   function setNewCount(n) {
     newCount = n;
     document.querySelectorAll('[data-newcount]').forEach((b) => { b.textContent = n; b.hidden = !n; });
-    document.title = (n ? `(${n}) ` : '') + 'Mike’s Dashboard';
+    document.title = (n ? `(${n}) ` : '') + bizName();
   }
 
-  function showLogin() {
+  // ---------- sign in / sign up / reset ----------
+  function showAuth(mode, token) {
     showChrome(false);
-    view.innerHTML = `
-      <form class="card login stack" id="login">
-        <h1>Mike’s Dashboard</h1>
-        <p class="muted">Log in to see repair requests, build quotes and take payments.</p>
-        <div><label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password" required></div>
-        <p class="alert err" id="login-err" hidden></p>
-        <button class="btn primary block" type="submit">Log in</button>
-      </form>`;
-    const f = document.getElementById('login');
-    f.pw.focus();
+    const legalNote = `<p class="small muted">Agilities runs this platform. <a href="/legal/terms">Terms</a> · <a href="/legal/privacy">Privacy</a></p>`;
+    if (mode === 'signup') {
+      view.innerHTML = `
+        <form class="card login stack" id="af" style="max-width:480px">
+          <h1>Create your business account</h1>
+          <p class="muted">Get a branded website, request inbox, onsite quotes, e-signatures and online payments.</p>
+          <div><label for="a-biz">Business name</label><input id="a-biz" name="business_name" required autocomplete="organization"></div>
+          <div><label for="a-name">Your name</label><input id="a-name" name="name" required autocomplete="name"></div>
+          <div><label for="a-email">Email</label><input id="a-email" name="email" type="email" required autocomplete="email"></div>
+          <div><label for="a-phone">Mobile phone (for request alerts)</label><input id="a-phone" name="phone" type="tel" autocomplete="tel"></div>
+          <div><label for="a-pw">Password (10+ characters)</label><input id="a-pw" name="password" type="password" minlength="10" required autocomplete="new-password"></div>
+          <label class="check"><input type="checkbox" name="agree" required> <span>I agree to the ${LEGAL}, including the Processing Fee on online payments.</span></label>
+          <p class="alert err" id="a-err" hidden></p>
+          <button class="btn primary block" type="submit">Create account</button>
+          <p class="small">Already have an account? <a href="#/login">Log in</a></p>
+        </form>`;
+    } else if (mode === 'forgot') {
+      view.innerHTML = `
+        <form class="card login stack" id="af">
+          <h1>Reset your password</h1>
+          <div><label for="a-email">Email</label><input id="a-email" name="email" type="email" required autocomplete="email"></div>
+          <p class="alert" id="a-err" hidden></p>
+          <button class="btn primary block" type="submit">Send reset link</button>
+          <p class="small"><a href="#/login">Back to log in</a></p>
+        </form>`;
+    } else if (mode === 'reset') {
+      view.innerHTML = `
+        <form class="card login stack" id="af">
+          <h1>Set your password</h1>
+          <div><label for="a-pw">New password (10+ characters)</label><input id="a-pw" name="password" type="password" minlength="10" required autocomplete="new-password"></div>
+          <p class="alert err" id="a-err" hidden></p>
+          <button class="btn primary block" type="submit">Save password</button>
+        </form>`;
+    } else {
+      view.innerHTML = `
+        <form class="card login stack" id="af">
+          <h1>Log in</h1>
+          <div><label for="a-email">Email</label><input id="a-email" name="email" type="email" required autocomplete="username"></div>
+          <div><label for="a-pw">Password</label><input id="a-pw" name="password" type="password" required autocomplete="current-password"></div>
+          <p class="alert err" id="a-err" hidden></p>
+          <button class="btn primary block" type="submit">Log in</button>
+          <p class="small"><a href="#/forgot">Forgot your password?</a> · <a href="#/signup">Create a business account</a></p>
+          ${legalNote}
+        </form>`;
+    }
+    const f = document.getElementById('af');
+    const err = document.getElementById('a-err');
+    (f.querySelector('input') || {}).focus?.();
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
-      try { await api('/api/login', { method: 'POST', body: { password: f.pw.value } }); route(); }
-      catch (err) { flash(document.getElementById('login-err'), err.message, 'err'); }
+      const body = Object.fromEntries(new FormData(f));
+      try {
+        if (mode === 'signup') { body.agree = f.elements.agree.checked; await api('/api/signup', { method: 'POST', body, quiet: true }); location.hash = '#/business'; }
+        else if (mode === 'forgot') {
+          const r = await api('/api/password/forgot', { method: 'POST', body, quiet: true });
+          flash(err, r.email_enabled ? 'If that email has an account, a reset link is on its way.' : 'Email isn’t set up yet. Ask Agilities support for a reset link.', 'ok'); err.hidden = false; return;
+        } else if (mode === 'reset') { await api('/api/password/reset', { method: 'POST', body: { token, password: body.password }, quiet: true }); location.hash = '#/'; }
+        else { await api('/api/login', { method: 'POST', body, quiet: true }); if (/^#\/(login|signup|forgot|reset)/.test(location.hash)) location.hash = '#/'; }
+        await loadMe(); route();
+      } catch (ex) { flash(err, ex.message, 'err'); }
     });
   }
+
+  function agreementsView() {
+    showChrome(false);
+    view.innerHTML = `
+      <form class="card login stack" id="ag" style="max-width:520px">
+        <h1>Before you start</h1>
+        <p>Please review and accept the agreements for using this platform with ${esc(bizName())}.</p>
+        <ul class="stack" style="margin:0;padding-left:20px;gap:6px"><li><a href="/legal/terms" target="_blank" rel="noopener">Business Terms of Service</a></li><li><a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a></li><li><a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a></li></ul>
+        <label class="check"><input type="checkbox" name="agree"> <span>I have read and agree to the ${LEGAL} on behalf of my business.</span></label>
+        <p class="alert err" id="ag-err" hidden></p>
+        <button class="btn primary block" type="submit">Accept and continue</button>
+        <button class="linkbtn" type="button" id="ag-out">Log out</button>
+      </form>`;
+    const f = document.getElementById('ag');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!f.elements.agree.checked) return flash(document.getElementById('ag-err'), 'Check the box to accept.', 'err');
+      await api('/api/agreements/accept', { method: 'POST', body: { agree: true } }); await loadMe(); route();
+    });
+    document.getElementById('ag-out').addEventListener('click', logout);
+  }
+  async function logout() { await api('/api/logout', { method: 'POST' }); me = null; location.hash = '#/login'; showAuth('login'); }
 
   // ---------- requests ----------
   let reqFilter = 'open';
@@ -97,14 +221,14 @@
         <a class="item" href="#/requests/${r.id}">
           <div class="grow stack" style="gap:4px">
             <div class="row" style="gap:8px"><span class="item-title">${esc(r.name || 'No name')}</span>
-              <span class="tag ${r.type}">${r.type === 'winterize' ? 'Winterize' : 'Repair'}</span>
+              <span class="tag ${r.type}">${r.type === 'booking' ? esc(r.product_name ? 'Book: ' + r.product_name : 'Booking') : 'Repair'}</span>
               ${r.status === 'new' ? '<span class="tag new">New</span>' : `<span class="tag ${r.status}">${STATUS[r.status] || r.status}</span>`}
               ${r.has_photo ? '<span class="tag">Photo</span>' : ''}</div>
             <div class="small">${esc((r.location || '').split('\n')[0]).slice(0, 140)}</div>
             <div class="small muted">${esc(r.rig || '')}${r.rig && r.issue ? ' · ' : ''}${esc((r.issue || '').slice(0, 90))}${r.preferred_date ? ' · wants ' + esc(r.preferred_date) : ''}</div>
           </div>
           <div class="small muted" style="white-space:nowrap">${when(r.created_at)}</div>
-        </a>`).join('') : '<p class="empty">Nothing here. New website requests show up here automatically.</p>'}
+        </a>`).join('') : '<p class="empty">Nothing here. Requests from your website show up here automatically.</p>'}
       </div>`;
     view.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('click', () => { reqFilter = b.dataset.filter; requestsView(); }));
   }
@@ -116,7 +240,6 @@
       <form class="card stack" id="nr">
         <h1>Add a call-in or walk-up</h1>
         <div class="grid2">
-          <div><label for="nr-type">Type</label><select id="nr-type" name="type"><option value="repair">Repair</option><option value="winterize">Winterizing</option></select></div>
           <div><label for="nr-name">Name</label><input id="nr-name" name="name"></div>
           <div><label for="nr-phone">Phone</label><input id="nr-phone" name="phone" type="tel"></div>
           <div><label for="nr-rig">Year, make, model</label><input id="nr-rig" name="rig"></div>
@@ -129,10 +252,8 @@
     const f = document.getElementById('nr');
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
-      try {
-        const r = await api('/api/requests', { method: 'POST', body: Object.fromEntries(new FormData(f)) });
-        location.hash = '#/requests/' + r.id;
-      } catch (err) { flash(document.getElementById('nr-err'), err.message, 'err'); }
+      try { const r = await api('/api/requests', { method: 'POST', body: Object.fromEntries(new FormData(f)) }); location.hash = '#/requests/' + r.id; }
+      catch (err) { flash(document.getElementById('nr-err'), err.message, 'err'); }
     });
   }
 
@@ -141,17 +262,18 @@
     const [r, cfg] = await Promise.all([api('/api/requests/' + id), api('/api/config')]);
     const dep = cfg.settings.deposit_cents;
     const depPending = r.payments.filter((p) => p.kind === 'deposit' && p.status === 'pending');
+    const online = cfg.stripe.charges_enabled;
     view.innerHTML = `
       <a href="#/requests" class="small">← Requests</a>
       <div class="row between">
         <div class="stack" style="gap:6px"><h1>${esc(r.name || 'No name')}</h1>
-          <div class="row" style="gap:8px"><span class="tag ${r.type}">${r.type === 'winterize' ? 'Winterizing booking' : 'Repair request'}</span><span class="small muted">#${r.id} · ${when(r.created_at)}</span></div></div>
+          <div class="row" style="gap:8px"><span class="tag ${r.type}">${r.type === 'booking' ? 'Booking' + (r.product ? ': ' + esc(r.product.name) + ' (' + money(r.product.price_cents) + ')' : '') : 'Repair request'}</span><span class="small muted">#${r.id} · ${when(r.created_at)}</span></div></div>
         <div><label for="rq-status" class="small">Status</label>
           <select id="rq-status" style="min-width:160px">${Object.entries(STATUS).map(([k, v]) => `<option value="${k}" ${r.status === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
       </div>
       <div class="row">
         <a class="btn primary" href="${telHref(r.phone)}">Call ${esc(r.phone)}</a>
-        <a class="btn" href="${smsHref(r.phone, `Hi ${r.name || ''}, this is Mike Stevens with Emergency RV & Trailer Repair. I got your request and I'm on it.`)}">Text</a>
+        <a class="btn" href="${smsHref(r.phone, `Hi ${r.name || ''}, this is ${bizName()}. I got your request and I'm on it.`)}">Text</a>
         <a class="btn ghost" href="${mapHref(r.location)}" target="_blank" rel="noopener">Map</a>
       </div>
       <p class="alert" id="rq-msg" hidden></p>
@@ -160,7 +282,7 @@
           <h2>Details</h2>
           <dl class="facts">
             <dt>Where</dt><dd>${esc(r.location)}</dd>
-            ${r.rig ? `<dt>Rig</dt><dd>${esc(r.rig)}</dd>` : ''}
+            ${r.rig ? `<dt>Vehicle</dt><dd>${esc(r.rig)}</dd>` : ''}
             ${r.issue ? `<dt>Problem</dt><dd>${esc(r.issue)}</dd>` : ''}
             ${r.preferred_date ? `<dt>Wants</dt><dd>${esc(r.preferred_date)}</dd>` : ''}
             ${r.email ? `<dt>Email</dt><dd>${esc(r.email)}</dd>` : ''}
@@ -170,18 +292,18 @@
           <button class="btn sm" id="rq-save-notes" type="button" style="margin-top:8px">Save notes</button></div>
         </section>
         <div class="stack">
-          ${r.type === 'repair' ? `
+          ${r.type === 'repair' && dep ? `
           <section class="card stack">
-            <h2>Diagnosis deposit, ${money(dep)}</h2>
-            <p class="small muted">For the diagnosis and onsite review. It’s credited toward the job if the customer goes ahead.</p>
+            <h2>${esc(cfg.settings.deposit_label)}, ${money(dep)}</h2>
+            <p class="small muted">Paid up front and credited toward the job if the customer goes ahead.${online && cfg.processing_fee.mode === 'customer' ? ` Paid online, the customer also pays a ${pct(cfg.processing_fee.bp)} Processing Fee.` : ''}</p>
             ${r.deposit_paid_cents ? `<p class="alert ok">${money(r.deposit_paid_cents)} paid. It will be credited on the quote.</p>` : `
             <div class="row">
-              <button class="btn primary" type="button" data-dep="card">Card payment link</button>
+              ${online ? '<button class="btn primary" type="button" data-dep="card">Online payment link</button>' : ''}
               <button class="btn ghost" type="button" data-dep="cash">Got cash</button>
               <button class="btn ghost" type="button" data-dep="check">Got a check</button>
             </div>
-            ${!cfg.stripe.enabled ? '<p class="small muted">Card payments aren’t connected yet. See Settings.</p>' : ''}
-            ${depPending.map((p) => payLinkBox(location.origin + '/pay/' + p.token, r)).join('')}`}
+            ${!online ? '<p class="small muted">Online payments aren’t connected yet. <a href="#/settings">Connect Stripe in Settings.</a></p>' : ''}
+            ${depPending.map((p) => payLinkBox(location.origin + '/pay/' + p.token, r.phone)).join('')}`}
           </section>` : ''}
           <section class="card stack">
             <div class="row between"><h2>Quotes</h2><button class="btn primary" id="rq-quote" type="button">Build a quote</button></div>
@@ -207,12 +329,12 @@
     });
   }
 
-  function payLinkBox(url, r) {
+  function payLinkBox(url, phone) {
     return `<div class="stack" style="gap:8px;border-top:1px solid var(--line);padding-top:12px">
       <p class="small"><strong>Payment link ready.</strong> Hand over your phone, or text it.</p>
       <div class="row">
         <a class="btn gold sm" href="${esc(url)}" target="_blank" rel="noopener">Open payment page</a>
-        <a class="btn sm" href="${smsHref(r.customer_phone || r.phone, 'Mike Stevens RV Repair: here is your secure payment link: ' + url)}">Text link</a>
+        <a class="btn sm" href="${smsHref(phone, bizName() + ': here is your secure payment link: ' + url)}">Text link</a>
         <button class="btn ghost sm" type="button" data-copy="${esc(url)}">Copy link</button>
       </div></div>`;
   }
@@ -233,16 +355,16 @@
 
   async function quoteView(id) {
     setNav('quotes');
-    const [q, products, cfg] = await Promise.all([api('/api/quotes/' + id), api('/api/products'), api('/api/config')]);
+    const [q, products] = await Promise.all([api('/api/quotes/' + id), api('/api/products')]);
     const locked = Boolean(q.signed_at) || q.status === 'paid' || q.status === 'void';
-    let items = q.items.map((it) => ({ ...it }));
+    const items = q.items.map((it) => ({ ...it }));
     const active = products.filter((p) => p.active);
 
     view.innerHTML = `
       <a href="${q.request_id ? '#/requests/' + q.request_id : '#/quotes'}" class="small">← ${q.request_id ? 'Request #' + q.request_id : 'Quotes'}</a>
       <div class="row between"><h1>Quote #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
       <p class="alert" id="q-msg" hidden></p>
-      ${locked && q.signed_at ? `<p class="alert ok">Signed by ${esc(q.signer_name)} on ${esc(new Date(q.signed_at.replace(' ', 'T') + 'Z').toLocaleString())}. Signed quotes can’t be edited.</p>` : ''}
+      ${q.signed_at ? `<p class="alert ok">Signed by ${esc(q.signer_name)} on ${esc(new Date(q.signed_at.replace(' ', 'T') + 'Z').toLocaleString())}. Signed quotes can’t be edited.</p>` : ''}
       <form id="qf" class="stack">
         <fieldset ${locked ? 'disabled' : ''} style="border:0;padding:0;margin:0" class="stack">
         <section class="card stack">
@@ -275,11 +397,11 @@
         <section class="card stack">
           <h2>Total</h2>
           <dl class="totals" id="totals"></dl>
+          <p class="small muted" id="fee-note"></p>
         </section>
         <div class="sticky-actions row">
-          ${locked ? '' : '<button class="btn" type="submit">Save</button><button class="btn primary" type="button" id="q-show">Save and show proposal</button>'}
-          ${locked ? `<a class="btn primary" href="${esc(q.proposal_url)}" target="_blank" rel="noopener">Open proposal</a>` : ''}
-          <a class="btn ghost" href="${smsHref(q.customer_phone, 'Mike Stevens RV Repair: here is your proposal to review and sign: ' + q.proposal_url)}" id="q-text">Text link</a>
+          ${locked ? `<a class="btn primary" href="${esc(q.proposal_url)}" target="_blank" rel="noopener">Open proposal</a>` : '<button class="btn" type="submit">Save</button><button class="btn primary" type="button" id="q-show">Save and show proposal</button>'}
+          <a class="btn ghost" href="${smsHref(q.customer_phone, bizName() + ': here is your proposal to review and sign: ' + q.proposal_url)}">Text link</a>
           <button class="btn ghost" type="button" data-copy="${esc(q.proposal_url)}">Copy link</button>
         </div>
       </form>
@@ -290,7 +412,7 @@
     const msg = document.getElementById('q-msg');
 
     function totals() {
-      const tax = toCents(f.elements.tax.value); // percent x 100 = basis points
+      const tax = toCents(f.elements.tax.value);
       let sub = 0, taxable = 0;
       items.forEach((it) => { const l = Math.round((Number(it.qty) || 0) * it.unit_cents); sub += l; if (it.taxable) taxable += l; });
       const taxC = Math.round(taxable * tax / 10000);
@@ -304,8 +426,12 @@
         <dt>Subtotal</dt><dd>${money(t.sub)}</dd>
         ${t.taxC ? `<dt>Sales tax</dt><dd>${money(t.taxC)}</dd>` : ''}
         <dt>Total</dt><dd>${money(t.total)}</dd>
-        ${t.credit ? `<dt>Diagnosis deposit paid</dt><dd>−${money(t.credit)}</dd>` : ''}
+        ${t.credit ? `<dt>Deposit paid</dt><dd>−${money(t.credit)}</dd>` : ''}
         <dt class="big">Balance due</dt><dd class="big">${money(t.balance)}</dd>`;
+      const o = q.online;
+      document.getElementById('fee-note').textContent = o.card_payments && o.mode === 'customer' && t.balance > 0
+        ? `If the customer pays online, a ${pct(o.bp)} Processing Fee (${money(Math.round(t.balance * o.bp / 10000))}) is added at checkout. Cash or check: no fee.`
+        : '';
     }
     function renderLines() {
       linesEl.innerHTML = items.length ? items.map((it, i) => `
@@ -358,13 +484,12 @@
     view.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.copy, b)));
     renderLines();
 
-    // payment / status card
     const pay = document.getElementById('q-pay');
     const paidList = q.payments.filter((p) => p.status === 'paid');
     pay.innerHTML = `
       <h2>Payment</h2>
       ${q.status === 'paid' ? `<p class="alert ok">Paid in full. ${paidList.map((p) => `${money(p.amount_cents)} by ${esc(p.method)}`).join(', ')}.</p>` :
-        q.signed_at ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. The customer can pay by card on the proposal page${cfg.stripe.enabled ? '' : ' once card payments are connected in Settings'}, or record cash or a check here.</p>
+        q.signed_at ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. ${q.online.card_payments ? 'The customer can pay online on the proposal page, or you can' : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
         <div class="row"><button class="btn ghost" type="button" data-paid="cash">Got cash</button><button class="btn ghost" type="button" data-paid="check">Got a check</button></div>` :
         q.status === 'void' ? '<p class="muted">This quote is void.</p>' : '<p class="muted">The customer signs the proposal first, then pays.</p>'}
       ${q.status !== 'paid' ? `<div class="row" style="border-top:1px solid var(--line);padding-top:12px">${q.status === 'void' ? (q.signed_at ? '' : '<button class="linkbtn" type="button" data-st="draft">Restore quote</button>') : '<button class="linkbtn" type="button" data-st="void">Void this quote</button>'}</div>` : ''}`;
@@ -382,111 +507,344 @@
   async function productsView() {
     setNav('products');
     const rows = await api('/api/products');
+    const flags = (p) => `${p.active ? '' : '<span class="tag void">Hidden</span>'} ${p.on_site ? '<span class="tag">On website</span>' : ''} ${p.bookable ? '<span class="tag winterize">Bookable</span>' : ''} ${p.taxable ? '<span class="tag">Taxable</span>' : ''}`;
     view.innerHTML = `
       <h1>Products and services</h1>
-      <p class="muted">These show up when you build a quote. Prices can still be changed on each quote.</p>
+      <p class="muted">These show up when you build a quote. Turn on “Show on website” to list one on your site, and “Customers can book it” for fixed-price packages.</p>
       <form class="card stack" id="pf">
         <h2>Add a product</h2>
         <div class="grid2">
-          <div><label for="pf-name">Name</label><input id="pf-name" name="name" required placeholder="Trailer tire, ST225/75R15"></div>
+          <div><label for="pf-name">Name</label><input id="pf-name" name="name" required></div>
           <div><label for="pf-price">Price ($)</label><input id="pf-price" name="price" inputmode="decimal" required placeholder="0.00"></div>
         </div>
         <div><label for="pf-desc">Description</label><input id="pf-desc" name="description"></div>
-        <label class="check"><input type="checkbox" name="taxable"> Taxable</label>
+        <div class="row"><label class="check"><input type="checkbox" name="taxable"> Taxable</label><label class="check"><input type="checkbox" name="on_site"> Show on website</label><label class="check"><input type="checkbox" name="bookable"> Customers can book it</label></div>
         <p class="alert" id="pf-msg" hidden></p>
         <button class="btn primary" type="submit">Add product</button>
       </form>
       <div class="list">${rows.map((p) => `
-        <div class="item" style="display:block;padding:14px 16px;border-bottom:1px solid var(--line)" data-pid="${p.id}">
+        <div style="padding:14px 16px;border-bottom:1px solid var(--line)" data-pid="${p.id}">
           <div class="row between">
-            <div class="grow"><span class="item-title">${esc(p.name)}</span> ${p.active ? '' : '<span class="tag void">Hidden</span>'} ${p.taxable ? '<span class="tag">Taxable</span>' : ''}<div class="small muted">${esc(p.description || '')}</div></div>
+            <div class="grow"><span class="item-title">${esc(p.name)}</span> ${flags(p)}<div class="small muted">${esc(p.description || '')}</div></div>
             <strong>${money(p.price_cents)}</strong>
             <button class="btn ghost sm" type="button" data-edit="${p.id}">Edit</button>
           </div>
-        </div>`).join('')}</div>`;
+        </div>`).join('') || '<p class="empty">No products yet.</p>'}</div>`;
     const f = document.getElementById('pf');
+    const el = f.elements;
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
-      try {
-        await api('/api/products', { method: 'POST', body: { name: f.elements.name.value, description: f.elements.description.value, price_cents: toCents(f.elements.price.value), taxable: f.elements.taxable.checked } });
-        productsView();
-      } catch (err) { flash(document.getElementById('pf-msg'), err.message, 'err'); }
+      try { await api('/api/products', { method: 'POST', body: { name: el.name.value, description: el.description.value, price_cents: toCents(el.price.value), taxable: el.taxable.checked, on_site: el.on_site.checked, bookable: el.bookable.checked } }); productsView(); }
+      catch (err) { flash(document.getElementById('pf-msg'), err.message, 'err'); }
     });
     view.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => {
       const p = rows.find((x) => String(x.id) === b.dataset.edit);
       const box = view.querySelector(`[data-pid="${p.id}"]`);
+      const ck = (n, l) => `<label class="check"><input type="checkbox" name="${n}" ${p[n] ? 'checked' : ''}> ${l}</label>`;
       box.innerHTML = `<form class="stack">
         <div class="grid2"><div><label for="e-n${p.id}">Name</label><input id="e-n${p.id}" name="name" value="${esc(p.name)}"></div>
         <div><label for="e-p${p.id}">Price ($)</label><input id="e-p${p.id}" name="price" inputmode="decimal" value="${dollars(p.price_cents)}"></div></div>
         <div><label for="e-d${p.id}">Description</label><input id="e-d${p.id}" name="description" value="${esc(p.description || '')}"></div>
-        <label class="check"><input type="checkbox" name="taxable" ${p.taxable ? 'checked' : ''}> Taxable</label>
-        <label class="check"><input type="checkbox" name="active" ${p.active ? 'checked' : ''}> Show when building quotes</label>
+        <div class="row">${ck('taxable', 'Taxable')}${ck('on_site', 'Show on website')}${ck('bookable', 'Customers can book it')}${ck('active', 'Available in quotes')}</div>
         <div class="row"><button class="btn primary sm" type="submit">Save</button><button class="btn ghost sm" type="button" data-cancel>Cancel</button></div></form>`;
-      const ef = box.querySelector('form');
+      const ef = box.querySelector('form'), x = ef.elements;
       ef.querySelector('[data-cancel]').addEventListener('click', productsView);
       ef.addEventListener('submit', async (e) => {
         e.preventDefault();
-        await api('/api/products/' + p.id, { method: 'PATCH', body: { name: ef.elements.name.value, description: ef.elements.description.value, price_cents: toCents(ef.elements.price.value), taxable: ef.elements.taxable.checked, active: ef.elements.active.checked } });
+        await api('/api/products/' + p.id, { method: 'PATCH', body: { name: x.name.value, description: x.description.value, price_cents: toCents(x.price.value), taxable: x.taxable.checked, on_site: x.on_site.checked, bookable: x.bookable.checked, active: x.active.checked } });
         productsView();
       });
     }));
   }
 
+  // ---------- business, brand and website ----------
+  async function businessView() {
+    setNav('business');
+    const [b, team] = await Promise.all([api('/api/business'), api('/api/team')]);
+    const ro = isOwner() ? '' : 'disabled';
+    const embed = `<meta name="rsqu-api" content="${location.origin}">\n<meta name="rsqu-business" content="${b.slug}">`;
+    view.innerHTML = `
+      <h1>Business and website</h1>
+      <section class="card stack">
+        <h2>Your website</h2>
+        <p>Your hosted site: <a href="${esc(b.site_url)}" target="_blank" rel="noopener">${esc(b.site_url)}</a></p>
+        <p class="small muted">Use your own domain: add a CNAME record pointing your domain (for example <code>www.yourbusiness.com</code>) at <code>${esc(location.host)}</code>, then enter the domain below. Agilities support can help.</p>
+        <details><summary class="small" style="cursor:pointer;min-height:44px;display:flex;align-items:center">Already have a website? Connect its request form</summary>
+          <p class="small">Add these two lines to your site’s &lt;head&gt; and post forms to the address below. Agilities can set this up for you.</p>
+          <textarea readonly rows="3" style="font-family:monospace;font-size:13px">${esc(embed)}</textarea>
+          <p class="small">Form address: <code>${esc(b.intake_url)}</code></p></details>
+      </section>
+      <form class="stack" id="bf"><fieldset ${ro} style="border:0;padding:0;margin:0" class="stack">
+        <section class="card stack">
+          <h2>Business details</h2>
+          <div class="grid2">
+            <div><label for="b-name">Business name</label><input id="b-name" name="name" value="${esc(b.name)}"></div>
+            <div><label for="b-phone">Public phone</label><input id="b-phone" name="phone" type="tel" value="${esc(b.phone)}"></div>
+            <div><label for="b-email">Public email</label><input id="b-email" name="email" type="email" value="${esc(b.email)}"></div>
+            <div><label for="b-notify">Text new requests to</label><input id="b-notify" name="notify_phone" type="tel" value="${esc(b.notify_phone)}" placeholder="+18015550100"></div>
+          </div>
+          <div><label for="b-area">Service area</label><input id="b-area" name="service_area" value="${esc(b.service_area)}"></div>
+        </section>
+        <section class="card stack">
+          <h2>Brand</h2>
+          <div class="grid2">
+            <div><label for="b-pc">Main color</label><input id="b-pc" name="primary_color" type="color" value="${esc(b.primary_color)}" style="padding:4px;height:52px"></div>
+            <div><label for="b-ac">Button color</label><input id="b-ac" name="accent_color" type="color" value="${esc(b.accent_color)}" style="padding:4px;height:52px"></div>
+          </div>
+          <div class="grid2">
+            <div class="stack" style="gap:6px"><label for="b-logo">Logo</label>${b.logo ? `<img src="/media/${esc(b.slug)}/${esc(b.logo)}" alt="Current logo" style="max-height:64px;max-width:200px">` : ''}<input id="b-logo" type="file" accept="image/*" data-img="logo"></div>
+            <div class="stack" style="gap:6px"><label for="b-photo">Owner or team photo</label>${b.owner_photo ? `<img src="/media/${esc(b.slug)}/${esc(b.owner_photo)}" alt="Current photo" style="max-height:120px;max-width:96px;object-fit:cover;border-radius:6px">` : ''}<input id="b-photo" type="file" accept="image/*" data-img="owner_photo"></div>
+          </div>
+        </section>
+        <section class="card stack">
+          <h2>Website text</h2>
+          <div><label for="b-head">Headline</label><input id="b-head" name="hero_headline" value="${esc(b.hero_headline)}" placeholder="${esc(b.name)}"></div>
+          <div><label for="b-tag">Tagline</label><input id="b-tag" name="tagline" value="${esc(b.tagline)}"></div>
+          <div><label for="b-about">About</label><textarea id="b-about" name="about" rows="5">${esc(b.about)}</textarea></div>
+          <div class="grid2">
+            <div><label for="b-site">Your own website (if any)</label><input id="b-site" name="website_url" value="${esc(b.website_url)}" placeholder="https://"></div>
+            <div><label for="b-dom">Custom domain for the hosted site</label><input id="b-dom" name="custom_domain" value="${esc(b.custom_domain)}" placeholder="www.yourbusiness.com"></div>
+          </div>
+        </section>
+        <p class="alert" id="b-msg" hidden></p>
+        ${ro ? '<p class="muted small">Only the business owner can change these.</p>' : '<div class="sticky-actions row"><button class="btn primary" type="submit">Save</button><a class="btn ghost" href="' + esc(b.site_url) + '" target="_blank" rel="noopener">View website</a></div>'}
+      </fieldset></form>
+      <section class="card stack">
+        <h2>Team</h2>
+        <div class="list">${team.map((u) => `<div class="row between" style="padding:12px 14px;border-bottom:1px solid var(--line)"><div><strong>${esc(u.name || u.email)}</strong> <span class="tag">${u.role === 'owner' ? 'Owner' : 'Staff'}</span><div class="small muted">${esc(u.email)}${u.last_login_at ? ' · last in ' + when(u.last_login_at) : ''}</div></div>${u.role === 'staff' && isOwner() ? `<button class="btn ghost sm" type="button" data-rm="${u.id}">Remove</button>` : ''}</div>`).join('')}</div>
+        ${isOwner() ? `<form class="stack" id="tf"><h3>Add a team member</h3><div class="grid2"><div><label for="t-name">Name</label><input id="t-name" name="name"></div><div><label for="t-email">Email</label><input id="t-email" name="email" type="email" required></div><div><label for="t-pw">Temporary password</label><input id="t-pw" name="password" minlength="10" required></div></div><p class="alert" id="t-msg" hidden></p><button class="btn" type="submit">Add team member</button></form>` : ''}
+      </section>`;
+    const f = document.getElementById('bf'), msg = document.getElementById('b-msg');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try { await api('/api/business', { method: 'PUT', body: Object.fromEntries(new FormData(f)) }); await loadMe(); buildChrome(); setNav('business'); flash(msg, 'Saved.'); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    });
+    view.querySelectorAll('[data-img]').forEach((inp) => inp.addEventListener('change', async () => {
+      const image = await readImage(inp.files[0], inp.dataset.img === 'logo' ? 600 : 1200);
+      if (!image) return flash(msg, 'Use a JPG, PNG or WebP image.', 'err');
+      try { await api('/api/business/image', { method: 'POST', body: { kind: inp.dataset.img, image } }); await loadMe(); buildChrome(); businessView(); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    }));
+    const tf = document.getElementById('tf');
+    if (tf) tf.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try { await api('/api/team', { method: 'POST', body: Object.fromEntries(new FormData(tf)) }); businessView(); }
+      catch (err) { flash(document.getElementById('t-msg'), err.message, 'err'); }
+    });
+    view.querySelectorAll('[data-rm]').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!confirm('Remove this team member?')) return;
+      await api('/api/team/' + btn.dataset.rm, { method: 'DELETE' }); businessView();
+    }));
+  }
+
   // ---------- settings ----------
-  async function settingsView() {
+  async function settingsView(sub) {
     setNav('settings');
-    const cfg = await api('/api/config');
-    const s = cfg.settings, st = cfg.stripe;
+    let cfg = await api('/api/config');
+    if (sub === 'stripe-return' || sub === 'stripe-refresh') {
+      try { await api('/api/stripe/refresh', { method: 'POST' }); cfg = await api('/api/config'); } catch { /* shown below */ }
+    }
+    const s = cfg.settings, st = cfg.stripe, pf = cfg.processing_fee;
+    const ro = isOwner() ? '' : 'disabled';
     view.innerHTML = `
       <h1>Settings</h1>
-      <form class="card stack" id="sf">
-        <h2>Quotes</h2>
+      <section class="card stack">
+        <h2>Online payments</h2>
+        ${!st.platform_ready ? '<p>Online payments aren’t switched on for the platform yet. Agilities will let you know when they are.</p>' :
+          st.charges_enabled ? `<p class="alert ok">Stripe is connected and ready to take card and bank payments${st.test_mode ? ' (test mode: no real money moves)' : ''}.</p>` :
+          `<p>Connect a Stripe account so customers can pay by card or bank. Payments go straight to your Stripe account. Stripe will ask for your business details, bank account for payouts, and ID.</p>
+           ${st.details_submitted ? '<p class="alert ok">Details submitted. Stripe is reviewing them; this usually takes a few minutes.</p>' : ''}
+           ${isOwner() ? `<button class="btn primary" type="button" id="connect">${st.account ? 'Finish Stripe setup' : 'Connect Stripe'}</button>` : '<p class="small muted">Ask the business owner to connect Stripe.</p>'}`}
+        ${pf.mode !== 'off' ? `<p class="small muted">A ${pct(pf.bp)} Processing Fee applies to online payments (${FEE_MODE[pf.mode].toLowerCase()}). Cash and check payments have no Processing Fee. See the <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>.</p>` : ''}
+        <p class="alert" id="st-msg" hidden></p>
+      </section>
+      <form class="card stack" id="sf"><fieldset ${ro} style="border:0;padding:0;margin:0" class="stack">
+        <h2>Quotes and deposits</h2>
         <div class="grid2">
-          <div><label for="s-dep">Diagnosis deposit ($)</label><input id="s-dep" name="dep" inputmode="decimal" value="${dollars(s.deposit_cents)}"></div>
+          <div><label for="s-dlabel">Deposit name</label><input id="s-dlabel" name="dlabel" value="${esc(s.deposit_label)}"></div>
+          <div><label for="s-dep">Deposit amount ($, 0 = no deposit)</label><input id="s-dep" name="dep" inputmode="decimal" value="${dollars(s.deposit_cents)}"></div>
           <div><label for="s-tax">Default sales tax % (taxable lines)</label><input id="s-tax" name="tax" inputmode="decimal" value="${s.tax_rate_bp / 100}"></div>
         </div>
         <div><label for="s-terms">Default terms on proposals</label><textarea id="s-terms" name="terms" rows="4">${esc(s.terms)}</textarea></div>
         <p class="alert" id="s-msg" hidden></p>
-        <button class="btn primary" type="submit">Save settings</button>
-      </form>
-      <section class="card stack">
-        <h2>Card payments</h2>
-        ${st.enabled ? `<p class="alert ok">Stripe is connected${st.test_mode ? ' in <strong>test mode</strong> (no real money moves)' : ''}${st.connected_account ? ' through a connected account' : ''}.</p>
-          ${st.webhook ? '' : '<p class="small">Tip: add the Stripe webhook so bank (ACH) payments are confirmed automatically. See the README.</p>'}`
-          : '<p>Not connected yet. Card payments need a Stripe key on the server (see the README). Until then, record cash and check payments here.</p>'}
-      </section>
+        ${ro ? '' : '<button class="btn primary" type="submit">Save settings</button>'}
+      </fieldset></form>
       <section class="card stack">
         <h2>Text alerts</h2>
-        <p>${cfg.sms_alerts ? 'On. You get a text for each new request, signature and payment.' : 'Off. Add Twilio settings on the server to get a text for every new request.'}</p>
+        <p>${cfg.sms_alerts ? 'On. You get a text for each new request, signature and payment.' : 'Off. Add a “Text new requests to” number on the Business page; Agilities turns on texting for the platform.'}</p>
       </section>
+      <form class="card stack" id="pw"><h2>Change password</h2>
+        <div class="grid2"><div><label for="pw-c">Current password</label><input id="pw-c" name="current" type="password" autocomplete="current-password"></div><div><label for="pw-n">New password</label><input id="pw-n" name="password" type="password" minlength="10" autocomplete="new-password"></div></div>
+        <p class="alert" id="pw-msg" hidden></p><button class="btn" type="submit">Change password</button></form>
+      <p class="small muted"><a href="/legal/terms" target="_blank" rel="noopener">Terms</a> · <a href="/legal/privacy" target="_blank" rel="noopener">Privacy</a> · <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment terms</a></p>
       <button class="btn ghost" type="button" id="logout">Log out</button>`;
-    const f = document.getElementById('sf');
+    const c = document.getElementById('connect');
+    if (c) c.addEventListener('click', async () => {
+      c.disabled = true; c.textContent = 'Opening Stripe…';
+      try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); location.href = url; }
+      catch (err) { flash(document.getElementById('st-msg'), err.message, 'err'); c.disabled = false; c.textContent = 'Connect Stripe'; }
+    });
+    const f = document.getElementById('sf'), el = f.elements;
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
-      try { await api('/api/settings', { method: 'PUT', body: { deposit_cents: toCents(f.dep.value), tax_rate_bp: toCents(f.tax.value), terms: f.terms.value } }); flash(document.getElementById('s-msg'), 'Saved.'); }
+      try { await api('/api/settings', { method: 'PUT', body: { deposit_label: el.dlabel.value, deposit_cents: toCents(el.dep.value), tax_rate_bp: toCents(el.tax.value), terms: el.terms.value } }); flash(document.getElementById('s-msg'), 'Saved.'); }
       catch (err) { flash(document.getElementById('s-msg'), err.message, 'err'); }
     });
-    document.getElementById('logout').addEventListener('click', async () => { await api('/api/logout', { method: 'POST' }); showLogin(); });
+    const pw = document.getElementById('pw');
+    pw.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try { await api('/api/password/change', { method: 'POST', body: Object.fromEntries(new FormData(pw)) }); pw.reset(); flash(document.getElementById('pw-msg'), 'Password changed.'); }
+      catch (err) { flash(document.getElementById('pw-msg'), err.message, 'err'); }
+    });
+    document.getElementById('logout').addEventListener('click', logout);
+  }
+
+  // ---------- Agilities super admin ----------
+  async function superView() {
+    setNav('super');
+    const d = await api('/api/super/overview');
+    const t = d.totals;
+    const stripeTag = (r) => r.stripe_charges_enabled ? '<span class="tag paid">Payments on</span>' : r.stripe_account_id ? '<span class="tag">Stripe pending</span>' : '<span class="tag void">No Stripe</span>';
+    view.innerHTML = `
+      <div class="row between"><h1>Businesses</h1><a class="btn ghost sm" href="/api/super/fees.csv">Download Processing Fees (CSV)</a></div>
+      <div class="grid2">
+        <section class="card"><p class="muted small">Processing Fees this month</p><p class="big-num">${money(t.fee_month_cents)}</p></section>
+        <section class="card"><p class="muted small">Processing Fees all time</p><p class="big-num">${money(t.fee_cents)}</p></section>
+        <section class="card"><p class="muted small">Online payment volume</p><p class="big-num">${money(t.online_cents)}</p></section>
+        <section class="card"><p class="muted small">Businesses</p><p class="big-num">${t.active} <span class="small muted">active of ${t.businesses}</span></p></section>
+      </div>
+      ${!d.platform.stripe_ready ? '<p class="alert err">Stripe isn’t configured on the server yet (STRIPE_SECRET_KEY). Businesses can’t take online payments until it is.</p>' : d.platform.test_mode ? '<p class="alert ok">Stripe is in test mode.</p>' : ''}
+      <form class="card stack" id="nb">
+        <h2>Add a business</h2>
+        <p class="small muted">Creates the account and gives you a setup link to send the owner. Owners can also sign up themselves at <a href="/signup">${esc(location.origin)}/signup</a>.</p>
+        <div class="grid2"><div><label for="nb-biz">Business name</label><input id="nb-biz" name="business_name" required></div><div><label for="nb-name">Owner name</label><input id="nb-name" name="owner_name"></div><div><label for="nb-email">Owner email</label><input id="nb-email" name="owner_email" type="email" required></div><div><label for="nb-phone">Owner mobile</label><input id="nb-phone" name="phone" type="tel"></div></div>
+        <p class="alert" id="nb-msg" hidden></p>
+        <button class="btn primary" type="submit">Create business</button>
+      </form>
+      <div class="list">${d.tenants.map((r) => `
+        <a class="item" href="#/super/${r.id}">
+          <div class="grow stack" style="gap:4px">
+            <div class="row" style="gap:8px"><span class="item-title">${esc(r.name)}</span>${r.status === 'active' ? '' : '<span class="tag new">Suspended</span>'}${stripeTag(r)}${r.fee_bp != null || r.fee_mode ? '<span class="tag">Custom fee</span>' : ''}</div>
+            <div class="small muted">${esc(r.owner_email || '')} · ${r.requests} requests · last login ${r.last_login_at ? when(r.last_login_at) : 'never'}</div>
+          </div>
+          <div class="stack" style="gap:2px;align-items:flex-end"><strong>${money(r.fee_cents)}</strong><span class="small muted">fees · ${money(r.online_cents)} online</span></div>
+        </a>`).join('') || '<p class="empty">No businesses yet.</p>'}</div>`;
+    const f = document.getElementById('nb');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        const r = await api('/api/super/tenants', { method: 'POST', body: Object.fromEntries(new FormData(f)) });
+        view.insertAdjacentHTML('afterbegin', `<section class="card stack"><p class="alert ok">${esc(r.tenant.name)} created.</p><p>Send the owner this link to set their password and accept the agreements (valid 7 days):</p><textarea readonly rows="2">${esc(r.setup_link)}</textarea><button class="btn sm" type="button" data-copy="${esc(r.setup_link)}">Copy link</button></section>`);
+        view.querySelector('[data-copy]').addEventListener('click', (ev) => copy(r.setup_link, ev.target));
+        f.reset();
+      } catch (err) { flash(document.getElementById('nb-msg'), err.message, 'err'); }
+    });
+  }
+
+  async function superTenantView(id) {
+    setNav('super');
+    const d = await api('/api/super/tenants/' + id);
+    const t = d.tenant;
+    view.innerHTML = `
+      <a href="#/super" class="small">← Businesses</a>
+      <div class="row between"><h1>${esc(t.name)}</h1><button class="btn primary" type="button" id="open">Open their dashboard</button></div>
+      <p class="small"><a href="${esc(d.site_url)}" target="_blank" rel="noopener">${esc(d.site_url)}</a>${t.custom_domain ? ` · ${esc(t.custom_domain)}` : ''}</p>
+      <p class="alert" id="st-msg" hidden></p>
+      <div class="grid2">
+        <form class="card stack" id="tf">
+          <h2>Account</h2>
+          <div><label for="t-status">Status</label><select id="t-status" name="status"><option value="active" ${t.status === 'active' ? 'selected' : ''}>Active</option><option value="suspended" ${t.status === 'suspended' ? 'selected' : ''}>Suspended</option></select></div>
+          <div><label for="t-fee">Processing Fee % (blank = platform default)</label><input id="t-fee" name="fee" inputmode="decimal" value="${d.fee_bp == null ? '' : d.fee_bp / 100}"></div>
+          <div><label for="t-mode">Processing Fee is</label><select id="t-mode" name="mode"><option value="">Platform default</option>${Object.entries(FEE_MODE).map(([k, v]) => `<option value="${k}" ${d.fee_mode === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+          <div><label for="t-acct">Stripe account ID</label><input id="t-acct" name="acct" value="${esc(t.stripe_account_id || '')}" placeholder="acct_…"><p class="small muted">${t.stripe_charges_enabled ? 'Payments on.' : t.stripe_account_id ? 'Connected, setup not finished.' : 'Not connected. The owner connects from Settings, or paste an account ID connected in your Stripe dashboard.'}</p></div>
+          <button class="btn primary" type="submit">Save</button>
+        </form>
+        <section class="card stack">
+          <h2>People</h2>
+          ${d.users.map((u) => `<div class="row between"><div><strong>${esc(u.name || u.email)}</strong> <span class="tag">${esc(u.role)}</span><div class="small muted">${esc(u.email)} · last in ${u.last_login_at ? when(u.last_login_at) : 'never'}</div></div><button class="btn ghost sm" type="button" data-reset="${u.id}">Reset link</button></div>`).join('')}
+          <h2 style="margin-top:12px">Agreements</h2>
+          ${d.agreements.length ? `<ul class="small" style="margin:0;padding-left:18px">${d.agreements.map((a) => `<li>${esc(a.doc)} v${esc(a.version)} · ${esc(a.email || '')} · ${esc(a.accepted_at)} · ${esc(a.ip || '')}</li>`).join('')}</ul>` : '<p class="small muted">Not accepted yet.</p>'}
+        </section>
+      </div>
+      <section class="card stack">
+        <h2>Payments</h2>
+        ${d.payments.length ? `<table class="items"><thead><tr><th>Date</th><th>For</th><th>Method</th><th class="num">Amount</th><th class="num">Processing Fee</th></tr></thead><tbody>${d.payments.map((p) => `<tr><td>${esc((p.paid_at || p.created_at).slice(0, 10))}${p.status === 'paid' ? '' : ' <span class="tag">' + esc(p.status) + '</span>'}</td><td>${esc(p.description)}</td><td>${esc(p.method)}</td><td class="num">${money(p.amount_cents)}</td><td class="num">${money(p.fee_cents)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted small">No payments yet.</p>'}
+      </section>`;
+    const msg = document.getElementById('st-msg');
+    document.getElementById('open').addEventListener('click', async () => { await api('/api/super/view-as', { method: 'POST', body: { tenant_id: t.id } }); await loadMe(); location.hash = '#/requests'; route(); });
+    const f = document.getElementById('tf'), el = f.elements;
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api('/api/super/tenants/' + id, { method: 'PATCH', body: { status: el.status.value, fee_bp: el.fee.value.trim() === '' ? null : toCents(el.fee.value), fee_mode: el.mode.value || null, stripe_account_id: el.acct.value } });
+        await superTenantView(id); flash(document.getElementById('st-msg'), 'Saved.');
+      } catch (err) { flash(msg, err.message, 'err'); }
+    });
+    view.querySelectorAll('[data-reset]').forEach((b) => b.addEventListener('click', async () => {
+      const r = await api(`/api/super/users/${b.dataset.reset}/reset-link`, { method: 'POST' });
+      await copy(r.link); flash(msg, `Reset link for ${r.email} copied. It works for 7 days.`);
+    }));
+  }
+
+  async function platformView() {
+    setNav('platform');
+    const d = await api('/api/super/overview');
+    const p = d.platform;
+    view.innerHTML = `
+      <h1>Platform</h1>
+      <form class="card stack" id="pf">
+        <h2>Processing Fee</h2>
+        <p class="small muted">Applies to every online payment unless a business has its own setting. Customers and businesses see it only as “Processing Fee”.</p>
+        <div class="grid2">
+          <div><label for="p-fee">Processing Fee %</label><input id="p-fee" name="fee" inputmode="decimal" value="${p.fee_bp / 100}"></div>
+          <div><label for="p-mode">Processing Fee is</label><select id="p-mode" name="mode">${Object.entries(FEE_MODE).map(([k, v]) => `<option value="${k}" ${p.fee_mode === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+        </div>
+        <p class="alert" id="p-msg" hidden></p>
+        <button class="btn primary" type="submit">Save</button>
+      </form>
+      <section class="card stack">
+        <h2>Services</h2>
+        <dl class="facts"><dt>Stripe</dt><dd>${p.stripe_ready ? (p.test_mode ? 'Connected (test mode)' : 'Connected (live)') : 'Not configured'}</dd><dt>Text alerts</dt><dd>${p.sms ? 'On (Twilio)' : 'Off'}</dd><dt>Email</dt><dd>${p.email ? 'On (password resets)' : 'Off: send reset links by hand from a business page'}</dd></dl>
+      </section>
+      <section class="card stack"><h2>Legal</h2><p class="small"><a href="/legal/terms" target="_blank" rel="noopener">Business Terms</a> · <a href="/legal/privacy" target="_blank" rel="noopener">Privacy</a> · <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment terms</a> · <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer terms</a></p></section>
+      <button class="btn ghost" type="button" id="logout">Log out</button>`;
+    const f = document.getElementById('pf');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try { await api('/api/super/settings', { method: 'PUT', body: { fee_bp: toCents(f.elements.fee.value), fee_mode: f.elements.mode.value } }); flash(document.getElementById('p-msg'), 'Saved.'); }
+      catch (err) { flash(document.getElementById('p-msg'), err.message, 'err'); }
+    });
+    document.getElementById('logout').addEventListener('click', logout);
   }
 
   // ---------- router ----------
+  async function loadMe() { me = await api('/api/me', { quiet: true }).catch(() => ({ authed: false })); if (!me.authed) me = null; return me; }
   async function route() {
-    const me = await api('/api/me').catch(() => ({ authed: false }));
-    if (!me.authed) return showLogin();
-    showChrome(true);
-    const h = location.hash.replace(/^#\/?/, '') || 'requests';
+    const h = location.hash.replace(/^#\/?/, '');
     const [a, b] = h.split('/');
+    if (a === 'reset' && b) return showAuth('reset', b);
+    if (!me) await loadMe();
+    if (!me) return showAuth(['signup', 'forgot'].includes(a) ? a : 'login');
+    if (me.needs_agreements) return agreementsView();
+    if (me.tenant && me.tenant.status !== 'active' && !isSuper()) { showChrome(false); view.innerHTML = '<section class="card login stack"><h1>Account suspended</h1><p>Contact Agilities support to restore access.</p><button class="btn ghost" type="button" id="lo">Log out</button></section>'; document.getElementById('lo').addEventListener('click', logout); return; }
+    showChrome(true); buildChrome();
     try {
-      if (a === 'requests' && b === 'new') newRequestView();
+      if (!me.tenant) {
+        if (a === 'super' && b) await superTenantView(b);
+        else if (a === 'platform') await platformView();
+        else await superView();
+      } else if (a === 'requests' && b === 'new') newRequestView();
       else if (a === 'requests' && b) await requestView(b);
       else if (a === 'quotes' && b) await quoteView(b);
       else if (a === 'quotes') await quotesView();
       else if (a === 'products') await productsView();
-      else if (a === 'settings') await settingsView();
+      else if (a === 'business') await businessView();
+      else if (a === 'settings') await settingsView(b);
       else await requestsView();
       window.scrollTo(0, 0);
     } catch (err) {
-      if (err.message !== 'Please log in.') view.innerHTML = `<p class="alert err">${esc(err.message)}</p><a href="#/requests">Back to requests</a>`;
+      if (err.message !== 'Please log in.') view.innerHTML = `<p class="alert err">${esc(err.message)}</p><a href="#/">Back</a>`;
     }
   }
   window.addEventListener('hashchange', route);
@@ -494,15 +852,14 @@
 
   // Check for new requests every 30 seconds.
   setInterval(async () => {
-    if (document.getElementById('topbar').hidden) return;
+    if (!me || !me.tenant || document.getElementById('topbar').hidden) return;
     try {
-      const d = await api('/api/requests?filter=new');
+      const d = await api('/api/requests?filter=new', { quiet: true });
       if (d.counts.new > newCount && 'Notification' in window && Notification.permission === 'granted') new Notification('New request', { body: d.rows[0] ? `${d.rows[0].name || 'Customer'}: ${(d.rows[0].location || '').slice(0, 80)}` : '' });
       setNewCount(d.counts.new);
-      if ((location.hash === '' || location.hash === '#/requests') && document.activeElement === document.body) requestsView();
     } catch { /* offline */ }
   }, 30000);
   if ('Notification' in window && Notification.permission === 'default') {
-    document.addEventListener('click', () => Notification.requestPermission(), { once: true });
+    document.addEventListener('click', () => { if (me && me.tenant) Notification.requestPermission(); }, { once: true });
   }
 })();

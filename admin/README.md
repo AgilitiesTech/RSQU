@@ -1,59 +1,98 @@
-# Mike’s Dashboard (RSQU admin)
+# Service platform (RSQU admin)
 
-The back office for Mike Stevens Emergency RV & Trailer Repair. Mike uses it on his phone to:
+A white-label back office for mobile service businesses, run by Agilities. The first business on it is Mike Stevens Emergency RV & Trailer Repair.
 
-1. **Get requests** from the website’s repair form and $499 winterizing booking form, with photo, GPS location and one-tap call, text and map. A new request can also send him a text alert.
-2. **Take the $129 diagnosis deposit** by card link (hand over the phone or text the link), cash or check. A paid deposit is credited automatically on the job’s quote.
-3. **Build a quote onsite** from his products list plus custom lines, with quantities, optional sales tax, notes and terms.
-4. **Show the proposal** to the customer, who reviews it and **signs with a finger** on the spot (name, signature image, time, IP and device are recorded).
-5. **Collect payment** by card or bank (ACH) through Stripe Checkout, or record cash or check.
-6. **Manage products** and default settings (deposit amount, tax rate, terms).
+**Each business gets:** sign-up and log-in, its own brand (name, colors, logo, photo), a hosted website with a request form (`/s/<business>` or its own domain), a request inbox with photo, GPS, call/text/map, an optional up-front deposit (Mike: $129, credited toward the job), onsite quotes from its products list, a branded proposal the customer signs with a finger, online card and bank payments through its own Stripe account, cash/check recording, team members, and text alerts.
 
-No outside packages: plain Node.js 22.13+ with the built-in SQLite. The database and photos live in `DATA_DIR`.
+**Agilities gets:** a super admin dashboard over every business, a 3% **Processing Fee** on every online payment (collected automatically into the Agilities Stripe account), per-business fee overrides, suspend/restore, “open their dashboard” access, password reset links, agreement records, and a CSV of all Processing Fees.
 
-## Run it locally
+No outside packages: Node.js 22.13+ with built-in SQLite. Data and uploads live in `DATA_DIR`.
 
 ```bash
 cd admin
-ADMIN_PASSWORD=test node --no-warnings server.js
-# open http://localhost:3000
-npm test        # end-to-end test of the request → deposit → quote → sign → pay flow (fake Stripe)
+SUPER_ADMIN_EMAIL=you@example.com SUPER_ADMIN_PASSWORD=choose-a-long-one node --no-warnings server.js
+npm test   # end-to-end tests with a fake Stripe
 ```
 
-## Deploy
+---
 
-It needs a small always-on server with a persistent disk (the database is a single file).
+## Agilities: run the platform
 
-- **Render:** New → Blueprint → this repo. `render.yaml` (repo root) sets up the service and a 1 GB disk (Starter plan). Fill in the secret settings it asks for.
-- **Anywhere with Docker** (Fly.io, Railway, a VPS): build `admin/Dockerfile` and mount a volume at `/data`.
+### 1. Deploy
 
-Settings are listed in `.env.example`. At minimum set `ADMIN_PASSWORD`, `BASE_URL` and `ALLOWED_ORIGINS`.
+- **Render:** New → Blueprint → this repo (`render.yaml` at the repo root). Starter plan with a 1 GB disk.
+- **Anywhere with Docker:** build `admin/Dockerfile`, mount a volume at `/data`.
 
-### Connect the website
+Required settings (see `.env.example`): `SUPER_ADMIN_EMAIL`, `SUPER_ADMIN_PASSWORD`, `BASE_URL` (the dashboard’s public address). The super admin account is created on first start; change the password afterwards from Settings, and you can then remove `SUPER_ADMIN_PASSWORD`.
 
-In `index.html` and `winterize.html` at the repo root, set:
+### 2. Set up Stripe Connect (once, on the Agilities Stripe account)
+
+1. Stripe Dashboard → **Connect** → Get started → choose **Platform**. Allow **Standard** connected accounts.
+2. Connect → Settings → **Branding**: add the Agilities name, icon and color. Business owners see this during Stripe onboarding.
+3. Developers → **API keys**: put the secret key in `STRIPE_SECRET_KEY` (use `sk_test_…` first).
+4. Developers → **Webhooks** → Add endpoint `https://<BASE_URL>/api/stripe/webhook`, choose **Events on Connected accounts**, events `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `account.updated`. Put its signing secret in `STRIPE_CONNECT_WEBHOOK_SECRET`.
+5. Optional: each business can turn on **ACH Direct Debit** in its own Stripe settings for cheaper bank payments.
+
+Processing Fees arrive in the Agilities Stripe balance as **Collected fees** (Connect → Collected fees) and pay out to the Agilities bank account on your normal payout schedule.
+
+### 3. Manage businesses
+
+Log in at `https://<BASE_URL>/admin` with the super admin email. You land on **Businesses**:
+
+- **Totals:** Processing Fees this month and all time, online payment volume, active businesses. **Download Processing Fees (CSV)** for bookkeeping.
+- **Add a business:** enter the business and owner email. You get a setup link (valid 7 days) to send the owner. They set a password and accept the agreements on first log-in. Owners can also sign themselves up at `https://<BASE_URL>/signup`.
+- **Open a business** to:
+  - **Open their dashboard:** work inside their account exactly as they see it (a yellow bar shows you are viewing as them; “Back to all businesses” returns you).
+  - **Suspend / restore:** a suspended business can’t log in, take requests, or show its website.
+  - **Processing Fee:** leave blank for the platform default, or set a custom % and whether it is added to the customer’s total, taken from the business’s payout, or off.
+  - **Stripe account ID:** paste an `acct_…` if you connected an existing Stripe account from your Stripe dashboard; otherwise the owner connects from their Settings.
+  - **Reset link** for any user, the **agreements log** (document, version, time, IP), and their **payments** with Processing Fees.
+- **Platform** tab: the default Processing Fee (3%) and mode (added to the customer’s total by default), and service status.
+
+Customers and businesses only ever see the fee as **Processing Fee**. Customers see their business’s brand, not Agilities.
+
+### 4. Optional services
+
+- **Text alerts** (Twilio): `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`. Each business enters the number to alert on its Business page.
+- **Password reset emails** (Resend): `RESEND_API_KEY`, `EMAIL_FROM`. Without it, send reset links by hand from the business page.
+
+### 5. Custom domains
+
+A business can serve its hosted site from its own domain: it adds a CNAME pointing at the dashboard host and enters the domain on its Business page. Your host must also accept the domain and issue TLS for it (on Render: Settings → Custom Domains).
+
+### 6. Legal
+
+Drafts are in `public/legal/` and served at `/legal/terms`, `/legal/privacy`, `/legal/payment-terms` and `/legal/customer-terms`. Fill in the bracketed placeholders and **have a lawyer review them before launch**, especially the Processing Fee rules (see below). Agreement acceptance is recorded with version `2026-11-01` (`AGREEMENT_VERSION` in `src/db.js`); bump it when the documents change and every owner is asked to accept again on next log-in.
+
+**Processing Fee compliance:** a fee added to a customer’s card payment is a surcharge under card network rules. In the US it generally must be disclosed before payment (the app does this), is capped (3% under current Visa rules), can’t be applied to debit or prepaid cards, and is restricted in some states. Stripe Checkout can’t vary the fee by card type, so get legal advice; the safer settings are “taken from the business’s payout” or applying it only where allowed.
+
+---
+
+## Business owners
+
+- **Business:** name, phone, service area, colors, logo and photo, website text, own domain, team members, and the snippet to connect an existing website’s form.
+- **Products:** prices for quotes; “Show on website” lists one on the site; “Customers can book it” makes a fixed-price package bookable from the form.
+- **Settings:** connect Stripe, the deposit name and amount, default tax and terms, change password.
+
+### Connect an existing website (like Mike’s GitHub Pages site)
+
+Add to the page `<head>`:
 
 ```html
-<meta name="rsqu-api" content="https://YOUR-DASHBOARD-ADDRESS">
+<meta name="rsqu-api" content="https://<BASE_URL>">
+<meta name="rsqu-business" content="<business-slug>">
 ```
 
-and add the website’s address to `ALLOWED_ORIGINS`. Until that’s set, or if the dashboard can’t be reached, the website forms open a pre-filled text message to Mike instead, so no request is lost.
+and include `forms.js` from the repo root. Until both are set, the forms open a pre-filled text message instead.
 
-### Payments (Stripe)
+### Mike’s business
 
-1. Create (or log in to) Mike’s Stripe account and finish business verification.
-2. Developers → API keys: put the secret key in `STRIPE_SECRET_KEY` (start with `sk_test_...`).
-3. Developers → Webhooks → add endpoint `https://YOUR-DASHBOARD-ADDRESS/api/stripe/webhook` with events `checkout.session.completed` and `checkout.session.async_payment_succeeded`. Put its signing secret in `STRIPE_WEBHOOK_SECRET`.
-4. Settings → Payment methods: turn on **ACH Direct Debit** to let customers pay big jobs from their bank for a much lower fee than cards. Checkout shows whatever methods are turned on there.
+```bash
+DATA_DIR=/data BASE_URL=https://<BASE_URL> node scripts/seed-mike.js mike@hisemail.com
+```
 
-Card payments are confirmed when the customer returns from checkout; the webhook is the backup and is required for bank payments, which take a few days to clear.
+creates his business with his brand, photo, service area, the $499 winterizing package, the $129 diagnosis deposit, and prints a setup link for him. (Or let him sign up and enter these himself.)
 
-**Stripe Connect (optional, for Agilities):** if Mike’s account is connected to an Agilities platform account, use the platform’s secret key, set `STRIPE_CONNECT_ACCOUNT_ID=acct_...`, and optionally `STRIPE_APPLICATION_FEE_BP` (basis points, e.g. `100` = 1%). Charges go to Mike’s account; any platform fee goes to Agilities.
+## Backups
 
-### Text alerts (optional, Twilio)
-
-Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM` and `NOTIFY_SMS_TO` to text Mike for every new request, signature and payment. Without them, the dashboard still shows new requests (it checks every 30 seconds and can show a browser notification).
-
-### Backups
-
-Back up `DATA_DIR` (the `rsqu.db` file and `uploads/` folder). Customer photos and signatures are only visible to a logged-in admin, except that a customer sees their own signature on their proposal link.
+Back up `DATA_DIR` (`rsqu.db` and `uploads/`).

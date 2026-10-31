@@ -11,17 +11,17 @@ services:
       mountPath: /data
       sizeGB: 1
     envVars:
-      - key: ADMIN_PASSWORD
+      - key: SUPER_ADMIN_EMAIL
+        sync: false
+      - key: SUPER_ADMIN_PASSWORD
         sync: false
       - key: SESSION_SECRET
         generateValue: true
-      - key: ALLOWED_ORIGINS
-        value: https://agilitiestech.github.io
       - key: BASE_URL
         sync: false
       - key: STRIPE_SECRET_KEY
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET
+      - key: STRIPE_CONNECT_WEBHOOK_SECRET
         sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false
@@ -29,5 +29,7 @@ services:
         sync: false
       - key: TWILIO_FROM
         sync: false
-      - key: NOTIFY_SMS_TO
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
         sync: false
