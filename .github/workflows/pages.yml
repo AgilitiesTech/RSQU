@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - index.html
+      - "*.html"
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -30,7 +30,7 @@ jobs:
       - name: Assemble site
         run: |
           mkdir _site
-          cp index.html _site/
+          cp *.html _site/
           touch _site/.nojekyll
 
       - uses: actions/configure-pages@v5
