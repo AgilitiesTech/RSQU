@@ -16,13 +16,13 @@ services:
       - key: PLATFORM_CONTACT_EMAIL
         value: aaron@agilitiestech.com
       - key: PLATFORM_URL
-        sync: false
+        value: https://gethitchpoint.com
       - key: SUPER_ADMIN_PASSWORD
         sync: false
       - key: SESSION_SECRET
         generateValue: true
       - key: BASE_URL
-        sync: false
+        value: https://gethitchpoint.com
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET

@@ -889,6 +889,9 @@ export function createApp(env = process.env) {
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
 
       const host = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
+      // Send www.<platform domain> to the bare domain so search engines see one site.
+      const platformHost = env.PLATFORM_URL ? new URL(env.PLATFORM_URL).host : '';
+      if (platformHost && host === 'www.' + platformHost) { res.writeHead(301, { Location: env.PLATFORM_URL.replace(/\/$/, '') + req.url }); return res.end(); }
       const domainTenant = host ? db.prepare('SELECT * FROM tenants WHERE custom_domain = ?').get(host) : null;
       if (pathname === '/') {
         if (domainTenant) return serveSite(res, domainTenant);
