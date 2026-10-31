@@ -3,11 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { openDb, platformSettings, processingFee, quoteTotals, slugify, AGREEMENT_VERSION, BUSINESS_AGREEMENTS } from './src/db.js';
+import { openDb, platformSettings, platformFee, quoteTotals, slugify, AGREEMENT_VERSION, BUSINESS_AGREEMENTS } from './src/db.js';
 import { hashPassword, verifyPassword, sessions, randomToken, sha256 } from './src/auth.js';
 import { stripeClient, verifyStripeSignature } from './src/stripe.js';
 import { notifier } from './src/notify.js';
 import { renderSite } from './src/site.js';
+import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -18,6 +19,8 @@ export function createApp(env = process.env) {
   const uploads = path.join(dataDir, 'uploads');
   const stripe = stripeClient(env);
   const notify = notifier(env);
+  const platformEmail = env.PLATFORM_CONTACT_EMAIL || 'aaron@agilitiestech.com';
+  const platformName = env.PLATFORM_NAME || BRAND.name;
 
   // Session secret: from env, else generated once and kept in the database.
   let secret = env.SESSION_SECRET || db.prepare(`SELECT value FROM platform_settings WHERE key = 'session_secret'`).get()?.value;
@@ -65,6 +68,8 @@ export function createApp(env = process.env) {
     try { return raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, 'Invalid JSON'); }
   }
 
+  // Public marketing origin (the brand domain if set).
+  const siteOrigin = (req) => (env.PLATFORM_URL || baseUrl(req)).replace(/\/$/, '');
   function baseUrl(req) {
     if (env.BASE_URL) return env.BASE_URL.replace(/\/$/, '');
     const proto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
@@ -95,8 +100,8 @@ export function createApp(env = process.env) {
 
   function publicTenant(t) {
     if (!t) return null;
-    const { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_charges_enabled, stripe_details_submitted, created_at } = t;
-    return { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_charges_enabled, stripe_details_submitted, created_at };
+    const { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_payouts_enabled, stripe_details_submitted, statement_name, created_at } = t;
+    return { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_payouts_enabled, stripe_details_submitted, statement_name, created_at };
   }
   // Brand details safe to show customers.
   const brand = (t) => ({ name: t.name, phone: t.phone, primary_color: t.primary_color, accent_color: t.accent_color, logo: t.logo ? `/media/${t.slug}/${t.logo}` : null, slug: t.slug });
@@ -111,6 +116,10 @@ export function createApp(env = process.env) {
     if (!user || user.role === 'super') return false;
     const have = db.prepare(`SELECT doc FROM agreements WHERE tenant_id = ? AND user_id = ? AND version = ?`).all(user.tenant_id, user.id, AGREEMENT_VERSION).map((r) => r.doc);
     return user.role === 'owner' && BUSINESS_AGREEMENTS.some((d) => !have.includes(d));
+  }
+  // Owners must connect a bank account for direct deposit (Stripe Express) before using the dashboard.
+  function needsPayoutSetup(user, tenant) {
+    return Boolean(stripe.enabled && user && user.role === 'owner' && tenant && !tenant.stripe_details_submitted);
   }
   function recordAgreements(req, user, tenantId) {
     const ins = db.prepare(`INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)`);
@@ -173,45 +182,80 @@ export function createApp(env = process.env) {
   }
 
   // ---------- payments ----------
+  // Online payments are charged on the platform's Stripe account. The customer pays only the amount due.
+  const onlineReady = (t) => stripe.enabled && Boolean(t.stripe_account_id && t.stripe_details_submitted);
   function onlineQuote(t, amount) {
-    const pf = processingFee(db, t, amount);
-    return { mode: pf.mode, bp: pf.bp, fee: pf.mode === 'customer' ? pf.fee : 0, charge: pf.charge, card_payments: stripe.enabled && Boolean(t.stripe_account_id && t.stripe_charges_enabled) };
+    return { fee: 0, charge: amount, bp: platformFee(db, t, amount).bp, card_payments: onlineReady(t) };
   }
 
   async function startCheckout(req, t, payment, { successPath, cancelPath, email }) {
-    if (!stripe.enabled || !t.stripe_account_id || !t.stripe_charges_enabled) throw new HttpError(503, 'Online payments aren’t set up yet for this business. Please pay directly.');
-    const pf = processingFee(db, t, payment.amount_cents);
-    const lines = [{ name: payment.description, amountCents: payment.amount_cents }];
-    if (pf.mode === 'customer' && pf.fee > 0) lines.push({ name: 'Processing Fee', amountCents: pf.fee });
+    if (!onlineReady(t)) throw new HttpError(503, 'Online payments aren’t set up yet for this business. Please pay directly.');
     const base = baseUrl(req);
     const sep = successPath.includes('?') ? '&' : '?';
     const session = await stripe.createCheckout({
-      account: t.stripe_account_id,
-      lines,
-      feeCents: pf.fee,
+      name: payment.description,
+      amountCents: payment.amount_cents,
       successUrl: `${base}${successPath}${sep}paid=${payment.token}&session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl: `${base}${cancelPath}`,
       ref: payment.token,
       email,
-      statementName: t.name,
+      statementName: t.statement_name || t.name,
     });
-    db.prepare(`UPDATE payments SET stripe_session_id = ?, stripe_account_id = ?, fee_cents = ?, fee_mode = ? WHERE id = ?`).run(session.id, t.stripe_account_id, pf.fee, pf.mode, payment.id);
+    db.prepare(`UPDATE payments SET stripe_session_id = ? WHERE id = ?`).run(session.id, payment.id);
     return session.url;
+  }
+
+  // After an online payment succeeds: read Stripe's actual fee, keep it plus the platform share
+  // (together the "Processing Fee"), and transfer the rest to the business's Stripe account for payout.
+  async function settle(token) {
+    let pay = getPayment(token);
+    if (!pay || pay.status !== 'paid' || pay.method !== 'card' || pay.transfer_status === 'sent') return pay;
+    const t = getTenant(pay.tenant_id);
+    const fail = (msg) => db.prepare(`UPDATE payments SET transfer_status = 'failed', transfer_error = ? WHERE id = ?`).run(String(msg).slice(0, 300), pay.id);
+    try {
+      if (!pay.charge_id) {
+        const s = await stripe.retrieveCheckout(pay.stripe_session_id);
+        const ch = s.payment_intent && s.payment_intent.latest_charge;
+        const bt = ch && ch.balance_transaction;
+        if (!ch || !bt || typeof bt !== 'object') {
+          db.prepare(`UPDATE payments SET transfer_status = 'pending', transfer_error = 'Waiting for Stripe to settle the payment' WHERE id = ?`).run(pay.id);
+          return getPayment(token);
+        }
+        const { fee } = platformFee(db, t, pay.amount_cents);
+        const payout = Math.max(0, pay.amount_cents - bt.fee - fee);
+        db.prepare(`UPDATE payments SET charge_id = ?, stripe_fee_cents = ?, fee_cents = ?, payout_cents = ?, transfer_status = 'pending' WHERE id = ?`).run(ch.id, bt.fee, fee, payout, pay.id);
+        pay = getPayment(token);
+      }
+      if (!t.stripe_account_id) { fail('The business hasn’t connected a payout account yet.'); return getPayment(token); }
+      if (pay.payout_cents <= 0) { db.prepare(`UPDATE payments SET transfer_status = 'sent', transfer_error = NULL WHERE id = ?`).run(pay.id); return getPayment(token); }
+      const tr = await stripe.createTransfer({ amountCents: pay.payout_cents, destination: t.stripe_account_id, sourceTransaction: pay.charge_id, group: pay.token, ref: pay.token });
+      db.prepare(`UPDATE payments SET transfer_id = ?, transfer_status = 'sent', transfer_error = NULL WHERE id = ?`).run(tr.id, pay.id);
+      notify.sms(t.notify_phone, `${money(pay.payout_cents)} is on its way to your bank (${money(pay.amount_cents)} paid, ${money(pay.stripe_fee_cents + pay.fee_cents)} Processing Fee).`);
+    } catch (e) {
+      fail(e.message);
+    }
+    return getPayment(token);
+  }
+  async function retryPayouts(tenantId) {
+    const rows = db.prepare(`SELECT token FROM payments WHERE tenant_id = ? AND status = 'paid' AND method = 'card' AND transfer_status IN ('pending','failed')`).all(tenantId);
+    for (const r of rows) await settle(r.token);
   }
 
   async function confirmCheckout(payment, sessionId) {
     if (payment.status === 'paid') return true;
-    if (!sessionId || !stripe.enabled || !payment.stripe_account_id) return false;
-    const s = await stripe.retrieveCheckout(sessionId, payment.stripe_account_id);
+    if (!sessionId || !stripe.enabled || sessionId !== payment.stripe_session_id) return false;
+    const s = await stripe.retrieveCheckout(sessionId);
     if (s.client_reference_id !== payment.token) return false;
-    if (s.payment_status === 'paid') { markPaid(getPayment(payment.token), 'card', s.id); return true; }
+    if (s.payment_status === 'paid') { markPaid(getPayment(payment.token), 'card', s.id); await settle(payment.token); return true; }
     return false;
   }
 
   async function refreshStripeStatus(t) {
     if (!stripe.enabled || !t.stripe_account_id) return t;
     const a = await stripe.getAccount(t.stripe_account_id);
-    db.prepare(`UPDATE tenants SET stripe_charges_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(a.charges_enabled ? 1 : 0, a.details_submitted ? 1 : 0, t.id);
+    const ready = a.payouts_enabled && (!a.capabilities || a.capabilities.transfers === 'active');
+    db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(ready ? 1 : 0, a.details_submitted ? 1 : 0, t.id);
+    if (ready) await retryPayouts(t.id);
     return getTenant(t.id);
   }
 
@@ -251,6 +295,7 @@ export function createApp(env = process.env) {
     const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role, last_login_at) VALUES (?,?,?,?, 'owner', ?)`).run(tid, email, name, hashPassword(b.password), now());
     const user = getUser(Number(u.lastInsertRowid));
     recordAgreements(req, user, tid);
+    notify.email(platformEmail, `New ${platformName} sign-up: ${business}`, `${name} <${email}> ${phone}\nBusiness: ${business}\n${baseUrl(req)}/admin/#/super/${tid}`);
     send(res, 201, { ok: true }, { 'Set-Cookie': cookie(req, sess.create(user.id), sess.maxAge) });
   });
 
@@ -272,6 +317,8 @@ export function createApp(env = process.env) {
       tenant: ctx.tenant ? publicTenant(ctx.tenant) : null,
       viewing_as: Boolean(ctx.viewAs),
       needs_agreements: needsAgreements(ctx.user),
+      needs_payout_setup: !ctx.isSuper && needsPayoutSetup(ctx.user, ctx.tenant),
+      platform: { name: platformName },
       agreement_version: AGREEMENT_VERSION,
     });
   });
@@ -399,7 +446,7 @@ export function createApp(env = process.env) {
     const pay = getPayment(p.token);
     const t = pay && getTenant(pay.tenant_id);
     if (!pay || !t) throw new HttpError(404, 'This payment link isn’t valid.');
-    send(res, 200, { description: pay.description, amount_cents: pay.amount_cents, status: pay.status, kind: pay.kind, paid_at: pay.paid_at, fee_cents: pay.status === 'paid' && pay.fee_mode === 'customer' ? pay.fee_cents : 0, online: onlineQuote(t, pay.amount_cents), business: brand(t) });
+    send(res, 200, { description: pay.description, amount_cents: pay.amount_cents, status: pay.status, kind: pay.kind, paid_at: pay.paid_at, fee_cents: 0, online: onlineQuote(t, pay.amount_cents), business: brand(t) });
   });
 
   route('POST', '/api/public/payments/:token/checkout', async (req, res, p) => {
@@ -427,19 +474,21 @@ export function createApp(env = process.env) {
     const o = evt.data?.object;
     if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(evt.type) && o?.payment_status === 'paid') {
       const pay = getPayment(o.client_reference_id || o.metadata?.payment_token || '');
-      if (pay && (!evt.account || evt.account === pay.stripe_account_id)) markPaid(pay, 'card', o.id);
+      if (pay && !evt.account && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); }
     } else if (evt.type === 'account.updated' && o?.id) {
-      db.prepare(`UPDATE tenants SET stripe_charges_enabled = ?, stripe_details_submitted = ? WHERE stripe_account_id = ?`).run(o.charges_enabled ? 1 : 0, o.details_submitted ? 1 : 0, o.id);
+      const ready = o.payouts_enabled && (!o.capabilities || o.capabilities.transfers === 'active');
+      db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE stripe_account_id = ?`).run(ready ? 1 : 0, o.details_submitted ? 1 : 0, o.id);
+      const t = db.prepare('SELECT id FROM tenants WHERE stripe_account_id = ?').get(o.id);
+      if (t && ready) await retryPayouts(t.id);
     }
     send(res, 200, { received: true });
   });
 
   // ===== business dashboard =====
   route('GET', '/api/config', async (req, res, p, url, { tenant: t }) => {
-    const pf = processingFee(db, t, 10000);
     send(res, 200, {
-      stripe: { platform_ready: stripe.enabled, test_mode: stripe.testMode, account: t.stripe_account_id, charges_enabled: Boolean(t.stripe_charges_enabled), details_submitted: Boolean(t.stripe_details_submitted) },
-      processing_fee: { bp: pf.bp, mode: pf.mode },
+      stripe: { platform_ready: stripe.enabled, test_mode: stripe.testMode, account: t.stripe_account_id, online_ready: onlineReady(t), payouts_enabled: Boolean(t.stripe_payouts_enabled), details_submitted: Boolean(t.stripe_details_submitted) },
+      processing_fee: { bp: platformFee(db, t, 0).bp },
       sms_alerts: notify.smsEnabled && Boolean(t.notify_phone),
       settings: { tax_rate_bp: t.tax_rate_bp, deposit_cents: t.deposit_cents, deposit_label: t.deposit_label, terms: t.terms || '' },
     });
@@ -635,39 +684,52 @@ export function createApp(env = process.env) {
     send(res, 200, { ok: true });
   }, { auth: 'owner' });
 
-  // Stripe Connect onboarding for the business
+  // Direct deposit: Stripe Express onboarding for the business owner.
   route('POST', '/api/stripe/connect', async (req, res, p, url, { tenant: t, user }) => {
-    if (!stripe.enabled) throw new HttpError(503, 'Online payments aren’t switched on for the platform yet. Contact support.');
+    if (!stripe.enabled) throw new HttpError(503, 'Payouts aren’t switched on for the platform yet. Contact support.');
     let acct = t.stripe_account_id;
     if (!acct) {
       acct = (await stripe.createAccount({ email: t.email || user.email, businessName: t.name, tenantId: t.id })).id;
       db.prepare('UPDATE tenants SET stripe_account_id = ? WHERE id = ?').run(acct, t.id);
     }
-    const link = await stripe.accountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/settings/stripe-refresh`, returnUrl: `${baseUrl(req)}/admin/#/settings/stripe-return` });
+    const link = await stripe.accountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
     send(res, 200, { url: link.url });
-  }, { auth: 'owner' });
+  }, { auth: 'owner', onboarding: true });
   route('POST', '/api/stripe/refresh', async (req, res, p, url, { tenant: t }) => {
     const fresh = await refreshStripeStatus(t);
-    send(res, 200, { charges_enabled: Boolean(fresh.stripe_charges_enabled), details_submitted: Boolean(fresh.stripe_details_submitted) });
+    send(res, 200, { payouts_enabled: Boolean(fresh.stripe_payouts_enabled), details_submitted: Boolean(fresh.stripe_details_submitted) });
+  }, { auth: 'tenant', onboarding: true });
+  route('POST', '/api/stripe/dashboard', async (req, res, p, url, { tenant: t }) => {
+    if (!t.stripe_account_id) throw new HttpError(409, 'Set up direct deposit first.');
+    send(res, 200, { url: (await stripe.loginLink(t.stripe_account_id)).url });
+  }, { auth: 'owner' });
+
+  // Payments and payouts for the business.
+  route('GET', '/api/payments', async (req, res, p, url, { tenant: t }) => {
+    send(res, 200, db.prepare(`SELECT id, kind, description, amount_cents, method, status, stripe_fee_cents, fee_cents, payout_cents, transfer_status, paid_at, created_at FROM payments WHERE tenant_id = ? AND status = 'paid' ORDER BY paid_at DESC LIMIT 200`).all(t.id));
   }, { auth: 'tenant' });
 
   // ===== Agilities super admin =====
   route('GET', '/api/super/overview', async (req, res) => {
     const month = new Date().toISOString().slice(0, 7);
     const rows = db.prepare(`
-      SELECT t.id, t.slug, t.name, t.status, t.created_at, t.stripe_account_id, t.stripe_charges_enabled, t.fee_bp, t.fee_mode, t.custom_domain,
+      SELECT t.id, t.slug, t.name, t.status, t.created_at, t.stripe_account_id, t.stripe_payouts_enabled, t.stripe_details_submitted, t.fee_bp, t.custom_domain,
         (SELECT email FROM users u WHERE u.tenant_id = t.id AND u.role = 'owner' ORDER BY u.id LIMIT 1) AS owner_email,
         (SELECT MAX(last_login_at) FROM users u WHERE u.tenant_id = t.id) AS last_login_at,
         (SELECT COUNT(*) FROM requests r WHERE r.tenant_id = t.id) AS requests,
         (SELECT COALESCE(SUM(amount_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS paid_cents,
         (SELECT COALESCE(SUM(amount_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND p.method = 'card') AS online_cents,
         (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS fee_cents,
-        (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND substr(p.paid_at,1,7) = ?) AS fee_month_cents
+        (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND substr(p.paid_at,1,7) = ?) AS fee_month_cents,
+        (SELECT COALESCE(SUM(stripe_fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS stripe_fee_cents,
+        (SELECT COALESCE(SUM(payout_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status = 'sent') AS payout_cents,
+        (SELECT COUNT(*) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status IN ('pending','failed')) AS payouts_waiting
       FROM tenants t ORDER BY t.id DESC`).all(month);
     const sum = (k) => rows.reduce((a, r) => a + (r[k] || 0), 0);
     send(res, 200, {
       platform: { ...platformSettings(db), stripe_ready: stripe.enabled, test_mode: stripe.testMode, sms: notify.smsEnabled, email: notify.emailEnabled },
-      totals: { businesses: rows.length, active: rows.filter((r) => r.status === 'active').length, paid_cents: sum('paid_cents'), online_cents: sum('online_cents'), fee_cents: sum('fee_cents'), fee_month_cents: sum('fee_month_cents') },
+      totals: { businesses: rows.length, active: rows.filter((r) => r.status === 'active').length, paid_cents: sum('paid_cents'), online_cents: sum('online_cents'), fee_cents: sum('fee_cents'), fee_month_cents: sum('fee_month_cents'), stripe_fee_cents: sum('stripe_fee_cents'), payout_cents: sum('payout_cents'), payouts_waiting: sum('payouts_waiting') },
+      leads_new: db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE status = 'new'`).get().n,
       tenants: rows,
     });
   }, { auth: 'super' });
@@ -675,10 +737,10 @@ export function createApp(env = process.env) {
   route('GET', '/api/super/tenants/:id', async (req, res, p) => {
     const t = getTenant(p.id); if (!t) throw new HttpError(404, 'Not found');
     send(res, 200, {
-      tenant: publicTenant(t), fee_bp: t.fee_bp, fee_mode: t.fee_mode, site_url: `${baseUrl(req)}/s/${t.slug}`,
+      tenant: publicTenant(t), fee_bp: t.fee_bp, site_url: `${baseUrl(req)}/s/${t.slug}`,
       users: db.prepare('SELECT id, name, email, role, last_login_at, created_at FROM users WHERE tenant_id = ? ORDER BY id').all(t.id),
       agreements: db.prepare('SELECT a.doc, a.version, a.accepted_at, a.ip, u.email FROM agreements a LEFT JOIN users u ON u.id = a.user_id WHERE a.tenant_id = ? ORDER BY a.id DESC').all(t.id),
-      payments: db.prepare(`SELECT id, kind, description, amount_cents, fee_cents, fee_mode, method, status, paid_at, created_at FROM payments WHERE tenant_id = ? ORDER BY id DESC LIMIT 100`).all(t.id),
+      payments: db.prepare(`SELECT id, kind, description, amount_cents, stripe_fee_cents, fee_cents, payout_cents, transfer_status, transfer_error, method, status, paid_at, created_at FROM payments WHERE tenant_id = ? ORDER BY id DESC LIMIT 100`).all(t.id),
     });
   }, { auth: 'super' });
 
@@ -700,10 +762,9 @@ export function createApp(env = process.env) {
     const b = await json(req);
     const status = ['active', 'suspended'].includes(b.status) ? b.status : t.status;
     const feeBp = b.fee_bp === null || b.fee_bp === '' ? null : b.fee_bp !== undefined ? Math.min(1000, cents(b.fee_bp)) : t.fee_bp;
-    const feeMode = b.fee_mode === null || b.fee_mode === '' ? null : ['customer', 'absorbed', 'off'].includes(b.fee_mode) ? b.fee_mode : t.fee_mode;
     const acct = b.stripe_account_id !== undefined ? (clean(b.stripe_account_id, 80) || null) : t.stripe_account_id;
     if (acct && !/^acct_[A-Za-z0-9]+$/.test(acct)) throw new HttpError(400, 'Stripe account IDs look like acct_123…');
-    db.prepare('UPDATE tenants SET status = ?, fee_bp = ?, fee_mode = ?, stripe_account_id = ? WHERE id = ?').run(status, feeBp, feeMode, acct, t.id);
+    db.prepare('UPDATE tenants SET status = ?, fee_bp = ?, stripe_account_id = ? WHERE id = ?').run(status, feeBp, acct, t.id);
     let fresh = getTenant(t.id);
     if (acct && acct !== t.stripe_account_id) fresh = await refreshStripeStatus(fresh).catch(() => fresh);
     send(res, 200, publicTenant(fresh));
@@ -727,20 +788,49 @@ export function createApp(env = process.env) {
     const b = await json(req);
     const set = db.prepare(`INSERT OR REPLACE INTO platform_settings (key, value) VALUES (?, ?)`);
     if (b.fee_bp !== undefined) set.run('fee_bp', String(Math.min(1000, cents(b.fee_bp))));
-    if (['customer', 'absorbed', 'off'].includes(b.fee_mode)) set.run('fee_mode', b.fee_mode);
     send(res, 200, platformSettings(db));
   }, { auth: 'super' });
 
   route('GET', '/api/super/fees.csv', async (req, res) => {
-    const rows = db.prepare(`SELECT p.paid_at, t.name AS business, p.description, p.amount_cents, p.fee_cents, p.fee_mode, p.stripe_session_id FROM payments p JOIN tenants t ON t.id = p.tenant_id WHERE p.status = 'paid' AND p.fee_cents > 0 ORDER BY p.paid_at DESC`).all();
+    const rows = db.prepare(`SELECT p.paid_at, t.name AS business, p.description, p.amount_cents, p.stripe_fee_cents, p.fee_cents, p.payout_cents, p.transfer_status, p.transfer_id, p.charge_id FROM payments p JOIN tenants t ON t.id = p.tenant_id WHERE p.status = 'paid' AND p.method = 'card' ORDER BY p.paid_at DESC`).all();
     const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const csv = ['Paid at,Business,Description,Amount,Processing Fee,Fee mode,Stripe checkout'].concat(rows.map((r) => [r.paid_at, r.business, r.description, (r.amount_cents / 100).toFixed(2), (r.fee_cents / 100).toFixed(2), r.fee_mode, r.stripe_session_id].map(q).join(','))).join('\n');
+    const d = (c) => (c / 100).toFixed(2);
+    const csv = ['Paid at,Business,Description,Customer paid,Stripe fee,Platform share,Processing Fee total,Payout to business,Payout status,Transfer,Charge']
+      .concat(rows.map((r) => [r.paid_at, r.business, r.description, d(r.amount_cents), d(r.stripe_fee_cents), d(r.fee_cents), d(r.stripe_fee_cents + r.fee_cents), d(r.payout_cents), r.transfer_status, r.transfer_id, r.charge_id].map(q).join(','))).join('\n');
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="processing-fees.csv"', 'Cache-Control': 'no-store' });
     res.end(csv);
   }, { auth: 'super' });
 
+  route('POST', '/api/super/payments/:id/settle', async (req, res, p) => {
+    const pay = db.prepare('SELECT token FROM payments WHERE id = ?').get(p.id);
+    if (!pay) throw new HttpError(404, 'Not found');
+    const fresh = await settle(pay.token);
+    send(res, 200, { transfer_status: fresh.transfer_status, transfer_error: fresh.transfer_error });
+  }, { auth: 'super' });
+
+  // ===== platform marketing: owner leads =====
+  route('POST', '/api/public/leads', async (req, res) => {
+    if (limited('lead:' + clientIp(req), 8, 3600_000)) throw new HttpError(429, 'Too many requests. Email us instead.');
+    const b = await json(req);
+    if (b.website) return send(res, 201, { ok: true });
+    const email = clean(b.email, 200), phone = clean(b.phone, 40);
+    if (!clean(b.name) || (!/^\S+@\S+\.\S+$/.test(email) && !phone)) throw new HttpError(400, 'Add your name and an email or phone number.');
+    const r = db.prepare(`INSERT INTO leads (name, email, phone, business_name, location, certifications, message, source) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(clean(b.name, 120), email, phone, clean(b.business_name, 160), clean(b.location, 160), clean(b.certifications, 300), clean(b.message, 3000), clean(b.source, 200));
+    notify.email(platformEmail, `New ${platformName} lead: ${clean(b.name, 80)}`, `${clean(b.name, 120)} | ${email} | ${phone}\nBusiness: ${clean(b.business_name, 160)}\nLocation: ${clean(b.location, 160)}\nCertifications: ${clean(b.certifications, 300)}\n\n${clean(b.message, 3000)}\n\n${baseUrl(req)}/admin/#/leads`);
+    notify.sms(env.PLATFORM_NOTIFY_PHONE, `New ${platformName} lead: ${clean(b.name, 60)} ${phone || email} ${clean(b.location, 60)}`);
+    send(res, 201, { ok: true, id: Number(r.lastInsertRowid) });
+  });
+  route('GET', '/api/super/leads', async (req, res) => send(res, 200, db.prepare('SELECT * FROM leads ORDER BY id DESC LIMIT 500').all()), { auth: 'super' });
+  route('PATCH', '/api/super/leads/:id', async (req, res, p) => {
+    const l = db.prepare('SELECT * FROM leads WHERE id = ?').get(p.id); if (!l) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    db.prepare('UPDATE leads SET status = ?, notes = ? WHERE id = ?').run(['new', 'contacted', 'signed_up', 'closed'].includes(b.status) ? b.status : l.status, b.notes !== undefined ? clean(b.notes, 4000) : l.notes, l.id);
+    send(res, 200, db.prepare('SELECT * FROM leads WHERE id = ?').get(l.id));
+  }, { auth: 'super' });
+
   // ---------- static pages ----------
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg' };
+  const types = { '.txt': 'text/plain; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg' };
   const securityHeaders = {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'same-origin',
@@ -787,6 +877,7 @@ export function createApp(env = process.env) {
               if (!ctx.tenant) throw new HttpError(ctx.isSuper ? 409 : 403, ctx.isSuper ? 'Choose a business to view first.' : 'Forbidden');
               if (!ctx.isSuper && ctx.tenant.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact support.');
               if (!ctx.isSuper && needsAgreements(ctx.user)) throw new HttpError(428, 'Please accept the updated agreements.');
+              if (!ctx.isSuper && !r.onboarding && needsPayoutSetup(ctx.user, ctx.tenant)) throw new HttpError(428, 'Please set up direct deposit first.');
               if (r.auth === 'owner' && !ctx.isSuper && ctx.user.role !== 'owner') throw new HttpError(403, 'Only the business owner can change this.');
             }
           }
@@ -801,8 +892,13 @@ export function createApp(env = process.env) {
       const domainTenant = host ? db.prepare('SELECT * FROM tenants WHERE custom_domain = ?').get(host) : null;
       if (pathname === '/') {
         if (domainTenant) return serveSite(res, domainTenant);
-        res.writeHead(302, { Location: '/admin/' }); return res.end();
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300', ...securityHeaders });
+        return res.end(renderLanding({ origin: siteOrigin(req), name: platformName, email: platformEmail }));
       }
+      if (!domainTenant && pathname === '/robots.txt') return send(res, 200, robotsTxt(siteOrigin(req)), { 'Cache-Control': 'public, max-age=3600' });
+      if (!domainTenant && pathname === '/sitemap.xml') return send(res, 200, sitemapXml(siteOrigin(req)), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+      if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req), platformEmail), { 'Cache-Control': 'public, max-age=3600' });
+      if (pathname === '/favicon.ico' || pathname === '/favicon.svg') return serveFile(res, 'brand/favicon.svg');
       if (pathname === '/healthz') return send(res, 200, 'ok');
       if (pathname === '/admin' || pathname === '/admin/') return serveFile(res, 'admin.html');
       if (pathname === '/signup') { res.writeHead(302, { Location: '/admin/#/signup' }); return res.end(); }

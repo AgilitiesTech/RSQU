@@ -1,9 +1,10 @@
 import crypto from 'node:crypto';
 
 // Minimal Stripe client using the REST API directly (no SDK dependency).
-// STRIPE_SECRET_KEY is the Agilities platform key. Each business connects its own
-// Stripe account (Connect, Standard); charges are direct charges on that account
-// and the Processing Fee is collected as an application fee.
+// Model: every online payment is charged on the platform's own Stripe account
+// (the platform is the merchant of record and pays Stripe's fee). After the
+// payment succeeds, the platform transfers the business's share to the
+// business's Stripe Express account, and Stripe pays it out to their bank.
 export function stripeClient(env) {
   const key = env.STRIPE_SECRET_KEY;
   const base = env.STRIPE_API_BASE || 'https://api.stripe.com';
@@ -12,57 +13,69 @@ export function stripeClient(env) {
     for (const [k, v] of Object.entries(obj)) {
       if (v === undefined || v === null || v === '') continue;
       const name = prefix ? `${prefix}[${k}]` : k;
-      if (typeof v === 'object') form(v, name, out);
+      if (Array.isArray(v)) v.forEach((x, i) => (typeof x === 'object' ? form(x, `${name}[${i}]`, out) : out.append(`${name}[]`, String(x))));
+      else if (typeof v === 'object') form(v, name, out);
       else out.append(name, String(v));
     }
     return out;
   }
 
-  async function call(method, pathname, body, account) {
+  async function call(method, pathname, body, { idempotencyKey } = {}) {
     const headers = { Authorization: `Bearer ${key}` };
-    if (account) headers['Stripe-Account'] = account;
     if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
     const res = await fetch(base + pathname, { method, headers, body: body ? form(body).toString() : undefined });
     const json = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(json?.error?.message || `Stripe error ${res.status}`);
     return json;
   }
 
+  // Card statements show the platform descriptor plus this suffix (max 22 chars, no special characters).
+  const suffix = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9 ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 22).trim() || undefined;
+
   return {
     enabled: Boolean(key),
     testMode: String(key || '').includes('_test_'),
 
+    // Express account: Stripe collects identity and the bank account for direct deposit.
     createAccount({ email, businessName, tenantId }) {
-      return call('POST', '/v1/accounts', { type: 'standard', email, business_profile: { name: businessName }, metadata: { tenant_id: tenantId } });
+      return call('POST', '/v1/accounts', {
+        type: 'express', country: 'US', email,
+        capabilities: { transfers: { requested: true } },
+        business_profile: { name: businessName, mcc: '7538' },
+        metadata: { tenant_id: tenantId },
+      });
     },
     accountLink({ account, refreshUrl, returnUrl }) {
       return call('POST', '/v1/account_links', { account, refresh_url: refreshUrl, return_url: returnUrl, type: 'account_onboarding' });
+    },
+    loginLink(account) {
+      return call('POST', `/v1/accounts/${encodeURIComponent(account)}/login_links`, {});
     },
     getAccount(id) {
       return call('GET', `/v1/accounts/${encodeURIComponent(id)}`);
     },
 
-    // lines: [{ name, description, amountCents }]; feeCents goes to the platform.
-    createCheckout({ account, lines, feeCents, successUrl, cancelUrl, ref, email, statementName }) {
-      const line_items = {};
-      lines.forEach((l, i) => { line_items[i] = { quantity: 1, price_data: { currency: 'usd', unit_amount: l.amountCents, product_data: { name: l.name, description: l.description || undefined } } }; });
+    createCheckout({ name, amountCents, successUrl, cancelUrl, ref, email, statementName }) {
       return call('POST', '/v1/checkout/sessions', {
         mode: 'payment',
         success_url: successUrl,
         cancel_url: cancelUrl,
         client_reference_id: ref,
         customer_email: email || undefined,
-        line_items,
+        line_items: { 0: { quantity: 1, price_data: { currency: 'usd', unit_amount: amountCents, product_data: { name } } } },
         metadata: { payment_token: ref },
-        payment_intent_data: {
-          description: statementName ? `${statementName}: ${lines[0].name}` : lines[0].name,
-          metadata: { payment_token: ref },
-          application_fee_amount: feeCents || undefined,
-        },
-      }, account);
+        payment_intent_data: { description: name, statement_descriptor_suffix: suffix(statementName), transfer_group: ref, metadata: { payment_token: ref } },
+      });
     },
-    retrieveCheckout(id, account) {
-      return call('GET', `/v1/checkout/sessions/${encodeURIComponent(id)}`, null, account);
+    // Session with the charge and its balance transaction (Stripe's actual fee).
+    retrieveCheckout(id) {
+      return call('GET', `/v1/checkout/sessions/${encodeURIComponent(id)}?expand[]=payment_intent.latest_charge.balance_transaction`);
+    },
+    createTransfer({ amountCents, destination, sourceTransaction, group, ref }) {
+      return call('POST', '/v1/transfers', {
+        amount: amountCents, currency: 'usd', destination, source_transaction: sourceTransaction, transfer_group: group, metadata: { payment_token: ref },
+      }, { idempotencyKey: `transfer-${ref}` });
     },
   };
 }

@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const AGREEMENT_VERSION = '2026-11-01';
+export const AGREEMENT_VERSION = '2026-11-02';
 export const BUSINESS_AGREEMENTS = ['terms', 'privacy', 'payment-terms'];
 
 export function openDb(dataDir) {
@@ -27,9 +27,10 @@ export function openDb(dataDir) {
       deposit_cents INTEGER NOT NULL DEFAULT 0,
       deposit_label TEXT NOT NULL DEFAULT 'Diagnosis and onsite review',
       terms TEXT,
-      stripe_account_id TEXT, stripe_charges_enabled INTEGER NOT NULL DEFAULT 0, stripe_details_submitted INTEGER NOT NULL DEFAULT 0,
-      fee_bp INTEGER,                                 -- NULL = platform default
-      fee_mode TEXT,                                  -- NULL = platform default; customer | absorbed | off
+      -- Stripe Express connected account that receives payouts (direct deposit)
+      stripe_account_id TEXT, stripe_payouts_enabled INTEGER NOT NULL DEFAULT 0, stripe_details_submitted INTEGER NOT NULL DEFAULT 0,
+      statement_name TEXT,                            -- short name on customers' card statements
+      fee_bp INTEGER,                                 -- platform share in basis points; NULL = platform default
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -121,14 +122,25 @@ export function openDb(dataDir) {
       request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL,
       quote_id INTEGER REFERENCES quotes(id) ON DELETE SET NULL,
       description TEXT NOT NULL,
-      amount_cents INTEGER NOT NULL,                  -- amount owed to the business
-      fee_cents INTEGER NOT NULL DEFAULT 0,           -- Processing Fee collected by the platform
-      fee_mode TEXT,                                  -- customer | absorbed | off (at time of checkout)
+      amount_cents INTEGER NOT NULL,                  -- what the customer pays
       method TEXT NOT NULL DEFAULT 'card',
       status TEXT NOT NULL DEFAULT 'pending',
-      stripe_session_id TEXT, stripe_account_id TEXT,
+      stripe_session_id TEXT, charge_id TEXT,
+      -- Online payments: Processing Fee = stripe_fee_cents + fee_cents, retained before payout
+      stripe_fee_cents INTEGER NOT NULL DEFAULT 0,    -- Stripe's actual fee to the platform
+      fee_cents INTEGER NOT NULL DEFAULT 0,           -- platform share (3%)
+      payout_cents INTEGER NOT NULL DEFAULT 0,        -- transferred to the business
+      transfer_id TEXT, transfer_status TEXT,         -- NULL (offline) | pending | sent | failed
+      transfer_error TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       paid_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS leads (
+      id INTEGER PRIMARY KEY,
+      name TEXT, email TEXT, phone TEXT, business_name TEXT, location TEXT, certifications TEXT, message TEXT,
+      source TEXT, status TEXT NOT NULL DEFAULT 'new', notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS platform_settings (key TEXT PRIMARY KEY, value TEXT);
@@ -140,24 +152,19 @@ export function openDb(dataDir) {
   `);
   const set = db.prepare(`INSERT OR IGNORE INTO platform_settings (key, value) VALUES (?, ?)`);
   set.run('fee_bp', '300');
-  set.run('fee_mode', 'customer');
   return db;
 }
 
 export function platformSettings(db) {
   const out = {};
   for (const r of db.prepare('SELECT key, value FROM platform_settings').all()) out[r.key] = r.value;
-  return { fee_bp: Number(out.fee_bp ?? 300), fee_mode: out.fee_mode || 'customer' };
+  return { fee_bp: Number(out.fee_bp ?? 300) };
 }
 
-// Processing Fee for an online payment of `amountCents` owed to the business.
-// customer: added on top for the customer; absorbed: taken from the business's share; off: none.
-export function processingFee(db, tenant, amountCents) {
-  const p = platformSettings(db);
-  const bp = tenant.fee_bp ?? p.fee_bp;
-  const mode = tenant.fee_mode || p.fee_mode;
-  const fee = mode === 'off' ? 0 : Math.round((amountCents * bp) / 10000);
-  return { bp, mode, fee, charge: mode === 'customer' ? amountCents + fee : amountCents };
+// Platform share of an online payment (the 3% part of the Processing Fee).
+export function platformFee(db, tenant, amountCents) {
+  const bp = tenant.fee_bp ?? platformSettings(db).fee_bp;
+  return { bp, fee: Math.round((amountCents * bp) / 10000) };
 }
 
 // Totals for a quote. All money is integer cents.

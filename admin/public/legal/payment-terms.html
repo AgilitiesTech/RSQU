@@ -10,108 +10,111 @@
 <body>
 <main class="doc">
 <h1>Payment Processing and Fee Terms</h1>
-<p class="muted small">Version 2026-11-01 · Effective [EFFECTIVE DATE]</p>
+<p class="muted small">Version 2026-11-02 · Effective [EFFECTIVE DATE]</p>
 
 <section class="card">
-<p>These Payment Processing and Fee Terms ("Payment Terms") are part of the <a href="/legal/terms">Business Terms of Service</a> between [AGILITIES LEGAL NAME] ("Agilities," "we," "us") and the business using the platform ("you"). They explain how online payments work, the Processing Fee, refunds, disputes, and your compliance responsibilities. If these Payment Terms conflict with the Business Terms of Service on a payment topic, these Payment Terms control.</p>
+<p>These Payment Processing and Fee Terms (“Payment Terms”) are part of the <a href="/legal/terms">Business Terms of Service</a> between [AGILITIES LEGAL NAME] d/b/a HitchPoint (“HitchPoint”, “we”, “us”) and the business using the platform (“you”). They explain how online payments work, the Processing Fee, transfers and payouts, refunds, disputes, and taxes. If these Payment Terms conflict with the Business Terms of Service on a payment topic, these Payment Terms control.</p>
 </section>
 
 <section class="card">
-<h2>1. Stripe Connect and your Stripe account</h2>
+<h2>1. HitchPoint is the merchant of record</h2>
 <ol>
-<li>Online payments on the platform are processed by Stripe through Stripe Connect. You connect your own Stripe account, using the Standard account type.</li>
-<li>To use online payments you must agree to, and comply with, the <a href="https://stripe.com/legal/ssa">Stripe Services Agreement</a> and the <a href="https://stripe.com/legal/connect-account">Stripe Connected Account Agreement</a>. Stripe may require identity, bank, and business verification, and may hold, delay, or refuse payouts under its own rules. Agilities does not control those decisions.</li>
-<li>Agilities is not a bank, money transmitter, or payment processor, and does not hold your funds.</li>
+<li>All online card and bank (ACH) payments made through the platform are processed on HitchPoint’s own Stripe account. HitchPoint is the merchant of record for these payments.</li>
+<li>Your customer’s card or bank statement shows “HITCHPOINT” plus a short form of your business name.</li>
+<li>You remain responsible for the services you sell, your prices, your quotes, taxes on your services, receipts, and customer service. HitchPoint processes payments on your behalf; it does not provide or guarantee your services.</li>
 </ol>
 </section>
 
 <section class="card">
-<h2>2. You are the merchant of record</h2>
+<h2>2. Stripe Express onboarding</h2>
 <ol>
-<li>Every online payment is a direct charge on your Stripe account. You are the merchant of record. Your business name appears to the customer and on their statement, as configured in your Stripe account.</li>
-<li>Stripe's own processing fees are charged to your Stripe account under your agreement with Stripe. They are separate from the Processing Fee described below.</li>
-<li>You are responsible for the services you sell, your prices, your quotes, taxes on your sales, receipts, and customer service.</li>
+<li>During sign-up you must complete Stripe Express onboarding. This includes identity verification and adding a bank account for direct deposit. Stripe collects and holds these details; HitchPoint stores only your Stripe account ID and status.</li>
+<li>You must agree to, and comply with, the <a href="https://stripe.com/legal/connect-account">Stripe Connected Account Agreement</a>, which includes the Stripe Services Agreement. Stripe may require more verification and may restrict, hold, or delay payouts under its own rules.</li>
+<li>Online payments are not available until your Stripe Express onboarding is complete and your account is enabled by Stripe.</li>
 </ol>
 </section>
 
 <section class="card">
-<h2>3. The Processing Fee</h2>
+<h2>3. Transfers and payouts</h2>
 <ol>
-<li><strong>When it applies.</strong> A Processing Fee applies to every online card or bank (ACH) payment made through the platform. This includes diagnosis deposits (for example, a $129 deposit credited toward the job) and any other deposit, progress, or final payment paid online.</li>
-<li><strong>Rate.</strong> The Processing Fee equals 3% of the payment amount, unless Agilities and your business have agreed a different per-business rate in writing. We may change the standard rate with at least 30 days' notice to you.</li>
-<li><strong>How it is shown.</strong> By default the Processing Fee is added to the customer's total and shown as a separate line labeled "Processing Fee" before the customer pays. For example, on a $129.00 deposit the customer sees a Processing Fee of $3.87 and a total of $132.87.</li>
-<li><strong>How it is collected.</strong> Agilities collects the Processing Fee as a Stripe application fee on the charge. It is transferred to Agilities by Stripe; you do not need to pay it separately.</li>
-<li><strong>Cash and check.</strong> No Processing Fee applies to cash or check payments that you record in the platform. The platform will tell customers that paying by cash or check avoids the Processing Fee.</li>
-<li><strong>Not a Stripe fee.</strong> The Processing Fee is Agilities' fee for the platform's payment features. It does not replace or reduce Stripe's fees.</li>
+<li>After a customer’s payment succeeds, HitchPoint transfers your share to your Stripe Express connected account. Your share is the payment amount minus the Processing Fee.</li>
+<li>Stripe then pays your share out to your bank account by direct deposit on Stripe’s payout schedule, typically about two business days after the transfer. Your first payouts can take longer. Stripe controls payout timing, and HitchPoint is not responsible for Stripe’s payout delays.</li>
+<li>Transfer and payout records are available in your dashboard and your Stripe Express dashboard.</li>
 </ol>
 </section>
 
 <section class="card">
-<h2>4. Your compliance responsibility</h2>
-<p>Adding a fee to a customer's total can be regulated as a surcharge, convenience fee, or similar charge. The rules depend on where you and your customers are, the type of card, and card network rules (for example Visa and Mastercard). <strong>You are responsible for complying with all laws and card network rules on surcharges and fees that apply to your business.</strong> These can include:</p>
+<h2>4. The Processing Fee</h2>
+<ol>
+<li><strong>No fee for your customers.</strong> Your customer pays only the amount on your invoice, proposal, or deposit request. HitchPoint does not add a surcharge or any other fee to the customer’s total.</li>
+<li><strong>What HitchPoint keeps.</strong> On every online card or ACH payment, including diagnosis deposits and any other deposit, progress, or final payment, HitchPoint keeps a Processing Fee before transferring your share. The Processing Fee equals:
 <ul>
-<li>disclosure requirements, such as signage, notice at the point of entry, and showing the fee before payment;</li>
-<li>caps on the amount of a surcharge, which may be lower than the Processing Fee rate or tied to your actual cost of acceptance;</li>
-<li>rules that prohibit or restrict surcharges on debit cards or prepaid cards;</li>
-<li>card network registration or advance notice requirements; and</li>
-<li>states and localities that restrict or prohibit surcharging, or require that cash and card prices be presented a particular way.</li>
+<li>(a) Stripe’s actual processing fee charged to HitchPoint for that payment (for example, Stripe’s card or ACH pricing in effect at the time, including any international card or currency conversion fees); plus</li>
+<li>(b) 3% of the payment amount.</li>
 </ul>
-<p>Agilities does not provide legal advice and does not represent that the default Processing Fee setting is lawful for your business. You should check with your own advisor.</p>
+</li>
+<li><strong>How it is shown.</strong> You see the combined amount labeled “Processing Fee” on each payment in your dashboard.</li>
+<li><strong>Example.</strong> For illustration only: on a $129.00 card deposit, if Stripe’s fee for that payment were $4.04, the Processing Fee would be $4.04 + $3.87 (3%) = $7.91, and HitchPoint would transfer $121.09 to you. The customer pays $129.00. Actual Stripe fees vary by payment type and Stripe’s pricing at the time.</li>
+<li><strong>Rate changes.</strong> HitchPoint may change the 3% component with at least 30 days’ notice to you. A different per-business rate may be agreed in writing.</li>
+<li><strong>Cash and check.</strong> No Processing Fee applies to cash or check payments that you record in the platform yourself.</li>
+</ol>
 </section>
 
 <section class="card">
-<h2>5. Settings you can change</h2>
-<p>You may ask Agilities at any time, by contacting [SUPPORT EMAIL], to change how the Processing Fee works for your account. Two settings are supported:</p>
-<ol>
-<li><strong>Off:</strong> no Processing Fee is added to customer payments for your account.</li>
-<li><strong>Deducted from payout:</strong> the customer pays only your listed price, and the Processing Fee is deducted from your payout as the Stripe application fee instead of being added to the customer's total.</li>
-</ol>
-<p>Turning the fee off or switching it to payout deduction may change your platform pricing; we will tell you before the change takes effect. Changes apply to payments started after the setting is updated.</p>
+<h2>5. No surcharges without approval</h2>
+<p>You may not add surcharges, convenience fees, or other fees for card payments to your quotes, proposals, or invoices without HitchPoint’s written approval. If HitchPoint approves, you must comply with all applicable law, and you are responsible for that compliance. HitchPoint does not provide legal advice.</p>
 </section>
 
 <section class="card">
 <h2>6. Refunds</h2>
 <ol>
-<li>You issue refunds to your customers from your Stripe dashboard. You decide your refund policy and must honor it and any legal refund requirements.</li>
-<li>When you refund a payment and tell Agilities, the Processing Fee is refunded proportionally. For example, a full refund returns the full Processing Fee to the customer; a 50% refund returns 50% of the Processing Fee.</li>
-<li>Refunds issued in your Stripe dashboard do not automatically reverse the Processing Fee. Send the payment details to [SUPPORT EMAIL] within 30 days of the refund and Agilities will refund the matching share of the Processing Fee.</li>
-<li>Stripe's own processing fees on a refunded payment are governed by your Stripe agreement and are generally not returned.</li>
+<li>You decide your refund policy and must honor it and any legal refund requirements.</li>
+<li>To refund a customer, contact HitchPoint support at [SUPPORT EMAIL] with the payment details and refund amount. The dashboard does not issue refunds yet.</li>
+<li>HitchPoint refunds the customer from its Stripe account and recovers the refunded amount from you by reversing the related transfer or deducting it from future transfers.</li>
+<li>The 3% component of the Processing Fee is refunded to you proportionally. For example, a full refund returns the full 3% component; a 50% refund returns half of it.</li>
+<li>Stripe’s processing fee is generally not returned by Stripe on refunds and is not refunded to you.</li>
 </ol>
 </section>
 
 <section class="card">
 <h2>7. Chargebacks and disputes</h2>
 <ol>
-<li>Chargebacks, disputes, ACH returns, and related Stripe fees are your responsibility as merchant of record. Stripe debits them from your Stripe account.</li>
-<li>The Processing Fee is not refunded when a payment is disputed or charged back, whatever the outcome of the dispute.</li>
-<li>You are responsible for responding to disputes. Signed proposal records (typed name, signature image, time, IP address, and device information) are available in your dashboard to support your response.</li>
-<li>If disputes on your account become excessive, or Stripe restricts your account, we may disable online payments for your account.</li>
+<li>As merchant of record, HitchPoint receives chargebacks, disputes, and ACH returns on payments made through the platform, and will notify you.</li>
+<li>You must provide evidence, such as the signed proposal record (typed name, signature image, time, IP address, and device information), photos, and job notes, within the time HitchPoint requests. HitchPoint decides how to respond to the dispute.</li>
+<li>Disputed amounts and Stripe’s dispute fees are recovered from you by reversing the related transfer, deducting them from future transfers, or invoicing you. The Processing Fee is not returned on a disputed payment.</li>
+<li>If disputes on your account become excessive, we may disable online payments for your account.</li>
 </ol>
 </section>
 
 <section class="card">
-<h2>8. Taxes</h2>
-<p>You are responsible for sales tax and other taxes on your services and on any surcharge where applicable. Agilities is responsible for its own income taxes on Processing Fees it receives. The platform's tax fields are tools, not tax advice.</p>
+<h2>8. Holds, reserves, and negative balances</h2>
+<p>HitchPoint may hold or delay transfers to you, or set a reserve, for suspected fraud, high dispute rates, negative balances, or legal requirements. If refunds, disputes, or fees create a negative balance that future transfers do not cover, you must pay it when HitchPoint invoices you.</p>
 </section>
 
 <section class="card">
-<h2>9. Records and statements</h2>
-<p>Your payment records, including Processing Fee amounts, are available in your dashboard and in your Stripe account. Tell us of any fee error within 60 days of the payment; after that, fees are considered accepted except where the law says otherwise.</p>
+<h2>9. Taxes</h2>
+<p>You are responsible for taxes on your services and for including any sales tax on your quotes. The dashboard supports a tax line; it is a tool, not tax advice. HitchPoint or Stripe may issue tax information forms, such as Form 1099-K, as required by law, and you must provide accurate tax information when asked. HitchPoint is responsible for its own income taxes on the 3% component it retains.</p>
+<!-- ATTORNEY: confirm marketplace facilitator / sales tax and money transmission analysis for merchant-of-record model in each state served. -->
 </section>
 
 <section class="card">
-<h2>10. Prohibited payment activity</h2>
-<p>You will only process payments for your own legitimate services that you have actually provided or will provide. You will not process payments for another business, split a single sale to avoid limits, process payments for illegal goods or services, or use the platform to move money that is not payment for your services.</p>
+<h2>10. Records and statements</h2>
+<p>Your payment records, including Processing Fee amounts, transfers, and refunds, are available in your dashboard, and payouts are shown in your Stripe Express dashboard. Tell us of any fee or transfer error within 60 days of the payment; after that, amounts are considered accepted except where the law says otherwise.</p>
 </section>
 
 <section class="card">
-<h2>11. Changes</h2>
-<p>We may update these Payment Terms. We will give at least 30 days' notice of a change to the Processing Fee rate or any material change, by email or in your dashboard. A per-business rate agreed in writing stays in effect for its agreed term.</p>
+<h2>11. Prohibited payment activity</h2>
+<p>You will only take payments for your own legitimate services that you have actually provided or will provide. You will not take payments for another business, split a single sale to avoid limits, take payments for illegal goods or services, or use the platform to move money that is not payment for your services.</p>
+</section>
+
+<section class="card">
+<h2>12. Changes</h2>
+<p>We may update these Payment Terms. We will give at least 30 days’ notice of a change to the 3% component of the Processing Fee or any other material change, by email or in your dashboard. A per-business rate agreed in writing stays in effect for its agreed term. Changes in Stripe’s own pricing flow through to the Stripe component of the Processing Fee as they take effect.</p>
 </section>
 
 <section class="card">
 <h2>Contact</h2>
-<p>[AGILITIES LEGAL NAME]<br>[ADDRESS]<br>[SUPPORT EMAIL]</p>
+<p>[AGILITIES LEGAL NAME] d/b/a HitchPoint<br>[ADDRESS]<br>[SUPPORT EMAIL]</p>
 </section>
 
 <p class="muted small"><a href="/legal/terms">Business Terms of Service</a> · <a href="/legal/privacy">Privacy Policy</a> · <a href="/legal/payment-terms">Payment Processing and Fee Terms</a> · <a href="/legal/customer-terms">Customer Terms</a></p>

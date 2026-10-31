@@ -11,42 +11,57 @@ import { createApp } from '../server.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
-// ---- fake Stripe: Connect accounts, account links and Checkout sessions ----
+// ---- fake Stripe: Express accounts, platform Checkout sessions, balance transactions, transfers ----
 const sessions = new Map();
 const accounts = new Map();
+const transfers = [];
+const stripeFee = (amt) => Math.round(amt * 0.029) + 30;
 const stripeMock = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     const p = new URLSearchParams(body);
     const ok = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+    const bad = (msg) => { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: msg } })); };
+    if (req.headers['stripe-account']) return bad('platform model: no Stripe-Account header expected');
+    let m;
     if (req.method === 'POST' && req.url === '/v1/accounts') {
       const id = 'acct_' + crypto.randomBytes(5).toString('hex');
-      accounts.set(id, { id, type: p.get('type'), charges_enabled: false, details_submitted: false });
+      accounts.set(id, { id, type: p.get('type'), transfers_requested: p.get('capabilities[transfers][requested]'), payouts_enabled: false, details_submitted: false, capabilities: { transfers: 'inactive' } });
       return ok(accounts.get(id));
     }
     if (req.method === 'POST' && req.url === '/v1/account_links') return ok({ url: 'https://connect.stripe.test/setup/' + p.get('account') });
-    let m;
-    if (req.method === 'GET' && (m = /^\/v1\/accounts\/(.+)$/.exec(req.url))) return ok(accounts.get(m[1]) || { id: m[1], charges_enabled: true, details_submitted: true });
+    if (req.method === 'POST' && (m = /^\/v1\/accounts\/(.+)\/login_links$/.exec(req.url))) return ok({ url: 'https://connect.stripe.test/express/' + m[1] });
+    if (req.method === 'GET' && (m = /^\/v1\/accounts\/([^/?]+)$/.exec(req.url))) return ok(accounts.get(m[1]));
     if (req.method === 'POST' && req.url === '/v1/checkout/sessions') {
       const id = 'cs_test_' + crypto.randomBytes(6).toString('hex');
       const lines = [];
       for (let i = 0; p.has(`line_items[${i}][price_data][unit_amount]`); i++) lines.push({ name: p.get(`line_items[${i}][price_data][product_data][name]`), amount: Number(p.get(`line_items[${i}][price_data][unit_amount]`)) });
-      const s = { id, url: 'https://checkout.stripe.test/' + id, client_reference_id: p.get('client_reference_id'), lines, amount_total: lines.reduce((a, l) => a + l.amount, 0), application_fee: Number(p.get('payment_intent_data[application_fee_amount]') || 0), account: req.headers['stripe-account'] || null, payment_status: 'unpaid' };
+      const s = { id, url: 'https://checkout.stripe.test/' + id, client_reference_id: p.get('client_reference_id'), lines, amount_total: lines.reduce((a, l) => a + l.amount, 0), application_fee: p.get('payment_intent_data[application_fee_amount]'), descriptor_suffix: p.get('payment_intent_data[statement_descriptor_suffix]'), payment_status: 'unpaid' };
       sessions.set(id, s);
       return ok(s);
     }
-    if (req.method === 'GET' && (m = /^\/v1\/checkout\/sessions\/(.+)$/.exec(req.url)) && sessions.has(m[1])) {
+    if (req.method === 'GET' && (m = /^\/v1\/checkout\/sessions\/([^?]+)\?expand\[\]=payment_intent\.latest_charge\.balance_transaction$/.exec(req.url)) && sessions.has(m[1])) {
       const s = sessions.get(m[1]);
-      if (req.headers['stripe-account'] !== s.account) { res.writeHead(404); return res.end('{}'); }
-      return ok(s);
+      const out = { ...s, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, latest_charge: { id: 'ch_' + s.id, balance_transaction: { id: 'txn_' + s.id, fee: stripeFee(s.amount_total) } } } : null };
+      return ok(out);
+    }
+    if (req.method === 'POST' && req.url === '/v1/transfers') {
+      const dest = accounts.get(p.get('destination'));
+      if (!dest || dest.capabilities.transfers !== 'active') return bad('Destination account cannot receive transfers yet.');
+      const key = req.headers['idempotency-key'];
+      const prior = transfers.find((t) => t.key === key);
+      if (prior) return ok(prior);
+      const t = { id: 'tr_' + crypto.randomBytes(5).toString('hex'), key, amount: Number(p.get('amount')), destination: p.get('destination'), source_transaction: p.get('source_transaction') };
+      transfers.push(t);
+      return ok(t);
     }
     res.writeHead(404); res.end('{}');
   });
 });
 
 let server, base, dataDir;
-const WHSEC = 'whsec_connect_test';
+const WHSEC = 'whsec_platform_test';
 
 // Tiny cookie-jar client per user.
 function client() {
@@ -80,7 +95,7 @@ before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsqu-test-'));
   const { handler } = createApp({
     DATA_DIR: dataDir, SUPER_ADMIN_EMAIL: 'aaron@agilities.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw',
-    STRIPE_SECRET_KEY: 'sk_test_platform', STRIPE_API_BASE: `http://localhost:${stripeMock.address().port}`, STRIPE_CONNECT_WEBHOOK_SECRET: WHSEC,
+    STRIPE_SECRET_KEY: 'sk_test_platform', STRIPE_API_BASE: `http://localhost:${stripeMock.address().port}`, STRIPE_WEBHOOK_SECRET: WHSEC,
   });
   server = http.createServer(handler);
   await new Promise((r) => server.listen(0, r));
@@ -110,6 +125,17 @@ test('super admin creates a business; owner sets password and must accept agreem
   assert.equal(me.needs_agreements, true);
   assert.equal((await mike('GET', '/api/requests')).status, 428);
   assert.equal((await mike('POST', '/api/agreements/accept', { agree: true })).status, 200);
+  // Direct deposit is required before the dashboard opens.
+  assert.equal((await mike('GET', '/api/me')).json.needs_payout_setup, true);
+  assert.equal((await mike('GET', '/api/requests')).status, 428);
+  const c = await mike('POST', '/api/stripe/connect');
+  assert.match(c.json.url, /connect\.stripe\.test\/setup\/acct_/);
+  const acct = c.json.url.split('/').pop();
+  assert.equal(accounts.get(acct).type, 'express');
+  assert.equal(accounts.get(acct).transfers_requested, 'true');
+  accounts.get(acct).details_submitted = true; // owner finished Stripe's form; verification still pending
+  assert.equal((await mike('POST', '/api/stripe/refresh')).json.details_submitted, true);
+  assert.equal((await mike('GET', '/api/me')).json.needs_payout_setup, false);
   assert.equal((await mike('GET', '/api/requests')).status, 200);
   assert.equal((await mike('GET', '/api/super/overview')).status, 403, 'owners cannot reach super admin');
 
@@ -125,6 +151,10 @@ test('self sign-up records agreements; businesses cannot see each other', async 
   const s = await other('POST', '/api/signup', { business_name: 'Other Co', name: 'Ola', email: 'ola@other.test', password: 'long-enough-pw', agree: true });
   assert.equal(s.status, 201);
   assert.equal((await other('GET', '/api/me')).json.needs_agreements, false);
+  assert.equal((await other('GET', '/api/me')).json.needs_payout_setup, true);
+  await other('POST', '/api/stripe/connect');
+  for (const a of accounts.values()) a.details_submitted = true;
+  await other('POST', '/api/stripe/refresh');
   assert.equal((await other('POST', '/api/signup', { business_name: 'X', name: 'Y', email: 'OLA@other.test', password: 'long-enough-pw', agree: true })).status, 409);
 
   const r = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { type: 'repair', name: 'Dana', phone: '801-555-0100', location: 'I-15 mm 290', year: '2019', make: 'Jayco', issue: 'Blowout', photo: PNG }, { Origin: 'https://agilitiestech.github.io' });
@@ -142,38 +172,44 @@ test('self sign-up records agreements; businesses cannot see each other', async 
   assert.equal((await anon('GET', `/media/${mikeSlug}/${req.photo}`)).status, 404, 'request photos are never public');
 });
 
-test('Stripe Connect onboarding, then deposit with a 3% Processing Fee to the platform', async () => {
-  const c = await mike('POST', '/api/stripe/connect');
-  assert.match(c.json.url, /connect\.stripe\.test\/setup\/acct_/);
-  const acct = c.json.url.split('/').pop();
-  assert.equal(accounts.get(acct).type, 'standard');
-  // Not live yet: online payments refused.
+test('deposit paid online: platform charge, then payout minus Stripe fee and 3%', async () => {
+  const acct = [...accounts.values()][0].id;
   const rid = (await mike('GET', '/api/requests')).json.rows[0].id;
   const dep = await mike('POST', `/api/requests/${rid}/deposit`, { method: 'card' });
-  assert.equal((await anon('POST', `/api/public/payments/${dep.json.token}/checkout`, {})).status, 503);
-  // Stripe finishes onboarding.
-  accounts.get(acct).charges_enabled = true; accounts.get(acct).details_submitted = true;
-  assert.equal((await mike('POST', '/api/stripe/refresh')).json.charges_enabled, true);
-
   const pub = (await anon('GET', `/api/public/payments/${dep.json.token}`)).json;
-  assert.deepEqual([pub.online.fee, pub.online.charge], [387, 13287]);
-  assert.equal(pub.business.name, 'Mike Stevens Emergency RV & Trailer Repair');
+  assert.deepEqual([pub.online.fee, pub.online.charge, pub.online.card_payments], [0, 12900, true], 'customer pays only the amount due');
   const co = await anon('POST', `/api/public/payments/${dep.json.token}/checkout`, {});
-  const sess = [...sessions.values()].find((s) => s.client_reference_id === dep.json.token);
   assert.ok(co.json.url);
-  assert.equal(sess.account, acct);
-  assert.deepEqual(sess.lines, [{ name: 'Repair diagnosis and onsite review (credited toward the job)', amount: 12900 }, { name: 'Processing Fee', amount: 387 }]);
-  assert.equal(sess.application_fee, 387);
+  const sess = [...sessions.values()].find((s) => s.client_reference_id === dep.json.token);
+  assert.deepEqual(sess.lines, [{ name: 'Repair diagnosis and onsite review (credited toward the job)', amount: 12900 }]);
+  assert.equal(sess.application_fee, null);
+  assert.equal(sess.descriptor_suffix, 'MIKE STEVENS EMERGENCY');
 
-  // Connect webhook marks it paid (and must come from the right account).
+  // Paid while Stripe is still verifying the owner: transfer can't go yet.
   sess.payment_status = 'paid';
-  const wrong = webhook({ type: 'checkout.session.completed', account: 'acct_someoneelse', data: { object: sess } });
-  await anon('POST', '/api/stripe/webhook', wrong.raw, { 'Stripe-Signature': wrong.header, 'Content-Type': 'application/json' });
-  assert.equal((await anon('GET', `/api/public/payments/${dep.json.token}`)).json.status, 'pending');
-  const wh = webhook({ type: 'checkout.session.completed', account: acct, data: { object: sess } });
+  const bad = webhook({ type: 'checkout.session.completed', data: { object: sess } });
+  assert.equal((await anon('POST', '/api/stripe/webhook', bad.raw, { 'Stripe-Signature': 't=1,v1=bad', 'Content-Type': 'application/json' })).status, 400);
+  const wh = webhook({ type: 'checkout.session.completed', data: { object: sess } });
   assert.equal((await anon('POST', '/api/stripe/webhook', wh.raw, { 'Stripe-Signature': wh.header, 'Content-Type': 'application/json' })).status, 200);
-  assert.equal((await anon('GET', `/api/public/payments/${dep.json.token}`)).json.status, 'paid');
-  assert.equal((await anon('POST', '/api/stripe/webhook', wh.raw, { 'Stripe-Signature': 't=1,v1=bad', 'Content-Type': 'application/json' })).status, 400);
+  let pay = (await superA('GET', `/api/super/tenants/${mikeId}`)).json.payments.find((p) => p.kind === 'deposit');
+  assert.equal(pay.status, 'paid');
+  assert.deepEqual([pay.stripe_fee_cents, pay.fee_cents, pay.payout_cents], [404, 387, 12109]); // 2.9%+30¢ = 4.04; 3% = 3.87
+  assert.equal(pay.transfer_status, 'failed');
+  assert.equal(transfers.length, 0);
+
+  // Stripe finishes verification: account.updated triggers the held payout.
+  Object.assign(accounts.get(acct), { payouts_enabled: true, capabilities: { transfers: 'active' } });
+  const upd = webhook({ type: 'account.updated', account: acct, data: { object: accounts.get(acct) } });
+  await anon('POST', '/api/stripe/webhook', upd.raw, { 'Stripe-Signature': upd.header, 'Content-Type': 'application/json' });
+  pay = (await superA('GET', `/api/super/tenants/${mikeId}`)).json.payments.find((p) => p.kind === 'deposit');
+  assert.equal(pay.transfer_status, 'sent');
+  assert.equal(transfers.length, 1);
+  assert.deepEqual([transfers[0].amount, transfers[0].destination, transfers[0].source_transaction], [12109, acct, 'ch_' + sess.id]);
+  // Replayed webhook doesn't pay out twice.
+  await anon('POST', '/api/stripe/webhook', wh.raw, { 'Stripe-Signature': wh.header, 'Content-Type': 'application/json' });
+  assert.equal(transfers.length, 1);
+  const mine = (await mike('GET', '/api/payments')).json.find((p) => p.method === 'card');
+  assert.equal(mine.stripe_fee_cents + mine.fee_cents, 791);
 });
 
 test('quote: deposit credited, signed, paid online with Processing Fee on the balance', async () => {
@@ -182,7 +218,7 @@ test('quote: deposit credited, signed, paid online with Processing Fee on the ba
   assert.equal(q.json.deposit_credit_cents, 12900);
   const saved = await mike('PUT', '/api/quotes/' + q.json.id, { ...q.json, tax_rate_bp: 725, items: [{ name: 'Trailer tire', qty: 2, unit_cents: 18999, taxable: 1 }, { name: 'Labor', qty: 1.5, unit_cents: 12000 }] });
   assert.deepEqual(saved.json.totals, { subtotal: 55998, tax: 2755, total: 58753, credit: 12900, balance: 45853 });
-  assert.equal(saved.json.online.fee, 1376); // 3% of 458.53, rounded
+  assert.equal(saved.json.online.fee, 0);
   const tok = saved.json.token;
   assert.equal((await other('GET', '/api/quotes/' + q.json.id)).status, 404);
 
@@ -195,16 +231,20 @@ test('quote: deposit credited, signed, paid online with Processing Fee on the ba
   assert.equal((await mike('PUT', '/api/quotes/' + q.json.id, { items: [] })).status, 409);
   await anon('POST', `/api/public/proposals/${tok}/checkout`, {});
   const s = [...sessions.values()].find((x) => x.lines[0].amount === 45853);
-  assert.deepEqual(s.lines.map((l) => l.name), [`Repair proposal (#${q.json.id})`, 'Processing Fee']);
-  assert.equal(s.amount_total, 45853 + 1376);
+  assert.deepEqual(s.lines.map((l) => l.name), [`Repair proposal (#${q.json.id})`]);
+  assert.equal(s.amount_total, 45853);
   s.payment_status = 'paid';
   const pay = (await mike('GET', '/api/quotes/' + q.json.id)).json.payments.find((p) => p.status === 'pending');
   assert.equal((await anon('POST', `/api/public/payments/${pay.token}/confirm`, { session_id: s.id })).json.paid, true);
-  assert.equal((await mike('GET', '/api/quotes/' + q.json.id)).json.status, 'paid');
+  const done = (await mike('GET', '/api/quotes/' + q.json.id)).json;
+  assert.equal(done.status, 'paid');
+  const p2 = done.payments.find((p) => p.status === 'paid');
+  // Stripe: 2.9% of 458.53 = 13.30 + 0.30 = 13.60; platform 3% = 13.76; payout 458.53 - 27.36 = 431.17
+  assert.deepEqual([p2.stripe_fee_cents, p2.fee_cents, p2.payout_cents, p2.transfer_status], [1360, 1376, 43117, 'sent']);
 });
 
-test('fee modes: absorbed (no customer line) and cash (no fee); super overview totals and CSV', async () => {
-  await superA('PATCH', `/api/super/tenants/${mikeId}`, { fee_mode: 'absorbed' });
+test('custom platform share, cash has no fee; super overview, CSV, leads', async () => {
+  await superA('PATCH', `/api/super/tenants/${mikeId}`, { fee_bp: 200 });
   const book = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { type: 'winterize', name: 'Lee', phone: '801-555-0101', location: 'Ogden', preferred_date: '2026-11-05' });
   const q = await mike('POST', '/api/quotes', { request_id: book.json.id });
   assert.equal(q.json.title, 'Onsite RV winterizing package');
@@ -212,22 +252,38 @@ test('fee modes: absorbed (no customer line) and cash (no fee); super overview t
   await anon('POST', `/api/public/proposals/${q.json.token}/sign`, { name: 'Lee', agree: true, signature: SIG });
   await anon('POST', `/api/public/proposals/${q.json.token}/checkout`, {});
   const s = [...sessions.values()].find((x) => x.lines[0].amount === 49900);
-  assert.equal(s.lines.length, 1);
-  assert.equal(s.application_fee, 1497);
-  // Pays cash instead: no Processing Fee.
-  const cash = await mike('POST', `/api/quotes/${q.json.id}/payments`, { method: 'cash' });
-  assert.equal(cash.json.status, 'paid');
-  assert.equal(cash.json.payments.find((p) => p.status === 'paid').fee_cents, 0);
-  await superA('PATCH', `/api/super/tenants/${mikeId}`, { fee_mode: '' });
+  s.payment_status = 'paid';
+  const wh = webhook({ type: 'checkout.session.completed', data: { object: s } });
+  await anon('POST', '/api/stripe/webhook', wh.raw, { 'Stripe-Signature': wh.header, 'Content-Type': 'application/json' });
+  const p = (await mike('GET', '/api/quotes/' + q.json.id)).json.payments.find((x) => x.status === 'paid');
+  assert.deepEqual([p.stripe_fee_cents, p.fee_cents, p.payout_cents], [1477, 998, 47425]); // 2% custom share
+  await superA('PATCH', `/api/super/tenants/${mikeId}`, { fee_bp: null });
+
+  // Cash: no Processing Fee, no transfer.
+  const r2 = await mike('POST', '/api/requests', { name: 'Walk-up', phone: '1', location: 'Shop' });
+  const q2 = await mike('POST', '/api/quotes', { request_id: r2.json.id });
+  await mike('PUT', '/api/quotes/' + q2.json.id, { ...q2.json, items: [{ name: 'Fuse', qty: 1, unit_cents: 1500 }] });
+  const cash = await mike('POST', `/api/quotes/${q2.json.id}/payments`, { method: 'cash' });
+  const cp = cash.json.payments.find((x) => x.status === 'paid');
+  assert.deepEqual([cp.fee_cents, cp.stripe_fee_cents, cp.transfer_status], [0, 0, null]);
 
   const o = (await superA('GET', '/api/super/overview')).json;
-  assert.equal(o.totals.fee_cents, 387 + 1376);
-  assert.equal(o.totals.businesses, 2);
+  assert.equal(o.totals.fee_cents, 387 + 1376 + 998);
+  assert.equal(o.totals.stripe_fee_cents, 404 + 1360 + 1477);
+  assert.equal(o.totals.payouts_waiting, 0);
   const csv = await superA('GET', '/api/super/fees.csv');
-  assert.match(csv.text, /Processing Fee/);
-  assert.equal(csv.text.trim().split('\n').length, 3);
-  const detail = (await superA('GET', `/api/super/tenants/${mikeId}`)).json;
-  assert.equal(detail.agreements.length, 3);
+  assert.match(csv.text, /Processing Fee total/);
+  assert.equal(csv.text.trim().split('\n').length, 4);
+  assert.equal((await superA('GET', `/api/super/tenants/${mikeId}`)).json.agreements.length, 3);
+
+  // Owner leads from the HitchPoint landing page.
+  assert.equal((await anon('POST', '/api/public/leads', { name: 'Tech' })).status, 400);
+  assert.equal((await anon('POST', '/api/public/leads', { name: 'Ray Tech', email: 'ray@tech.test', location: 'Boise, ID', certifications: 'RVTI Level 2' })).status, 201);
+  const leads = (await superA('GET', '/api/super/leads')).json;
+  assert.equal(leads[0].name, 'Ray Tech');
+  assert.equal((await superA('PATCH', `/api/super/leads/${leads[0].id}`, { status: 'contacted' })).json.status, 'contacted');
+  assert.equal((await mike('GET', '/api/super/leads')).status, 403);
+  assert.equal((await superA('GET', '/api/super/overview')).json.leads_new, 0);
 });
 
 test('view-as, suspension, hosted website and custom domain', async () => {
@@ -264,7 +320,15 @@ test('view-as, suspension, hosted website and custom domain', async () => {
 });
 
 test('static pages, legal pages and seed script', async () => {
-  for (const p of ['/admin/', '/p/abc', '/pay/abc', '/static/app.css', '/static/admin.js', '/static/site.js', '/legal/terms', '/legal/privacy', '/legal/payment-terms', '/legal/customer-terms']) {
+  const home = await anon('GET', '/');
+  assert.equal(home.status, 200);
+  assert.match(home.text, /HitchPoint/);
+  assert.match(home.text, /"@type":"FAQPage"/);
+  assert.match(home.text, /<link rel="canonical"/);
+  assert.match((await anon('GET', '/robots.txt')).text, /Sitemap: .*\/sitemap\.xml/);
+  assert.match((await anon('GET', '/sitemap.xml')).text, /<urlset/);
+  assert.match((await anon('GET', '/llms.txt')).text, /# HitchPoint/);
+  for (const p of ['/admin/', '/favicon.svg', '/static/brand/og.png', '/static/landing.js', '/p/abc', '/pay/abc', '/static/app.css', '/static/admin.js', '/static/site.js', '/legal/terms', '/legal/privacy', '/legal/payment-terms', '/legal/customer-terms']) {
     assert.equal((await fetch(base + p)).status, 200, p);
   }
   assert.equal((await fetch(base + '/static/../server.js')).status, 404);
