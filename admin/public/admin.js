@@ -854,7 +854,13 @@
       </form>
       <section class="card stack">
         <h2>Services</h2>
-        <dl class="facts"><dt>Stripe</dt><dd>${p.stripe_ready ? (p.test_mode ? 'Connected (test mode)' : 'Connected (live)') : 'Not configured'}</dd><dt>Text alerts</dt><dd>${p.sms ? 'On (Twilio)' : 'Off'}</dd><dt>Email</dt><dd>${p.email ? 'On (password resets)' : 'Off: send reset links by hand from a business page'}</dd></dl>
+        <dl class="facts"><dt>Stripe</dt><dd>${p.stripe_ready ? (p.test_mode ? 'Key set (test mode)' : 'Key set (live)') : 'Not configured'}</dd><dt>Text alerts</dt><dd>${p.sms ? 'On (Twilio)' : 'Off'}</dd><dt>Email</dt><dd>${p.email ? 'On (password resets)' : 'Off: send reset links by hand from a business page'}</dd></dl>
+      </section>
+      <section class="card stack">
+        <h2>Check Stripe connection</h2>
+        <p class="small muted">Asks Stripe to confirm the key on the server works.</p>
+        <div><button class="btn" type="button" id="stripe-check">Check Stripe connection</button></div>
+        <p class="alert" id="sc-msg" hidden></p>
       </section>
       <section class="card stack"><h2>Legal</h2><p class="small"><a href="/legal/terms" target="_blank" rel="noopener">Business Terms</a> · <a href="/legal/privacy" target="_blank" rel="noopener">Privacy</a> · <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment terms</a> · <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer terms</a></p></section>
       <button class="btn ghost" type="button" id="logout">Log out</button>`;
@@ -863,6 +869,16 @@
       e.preventDefault();
       try { await api('/api/super/settings', { method: 'PUT', body: { fee_bp: toCents(f.elements.fee.value) } }); flash(document.getElementById('p-msg'), 'Saved.'); }
       catch (err) { flash(document.getElementById('p-msg'), err.message, 'err'); }
+    });
+    const sc = document.getElementById('stripe-check');
+    sc.addEventListener('click', async () => {
+      sc.disabled = true; sc.textContent = 'Checking…';
+      const r = await api('/api/super/stripe-check', { method: 'POST' }).catch((e) => ({ ok: false, error: e.message }));
+      const m = document.getElementById('sc-msg');
+      m.className = 'alert ' + (r.ok ? 'ok' : 'err');
+      m.textContent = r.ok ? `Connected to Stripe account ${r.name ? '“' + r.name + '” ' : ''}(${r.account_id}) in ${r.test_mode ? 'TEST mode, no real money moves' : 'LIVE mode'}.` : r.error;
+      m.hidden = false;
+      sc.disabled = false; sc.textContent = 'Check Stripe connection';
     });
     document.getElementById('logout').addEventListener('click', logout);
   }

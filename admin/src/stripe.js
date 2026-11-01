@@ -52,6 +52,10 @@ export function stripeClient(env) {
     loginLink(account) {
       return call('POST', `/v1/accounts/${encodeURIComponent(account)}/login_links`, {});
     },
+    // The platform's own Stripe account (used to confirm the API key works).
+    platformAccount() {
+      return call('GET', '/v1/account');
+    },
     getAccount(id) {
       return call('GET', `/v1/accounts/${encodeURIComponent(id)}`);
     },

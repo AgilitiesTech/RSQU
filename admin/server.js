@@ -734,6 +734,18 @@ export function createApp(env = process.env) {
     });
   }, { auth: 'super' });
 
+  route('POST', '/api/super/stripe-check', async (req, res) => {
+    if (!stripe.enabled) return send(res, 200, { ok: false, error: 'No STRIPE_SECRET_KEY is set on the server.' });
+    const key = String(env.STRIPE_SECRET_KEY);
+    if (!/^(sk|rk)_(test|live)_[A-Za-z0-9]{20,}$/.test(key)) return send(res, 200, { ok: false, error: 'STRIPE_SECRET_KEY doesn’t look like a Stripe key. It should start with sk_test_ (or rk_test_) followed by a long string of letters and numbers, with no spaces.' });
+    try {
+      const a = await stripe.platformAccount();
+      send(res, 200, { ok: true, test_mode: stripe.testMode, account_id: a.id, name: a.settings?.dashboard?.display_name || a.business_profile?.name || '', charges_enabled: Boolean(a.charges_enabled), details_submitted: Boolean(a.details_submitted) });
+    } catch (e) {
+      send(res, 200, { ok: false, error: `Stripe rejected the key: ${e.message}` });
+    }
+  }, { auth: 'super' });
+
   route('GET', '/api/super/tenants/:id', async (req, res, p) => {
     const t = getTenant(p.id); if (!t) throw new HttpError(404, 'Not found');
     send(res, 200, {
