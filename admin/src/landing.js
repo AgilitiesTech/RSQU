@@ -378,11 +378,13 @@ Sitemap: ${origin}/sitemap.xml
 `;
 }
 
-export function sitemapXml(origin) {
-  const urls = ['/', '/signup', '/legal/terms', '/legal/privacy', '/legal/payment-terms'];
+// `extra` holds absolute URLs of business sites hosted on the platform domain.
+export function sitemapXml(origin, extra = []) {
+  const urls = ['/', '/signup', '/legal/terms', '/legal/privacy', '/legal/payment-terms'].map((u) => origin + u).concat(extra);
+  const x = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls.map((u) => `  <url><loc>${origin}${u}</loc></url>`).join('\n')}
+${urls.map((u) => `  <url><loc>${x(u)}</loc></url>`).join('\n')}
 </urlset>
 `;
 }

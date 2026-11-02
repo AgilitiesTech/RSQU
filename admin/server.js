@@ -8,7 +8,8 @@ import { hashPassword, verifyPassword, sessions, randomToken, sha256 } from './s
 import { stripeClient, verifyStripeSignature } from './src/stripe.js';
 import * as customerTerms from './src/customer-terms.js';
 import { notifier } from './src/notify.js';
-import { renderSite } from './src/site.js';
+import { renderSite, renderCityPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
+import * as siteProfile from './src/site-profile.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +72,8 @@ export function createApp(env = process.env) {
 
   // Public marketing origin (the brand domain if set).
   const siteOrigin = (req) => (env.PLATFORM_URL || baseUrl(req)).replace(/\/$/, '');
+  // The platform's own hosts can never be a business's custom domain.
+  const platformHosts = new Set([env.PLATFORM_URL, env.BASE_URL].filter(Boolean).flatMap((u) => { try { const h = new URL(u).hostname.toLowerCase().replace(/^www\./, ''); return [h, 'www.' + h]; } catch { return []; } }));
   function baseUrl(req) {
     if (env.BASE_URL) return env.BASE_URL.replace(/\/$/, '');
     const proto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
@@ -762,7 +765,9 @@ export function createApp(env = process.env) {
     const b = await json(req);
     const v = (k, max) => (b[k] !== undefined ? clean(b[k], max) : t[k]);
     let domain = b.custom_domain !== undefined ? clean(b.custom_domain, 200).toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '') : t.custom_domain;
+    if (domain && (platformHosts.has(domain) || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain))) throw new HttpError(400, 'Enter your own domain, like www.yourbusiness.com.');
     if (domain && db.prepare('SELECT 1 FROM tenants WHERE custom_domain = ? AND id != ?').get(domain, t.id)) throw new HttpError(409, 'That domain is already used by another business.');
+    if ((domain || null) !== (t.custom_domain || null)) db.prepare('UPDATE tenants SET domain_live_at = NULL WHERE id = ?').run(t.id);
     db.prepare(`UPDATE tenants SET name = ?, phone = ?, email = ?, notify_phone = ?, tagline = ?, hero_headline = ?, about = ?, service_area = ?, primary_color = ?, accent_color = ?, website_url = ?, custom_domain = ? WHERE id = ?`).run(
       v('name', 120) || t.name, v('phone', 40), v('email', 200), v('notify_phone', 40), v('tagline', 300), v('hero_headline', 200), v('about', 6000), v('service_area', 400),
       hexColor(b.primary_color, t.primary_color), hexColor(b.accent_color, t.accent_color), v('website_url', 300), domain || null, t.id);
@@ -775,6 +780,63 @@ export function createApp(env = process.env) {
     if (b.image && !name) throw new HttpError(400, 'Use a JPG, PNG or WebP image.');
     db.prepare(`UPDATE tenants SET ${b.kind} = ? WHERE id = ?`).run(name, t.id);
     send(res, 200, publicTenant(getTenant(t.id)));
+  }, { auth: 'owner' });
+
+  // Website content and local search (each business edits its own)
+  function websiteState(req, t) {
+    const profile = siteProfile.parseProfile(t.site_profile);
+    const productsCount = db.prepare('SELECT COUNT(*) AS n FROM products WHERE tenant_id = ? AND active = 1 AND on_site = 1').get(t.id).n;
+    const u = siteUrls(t, baseUrl(req));
+    return {
+      profile,
+      checklist: siteProfile.checklist(t, profile, productsCount),
+      site_url: u.abs('/'),
+      city_urls: profile.cities.map((c) => u.abs('/areas/' + siteProfile.citySlug(c))),
+      file_urls: Object.fromEntries(profile.resources.map((r) => [r.file, u.abs('/files/' + r.file)])),
+      limits: siteProfile.LIMITS, states: siteProfile.STATES, city_intro_min: siteProfile.CITY_INTRO_MIN,
+      business: { name: t.name, phone: t.phone, service_area: t.service_area },
+    };
+  }
+  route('GET', '/api/website', async (req, res, p, url, { tenant: t }) => {
+    send(res, 200, websiteState(req, t));
+  }, { auth: 'tenant' });
+  route('PUT', '/api/website', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req, 400_000);
+    let profile;
+    try { profile = siteProfile.cleanProfile(b, siteProfile.parseProfile(t.site_profile)); }
+    catch (e) { if (e instanceof siteProfile.ProfileError) return send(res, 422, { error: e.message, field_errors: e.errors }); throw e; }
+    // Re-read inside the write so a file uploaded meanwhile isn't lost.
+    const fresh = siteProfile.parseProfile(getTenant(t.id).site_profile);
+    const known = new Set(profile.resources.map((r) => r.file));
+    for (const r of fresh.resources) if (!known.has(r.file)) profile.resources.push(r);
+    profile.resources = profile.resources.filter((r) => fresh.resources.some((x) => x.file === r.file));
+    db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(profile), t.id);
+    send(res, 200, websiteState(req, getTenant(t.id)));
+  }, { auth: 'owner' });
+  route('POST', '/api/website/resources', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req, Math.ceil(siteProfile.LIMITS.resourceBytes * 1.4) + 10_000);
+    const title = String(b.title || '').trim().slice(0, 120);
+    if (!title) throw new HttpError(400, 'Give the file a title customers will recognize.');
+    const m = /^data:application\/pdf;base64,([A-Za-z0-9+/=]+)$/.exec(b.file || '');
+    const buf = m ? Buffer.from(m[1], 'base64') : null;
+    if (!buf || buf.subarray(0, 5).toString('latin1') !== '%PDF-') throw new HttpError(400, 'Upload a PDF file.');
+    if (buf.length > siteProfile.LIMITS.resourceBytes) throw new HttpError(413, 'That PDF is larger than 10 MB. Save a smaller copy and try again.');
+    const profile = siteProfile.parseProfile(getTenant(t.id).site_profile);
+    if (profile.resources.length >= siteProfile.LIMITS.resources) throw new HttpError(409, `You can share up to ${siteProfile.LIMITS.resources} files. Remove one first.`);
+    const file = `t${t.id}-doc-${randomToken(12)}.pdf`;
+    fs.writeFileSync(path.join(uploads, file), buf);
+    profile.resources.push({ file, title, description: String(b.description || '').trim().slice(0, 300), size: buf.length, added_at: now() });
+    db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(profile), t.id);
+    send(res, 201, websiteState(req, getTenant(t.id)));
+  }, { auth: 'owner' });
+  route('DELETE', '/api/website/resources/:file', async (req, res, p, url, { tenant: t }) => {
+    const profile = siteProfile.parseProfile(getTenant(t.id).site_profile);
+    const r = profile.resources.find((x) => x.file === p.file);
+    if (!r) throw new HttpError(404, 'Not found');
+    profile.resources = profile.resources.filter((x) => x.file !== r.file);
+    db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(profile), t.id);
+    try { fs.unlinkSync(path.join(uploads, path.basename(r.file))); } catch { /* already gone */ }
+    send(res, 200, websiteState(req, getTenant(t.id)));
   }, { auth: 'owner' });
 
   // Team
@@ -1059,11 +1121,36 @@ export function createApp(env = process.env) {
     fs.createReadStream(full).pipe(res);
     return true;
   }
-  function serveSite(res, t) {
-    if (!t || t.status !== 'active') throw new HttpError(404, 'Not found');
-    const products = db.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY bookable DESC, price_cents DESC, name').all(t.id);
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...securityHeaders });
-    res.end(renderSite(t, products));
+  // Business websites embed YouTube videos (thumbnail from i.ytimg.com, player from youtube-nocookie.com
+  // only after a visitor clicks play), so their policy allows exactly those two hosts.
+  const siteHeaders = {
+    ...securityHeaders,
+    'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob: https://i.ytimg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-src https://www.youtube-nocookie.com; form-action 'self'; frame-ancestors 'none'",
+  };
+  const activeProducts = (t) => db.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY bookable DESC, price_cents DESC, name').all(t.id);
+  const liveTenant = (t) => { if (!t || t.status !== 'active') throw new HttpError(404, 'Not found'); return t; };
+  function serveSite(req, res, t, onDomain = false) {
+    liveTenant(t);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+    res.end(renderSite(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), { platformBase: baseUrl(req), onDomain }));
+  }
+  function serveCity(req, res, t, slug, onDomain = false) {
+    liveTenant(t);
+    const profile = siteProfile.parseProfile(t.site_profile);
+    const city = siteProfile.cityBySlug(profile, slug);
+    if (!city) throw new HttpError(404, 'Not found');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+    res.end(renderCityPage(t, activeProducts(t), profile, city, { platformBase: baseUrl(req), onDomain }));
+  }
+  // A PDF the business shares with customers (checklists, guides). Only files listed on its site.
+  function serveResource(res, t, file) {
+    liveTenant(t);
+    const r = siteProfile.parseProfile(t.site_profile).resources.find((x) => x.file === file);
+    const full = r && path.join(uploads, path.basename(r.file));
+    if (!r || !fs.existsSync(full)) throw new HttpError(404, 'Not found');
+    const name = (siteProfile.slugify(r.title) || 'document') + '.pdf';
+    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${name}"`, 'Cache-Control': 'public, max-age=3600', 'X-Content-Type-Options': 'nosniff' });
+    fs.createReadStream(full).pipe(res);
   }
 
   // A business's customer Terms & Conditions, as approved by its owner. ?v=N shows an earlier version
@@ -1133,21 +1220,39 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       // Send www.<platform domain> to the bare domain so search engines see one site.
       const platformHost = env.PLATFORM_URL ? new URL(env.PLATFORM_URL).host : '';
       if (platformHost && host === 'www.' + platformHost) { res.writeHead(301, { Location: env.PLATFORM_URL.replace(/\/$/, '') + req.url }); return res.end(); }
-      const domainTenant = host ? db.prepare('SELECT * FROM tenants WHERE custom_domain = ?').get(host) : null;
+      let domainTenant = host && !platformHosts.has(host) ? db.prepare('SELECT * FROM tenants WHERE custom_domain = ?').get(host) : null;
+      if (domainTenant && !domainTenant.domain_live_at) {
+        db.prepare('UPDATE tenants SET domain_live_at = ? WHERE id = ? AND domain_live_at IS NULL').run(now(), domainTenant.id);
+        domainTenant = getTenant(domainTenant.id);
+      }
       if (pathname === '/') {
-        if (domainTenant) return serveSite(res, domainTenant);
+        if (domainTenant) return serveSite(req, res, domainTenant, true);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300', ...securityHeaders });
         return res.end(renderLanding({ origin: siteOrigin(req), name: platformName, email: platformEmail }));
       }
+      if (domainTenant && pathname === '/robots.txt') return send(res, 200, tenantRobots(`https://${domainTenant.custom_domain}`), { 'Cache-Control': 'public, max-age=3600' });
+      if (domainTenant && pathname === '/sitemap.xml') {
+        liveTenant(domainTenant);
+        return send(res, 200, tenantSitemap(sitePages(domainTenant, siteProfile.parseProfile(domainTenant.site_profile), baseUrl(req))), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+      }
       if (!domainTenant && pathname === '/robots.txt') return send(res, 200, robotsTxt(siteOrigin(req)), { 'Cache-Control': 'public, max-age=3600' });
-      if (!domainTenant && pathname === '/sitemap.xml') return send(res, 200, sitemapXml(siteOrigin(req)), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+      if (!domainTenant && pathname === '/sitemap.xml') {
+        // Business sites hosted here (no domain of their own) are listed in the platform sitemap.
+        const hosted = db.prepare(`SELECT * FROM tenants WHERE status = 'active' AND (custom_domain IS NULL OR custom_domain = '' OR domain_live_at IS NULL) ORDER BY id`).all()
+          .flatMap((t) => sitePages(t, siteProfile.parseProfile(t.site_profile), baseUrl(req)));
+        return send(res, 200, sitemapXml(siteOrigin(req), hosted), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+      }
       if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req), platformEmail), { 'Cache-Control': 'public, max-age=3600' });
       if (pathname === '/favicon.ico' || pathname === '/favicon.svg') return serveFile(res, 'brand/favicon.svg');
       if (pathname === '/healthz') return send(res, 200, 'ok');
       if (pathname === '/admin' || pathname === '/admin/') return serveFile(res, 'admin.html');
       if (pathname === '/signup') { res.writeHead(302, { Location: '/admin/#/signup' }); return res.end(); }
       let m;
-      if ((m = /^\/s\/([\w-]+)\/?$/.exec(pathname))) return serveSite(res, getTenantBySlug(m[1]));
+      if ((m = /^\/s\/([\w-]+)\/?$/.exec(pathname))) return serveSite(req, res, getTenantBySlug(m[1]));
+      if ((m = /^\/s\/([\w-]+)\/areas\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveCity(req, res, getTenantBySlug(m[1]), m[2]);
+      if (domainTenant && (m = /^\/areas\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveCity(req, res, domainTenant, m[1], true);
+      if ((m = /^\/s\/([\w-]+)\/files\/([\w-]+\.pdf)$/.exec(pathname))) return serveResource(res, getTenantBySlug(m[1]), m[2]);
+      if (domainTenant && (m = /^\/files\/([\w-]+\.pdf)$/.exec(pathname))) return serveResource(res, domainTenant, m[1]);
       if ((m = /^\/s\/([\w-]+)\/terms\/?$/.exec(pathname))) return serveTerms(res, getTenantBySlug(m[1]), url);
       if (domainTenant && pathname === '/terms') return serveTerms(res, domainTenant, url);
       if ((m = /^\/media\/([\w-]+)\/([\w.-]+)$/.exec(pathname))) {

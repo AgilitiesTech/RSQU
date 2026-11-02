@@ -514,6 +514,134 @@ test('view-as, suspension, hosted website and custom domain', async () => {
   assert.equal((await mike('GET', '/api/requests')).status, 200);
 });
 
+function viaHost(host, p) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: 'localhost', port: server.address().port, path: p, headers: { Host: host } }, (r) => {
+      let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => resolve({ status: r.statusCode, text: b, headers: r.headers }));
+    }).on('error', reject);
+  });
+}
+
+test('website sections, city pages, PDFs and local-search markup', async () => {
+  const st = await mike('GET', '/api/website');
+  assert.equal(st.status, 200);
+  assert.ok(st.json.checklist.length >= 10);
+  assert.equal(st.json.checklist.find((c) => c.key === 'base').done, false);
+
+  const bad = await mike('PUT', '/api/website', { base_city: 'Ogden', base_state: 'ZZ', cities: [{ name: 'Layton' }], videos: [{ url: 'https://vimeo.com/123' }], links: { facebook: 'not a url' }, search_console: '<script>' });
+  assert.equal(bad.status, 422);
+  for (const k of ['base_state', 'cities.0.state', 'videos.0.url', 'links.facebook', 'search_console']) assert.ok(bad.json.field_errors[k], k);
+
+  const longIntro = 'We fix water heaters, slide-outs and roof leaks at Fort Buenaventura, the Ogden Valley campgrounds and driveways all over town, usually within a day of your call.';
+  const good = await mike('PUT', '/api/website', {
+    service_phrase: 'Mobile RV repair', base_city: 'Ogden', base_state: 'ut', radius_miles: '60',
+    cities: [{ name: 'Ogden', state: 'UT', intro: longIntro }, { name: 'Layton', state: 'UT', intro: 'Short note.' }, { name: '', state: '', intro: '' }],
+    hours: { always_open: false, note: 'Emergency calls answered after hours', days: { mon: { open: '08:00', close: '17:00' }, sat: { open: '09:00', close: '13:00' } } },
+    credentials: [{ title: 'RVTI Certified Technician, Level 2', detail: 'Since 2015' }],
+    faqs: [{ q: 'Do you come to campgrounds?', a: 'Yes, anywhere within about 60 miles.' }],
+    videos: [{ url: 'https://youtu.be/dQw4w9WgXcQ', title: 'Water heater repair' }, { url: 'https://www.youtube.com/shorts/abcdefghijk' }],
+    links: { google_review: 'g.page/r/abc123/review', google_profile: 'https://maps.app.goo.gl/xyz' },
+    search_console: '<meta name="google-site-verification" content="abcDEF123_-abcDEF123_-xyz" />',
+  });
+  assert.equal(good.status, 200, JSON.stringify(good.json));
+  const P = good.json.profile;
+  assert.equal(P.base_state, 'UT');
+  assert.equal(P.radius_miles, 60);
+  assert.equal(P.cities.length, 2);
+  assert.deepEqual(P.videos.map((v) => v.id), ['dQw4w9WgXcQ', 'abcdefghijk']);
+  assert.equal(P.links.google_review, 'https://g.page/r/abc123/review');
+  assert.equal(P.search_console, 'abcDEF123_-abcDEF123_-xyz');
+  assert.equal(good.json.checklist.find((c) => c.key === 'base').done, true);
+  assert.equal(good.json.checklist.find((c) => c.key === 'city_intros').done, false); // Layton is too short
+
+  // PDFs: only real PDFs, then listed and downloadable
+  const pdf = 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4\n% test checklist\n%%EOF').toString('base64');
+  assert.equal((await mike('POST', '/api/website/resources', { title: 'Tank checklist', file: PNG.replace('image/png', 'application/pdf') })).status, 400);
+  assert.equal((await mike('POST', '/api/website/resources', { title: '', file: pdf })).status, 400);
+  const up = await mike('POST', '/api/website/resources', { title: 'Black and grey tank checklist', description: 'Print before your trip', file: pdf });
+  assert.equal(up.status, 201);
+  const doc = up.json.profile.resources[0];
+  assert.match(doc.file, /^t\d+-doc-[\w-]+\.pdf$/);
+  // Saving other sections keeps the file; renaming works
+  const again = await mike('PUT', '/api/website', { ...P, resources: [{ file: doc.file, title: 'Tank checklist', description: 'Print before your trip' }, { file: 't999-doc-evil.pdf', title: 'x' }] });
+  assert.equal(again.status, 200);
+  assert.deepEqual(again.json.profile.resources.map((r) => [r.file, r.title]), [[doc.file, 'Tank checklist']]);
+  // Another business can't touch it
+  assert.equal((await other('DELETE', '/api/website/resources/' + doc.file)).status, 404);
+
+  // Mike uses his own domain: canonical URLs point there; pages on the platform keep /s/<slug> links
+  const site = await anon('GET', `/s/${mikeSlug}`);
+  assert.equal(site.status, 200);
+  assert.match(site.headers.get('content-security-policy'), /frame-src https:\/\/www\.youtube-nocookie\.com/);
+  assert.match(site.text, /<link rel="canonical" href="https:\/\/www\.mikesrv\.test\/">/);
+  assert.match(site.text, /<meta name="google-site-verification" content="abcDEF123_-abcDEF123_-xyz">/);
+  const ld = [...site.text.matchAll(/<script type="application\/ld\+json">(.*?)<\/script>/gs)].map((m) => JSON.parse(m[1]));
+  const biz = ld.find((x) => x['@type'] === 'AutoRepair');
+  assert.ok(biz, 'business markup');
+  assert.deepEqual(biz.areaServed.map((a) => a.name), ['Ogden, UT', 'Layton, UT']);
+  assert.equal(biz.address.addressLocality, 'Ogden');
+  assert.deepEqual(biz.openingHoursSpecification.map((h) => h.dayOfWeek), ['Monday', 'Saturday']);
+  assert.deepEqual(biz.sameAs, ['https://maps.app.goo.gl/xyz']);
+  assert.equal(biz.hasCredential[0].name, 'RVTI Certified Technician, Level 2');
+  assert.ok(ld.find((x) => x['@type'] === 'FAQPage'));
+  assert.match(site.text, /data-yt="dQw4w9WgXcQ"/);
+  assert.match(site.text, new RegExp(`href="/s/${mikeSlug}/areas/ogden-ut"`));
+  assert.match(site.text, new RegExp(`href="/s/${mikeSlug}/files/${doc.file}"`));
+  assert.match(site.text, /Review us on Google/);
+  assert.match(site.text, /9 AM–1 PM/);
+
+  const ogden = await anon('GET', `/s/${mikeSlug}/areas/ogden-ut`);
+  assert.equal(ogden.status, 200);
+  assert.match(ogden.text, /<title>Mobile RV repair in Ogden, UT \| /);
+  assert.match(ogden.text, /<meta name="robots" content="index,follow">/);
+  assert.match(ogden.text, /Fort Buenaventura/);
+  assert.match(ogden.text, /"@type":"Service"/);
+  assert.match((await anon('GET', `/s/${mikeSlug}/areas/layton-ut`)).text, /<meta name="robots" content="noindex,follow">/);
+  assert.equal((await anon('GET', `/s/${mikeSlug}/areas/provo-ut`)).status, 404);
+
+  const file = await fetch(`${base}/s/${mikeSlug}/files/${doc.file}`);
+  assert.equal(file.status, 200);
+  assert.equal(file.headers.get('content-type'), 'application/pdf');
+  assert.match(file.headers.get('content-disposition'), /filename="tank-checklist\.pdf"/);
+  assert.equal((await fetch(`${base}/s/${mikeSlug}/files/t1-doc-nope.pdf`)).status, 404);
+
+  // On his own domain: links are relative to the domain; sitemap lists indexable pages only
+  const home = await viaHost('www.mikesrv.test', '/');
+  assert.match(home.text, /href="\/areas\/ogden-ut"/);
+  assert.equal((await viaHost('www.mikesrv.test', '/areas/ogden-ut')).status, 200);
+  assert.equal((await viaHost('www.mikesrv.test', `/files/${doc.file}`)).status, 200);
+  const sm = await viaHost('www.mikesrv.test', '/sitemap.xml');
+  assert.match(sm.text, /<loc>https:\/\/www\.mikesrv\.test\/<\/loc>/);
+  assert.match(sm.text, /<loc>https:\/\/www\.mikesrv\.test\/areas\/ogden-ut<\/loc>/);
+  assert.doesNotMatch(sm.text, /layton/);
+  assert.match(sm.text, new RegExp(`/files/${doc.file}`));
+  assert.match((await viaHost('www.mikesrv.test', '/robots.txt')).text, /Sitemap: https:\/\/www\.mikesrv\.test\/sitemap\.xml/);
+  // The platform sitemap lists hosted business sites, but not ones on their own domain
+  const psm = await anon('GET', '/sitemap.xml');
+  assert.doesNotMatch(psm.text, new RegExp(`/s/${mikeSlug}/`));
+  assert.match(psm.text, /\/s\/[\w-]+\/<\/loc>/);
+
+  // A domain becomes canonical only once requests actually arrive on it
+  assert.equal((await other('PUT', '/api/business', { custom_domain: 'not a domain' })).status, 400);
+  assert.equal((await other('PUT', '/api/business', { custom_domain: 'www.other-rv.test' })).status, 200);
+  const before = await other('GET', '/api/website');
+  assert.match(before.json.site_url, /\/s\/[\w-]+\/$/);
+  assert.match((await anon('GET', '/sitemap.xml')).text, new RegExp(before.json.site_url.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')));
+  assert.equal((await viaHost('www.other-rv.test', '/')).status, 200);
+  assert.equal((await other('GET', '/api/website')).json.site_url, 'https://www.other-rv.test/');
+  await other('PUT', '/api/business', { custom_domain: '' });
+  // Lenient inputs: YouTube links without https://, closing at midnight
+  const lenient = await other('PUT', '/api/website', { videos: [{ url: 'youtube.com/watch?v=dQw4w9WgXcQ' }], hours: { days: { fri: { open: '18:00', close: '00:00' } } } });
+  assert.equal(lenient.status, 200, JSON.stringify(lenient.json));
+  assert.equal(lenient.json.profile.videos[0].id, 'dQw4w9WgXcQ');
+  assert.deepEqual(lenient.json.profile.hours.days.fri, { open: '18:00', close: '23:59' });
+
+  const del = await mike('DELETE', '/api/website/resources/' + doc.file);
+  assert.equal(del.status, 200);
+  assert.equal(del.json.profile.resources.length, 0);
+  assert.equal((await fetch(`${base}/s/${mikeSlug}/files/${doc.file}`)).status, 404);
+});
+
 test('static pages, legal pages and seed script', async () => {
   const home = await anon('GET', '/');
   assert.equal(home.status, 200);

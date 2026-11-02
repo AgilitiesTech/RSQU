@@ -204,6 +204,11 @@ function migrate(db) {
   // One-time business setup used in the customer Terms & Conditions, proposals and payment pages
   // (legal name, address, license, insurance, policies). JSON; see src/customer-terms.js.
   addColumn(db, 'tenants', 'legal_profile', 'TEXT');
+  // Website sections and local-search details the business edits itself (src/site-profile.js)
+  addColumn(db, 'tenants', 'site_profile', 'TEXT');
+  // Set the first time a request arrives on the business's own domain (DNS points here), so its domain
+  // becomes the canonical address only once it actually works.
+  addColumn(db, 'tenants', 'domain_live_at', 'TEXT');
 
   // Which terms version a customer accepted when signing a proposal.
   addColumn(db, 'quotes', 'customer_terms_version', 'INTEGER');

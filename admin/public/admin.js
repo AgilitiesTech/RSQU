@@ -604,6 +604,11 @@
     view.innerHTML = `
       <h1>Business and website</h1>
       <section class="card stack">
+        <h2>Get found on Google</h2>
+        <p>Add the cities you serve, your hours, certifications, FAQs, videos and customer checklists. Each city gets its own page, and your site tells Google exactly where you work.</p>
+        <div><a class="btn primary" href="#/website">Edit website sections</a></div>
+      </section>
+      <section class="card stack">
         <h2>Your website</h2>
         <p>Your hosted site: <a href="${esc(b.site_url)}" target="_blank" rel="noopener">${esc(b.site_url)}</a></p>
         <p class="small muted">Use your own domain: add a CNAME record pointing your domain (for example <code>www.yourbusiness.com</code>) at <code>${esc(location.host)}</code>, then enter the domain below. Agilities support can help.</p>
@@ -674,6 +679,196 @@
       if (!confirm('Remove this team member?')) return;
       await api('/api/team/' + btn.dataset.rm, { method: 'DELETE' }); businessView();
     }));
+  }
+
+  // ---------- website sections and local search ----------
+  async function websiteView() {
+    setNav('business');
+    const st = await api('/api/website');
+    const owner = isOwner();
+    const P = st.profile;
+    const stateOpts = (v) => `<option value="">State</option>${st.states.map((x) => `<option ${x === v ? 'selected' : ''}>${x}</option>`).join('')}`;
+    const DAYS = [['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'], ['thu', 'Thursday'], ['fri', 'Friday'], ['sat', 'Saturday'], ['sun', 'Sunday']];
+    const done = st.checklist.filter((c) => c.done).length;
+    const rm = '<button class="btn ghost sm" type="button" data-remove>Remove</button>';
+    const rows = {
+      city: (c = {}, url = '') => {
+        const link = url ? `<a class="small" href="${esc(url)}" target="_blank" rel="noopener">View page</a>` : '<span></span>';
+        return `<div class="card stack" data-row="cities" style="box-shadow:none;border:1px solid var(--line)">
+          <div class="grid2"><div><label>City</label><input data-f="name" data-k="name" maxlength="80" value="${esc(c.name)}" placeholder="Ogden"></div><div><label>State</label><select data-f="state" data-k="state">${stateOpts(c.state)}</select></div></div>
+          <div><label>About your work in this city</label><textarea data-f="intro" data-k="intro" rows="3" maxlength="2000" placeholder="Campgrounds, RV parks and roads you know there, typical arrival time, common repairs…">${esc(c.intro)}</textarea>
+          <p class="small muted" data-count></p></div>
+          <div class="row between">${link}${rm}</div></div>`;
+      },
+      cred: (c = {}) => `<div class="grid2" data-row="credentials" style="align-items:end"><div><label>Certification or credential</label><input data-f="title" data-k="title" maxlength="120" value="${esc(c.title)}" placeholder="RVTI Certified Technician, Level 2"></div><div><label>Details (optional)</label><input data-f="detail" maxlength="300" value="${esc(c.detail)}" placeholder="Since 2015 · NRVTA graduate"></div><div>${rm}</div></div>`,
+      faq: (f = {}) => `<div class="stack" data-row="faqs" style="border-bottom:1px solid var(--line);padding-bottom:12px"><div><label>Question</label><input data-f="q" maxlength="200" value="${esc(f.q)}" placeholder="Do you come to campgrounds?"></div><div><label>Answer</label><textarea data-f="a" rows="2" maxlength="1500">${esc(f.a)}</textarea></div><div>${rm}</div></div>`,
+      video: (v = {}) => `<div class="grid2" data-row="videos" style="align-items:end"><div><label>YouTube link</label><input data-f="url" data-k="url" maxlength="300" value="${v.id ? 'https://youtu.be/' + esc(v.id) : ''}" placeholder="https://youtu.be/…"></div><div><label>Title</label><input data-f="title" maxlength="120" value="${esc(v.title)}" placeholder="Water heater repair at a campground"></div><div>${rm}</div></div>`,
+    };
+    const hoursRow = ([k, label]) => {
+      const h = P.hours.days[k];
+      return `<div class="grid2" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));align-items:end" data-day="${k}">
+        <div><strong>${label}</strong><label class="check small"><input type="checkbox" data-closed ${h ? '' : 'checked'}> Closed</label></div>
+        <div><label for="h-${k}-o">Opens</label><input id="h-${k}-o" type="time" data-open value="${h ? h.open : '08:00'}" data-k="hours.${k}"></div>
+        <div><label for="h-${k}-c">Closes</label><input id="h-${k}-c" type="time" data-close value="${h ? h.close : '17:00'}"></div></div>`;
+    };
+    const linkField = (k, label, hint) => `<div><label for="l-${k}">${label}</label><input id="l-${k}" data-link="${k}" data-k="links.${k}" maxlength="400" value="${esc(P.links[k] || '')}" placeholder="https://"><p class="small muted">${hint}</p></div>`;
+
+    view.innerHTML = `
+      <p><a href="#/business">‹ Business and website</a></p>
+      <h1>Website sections and Google search</h1>
+      <section class="card stack">
+        <div class="row between"><h2>Local search checklist</h2><strong>${done} of ${st.checklist.length} done</strong></div>
+        <ul class="stack" style="list-style:none;padding:0;margin:0;gap:10px">${st.checklist.map((c) => `<li class="row" style="gap:10px;align-items:flex-start;flex-wrap:nowrap"><span aria-hidden="true" style="flex:none;width:22px;height:22px;border-radius:50%;display:grid;place-content:center;font-size:13px;font-weight:700;${c.done ? 'background:#1E7B4A;color:#fff' : 'border:2px solid var(--line)'}">${c.done ? '✓' : ''}</span><span><strong>${esc(c.label)}</strong>${c.done ? ' <span class="sr-only">(done)</span>' : ''}<br><span class="small muted">${esc(c.why)}</span></span></li>`).join('')}</ul>
+        <p class="small muted">Your phone, About text and services are on the <a href="#/business">Business page</a> and <a href="#/products">Products</a>. Use the same business name and phone number here as on your Google Business Profile.</p>
+        <div><a class="btn ghost" href="${esc(st.site_url)}" target="_blank" rel="noopener">View your website</a></div>
+      </section>
+      <form class="stack" id="wf"><fieldset ${owner ? '' : 'disabled'} style="border:0;padding:0;margin:0" class="stack">
+        <section class="card stack">
+          <h2>Where you work</h2>
+          <div><label for="w-phrase">What you do, in the words customers search</label><input id="w-phrase" data-k="service_phrase" maxlength="60" value="${esc(P.service_phrase)}" placeholder="Mobile RV repair"><p class="small muted">Used in page titles, like “Mobile RV repair in Ogden, UT”.</p></div>
+          <div class="grid2">
+            <div><label for="w-city">Base city</label><input id="w-city" data-k="base_city" maxlength="80" value="${esc(P.base_city)}" placeholder="Morgan"></div>
+            <div><label for="w-state">State</label><select id="w-state" data-k="base_state">${stateOpts(P.base_state)}</select></div>
+            <div><label for="w-radius">How far you travel (miles)</label><input id="w-radius" data-k="radius_miles" inputmode="numeric" value="${P.radius_miles || ''}" placeholder="60"></div>
+          </div>
+          <h3>Cities you serve</h3>
+          <p class="small muted">Up to ${st.limits.cities}. Each gets its own page. Write a few sentences for each one; pages with at least ${st.city_intro_min} characters of your own words are offered to Google, so they don’t look like copies of each other.</p>
+          <div class="stack" id="cities">${P.cities.map((c, i) => rows.city(c, st.city_urls[i])).join('')}</div>
+          <div><button class="btn ghost" type="button" data-add="city">+ Add a city</button></div>
+        </section>
+        <section class="card stack">
+          <h2>Hours</h2>
+          <label class="check"><input type="checkbox" id="w-247" ${P.hours.always_open ? 'checked' : ''}> Open 24 hours, 7 days a week</label>
+          <div class="stack" id="days" ${P.hours.always_open ? 'hidden' : ''}>${DAYS.map(hoursRow).join('')}</div>
+          <div><label for="w-hnote">Note (optional)</label><input id="w-hnote" maxlength="200" value="${esc(P.hours.note)}" placeholder="Emergency calls answered after hours"></div>
+        </section>
+        <section class="card stack">
+          <h2>Certifications and experience</h2>
+          <div class="stack" id="creds">${P.credentials.map((c) => rows.cred(c)).join('')}</div>
+          <div><button class="btn ghost" type="button" data-add="cred">+ Add a credential</button></div>
+        </section>
+        <section class="card stack">
+          <h2>Questions customers ask (FAQ)</h2>
+          <p class="small muted">Answer what people ask on the phone: pricing, how fast you come, which RVs you work on, whether you come to campgrounds.</p>
+          <div class="stack" id="faqs">${P.faqs.map((f) => rows.faq(f)).join('')}</div>
+          <div><button class="btn ghost" type="button" data-add="faq">+ Add a question</button></div>
+        </section>
+        <section class="card stack">
+          <h2>Videos</h2>
+          <p class="small muted">Paste links to your YouTube videos. Short repair walk-throughs work well.</p>
+          <div class="stack" id="videos">${P.videos.map((v) => rows.video(v)).join('')}</div>
+          <div><button class="btn ghost" type="button" data-add="video">+ Add a video</button></div>
+        </section>
+        <section class="card stack">
+          <h2>Google and social links</h2>
+          ${linkField('google_profile', 'Google Business Profile link', 'Search your business name on Google, click your listing, then Share and copy the link.')}
+          ${linkField('google_review', 'Google review link', 'On your Business Profile, click “Ask for reviews” and copy the link. Adds a “Review us on Google” button.')}
+          ${linkField('youtube', 'YouTube channel', '')}
+          <div class="grid2">${linkField('facebook', 'Facebook page', '')}${linkField('instagram', 'Instagram', '')}</div>
+        </section>
+        <section class="card stack">
+          <h2>Google Search Console</h2>
+          <p class="small">Shows which searches bring people to your site. In <a href="https://search.google.com/search-console" target="_blank" rel="noopener">Search Console</a>, add your site as a <strong>URL prefix</strong> using the address <code>${esc(st.site_url)}</code>, choose <strong>HTML tag</strong>, and paste the tag here.</p>
+          <div><label for="w-sc">Verification tag</label><input id="w-sc" data-k="search_console" maxlength="300" value="${esc(P.search_console)}" placeholder='<meta name="google-site-verification" content="…">'></div>
+        </section>
+        <section class="card stack">
+          <h2>Checklists and guides (PDFs)</h2>
+          <p class="small muted">Files customers can download and print from your site. Up to ${st.limits.resources}, 10 MB each.</p>
+          <div class="stack" id="docs"></div>
+          ${owner ? `<div class="stack" style="border-top:1px solid var(--line);padding-top:14px"><h3>Add a PDF</h3><div class="grid2"><div><label for="d-title">Title</label><input id="d-title" maxlength="120" placeholder="Black and grey tank checklist"></div><div><label for="d-desc">Short description (optional)</label><input id="d-desc" maxlength="300"></div></div><div><label for="d-file">PDF file</label><input id="d-file" type="file" accept="application/pdf"></div><div><button class="btn" type="button" id="d-up">Upload PDF</button></div><p class="alert" id="d-msg" hidden></p></div>` : ''}
+        </section>
+        <p class="alert" id="w-msg" hidden></p>
+        ${owner ? '<div class="sticky-actions row"><button class="btn primary" type="submit">Save</button></div>' : '<p class="muted small">Only the business owner can change these.</p>'}
+      </fieldset></form>`;
+
+    // Repeated rows are built from templates; give each label its own field.
+    let uid = 0;
+    const linkLabels = (root) => root.querySelectorAll('label:not([for]):not(.check)').forEach((l) => {
+      const inp = l.nextElementSibling;
+      if (inp && /^(INPUT|SELECT|TEXTAREA)$/.test(inp.tagName)) { if (!inp.id) inp.id = 'wf-' + (++uid); l.htmlFor = inp.id; }
+    });
+    linkLabels(view);
+    const lists = { city: 'cities', cred: 'creds', faq: 'faqs', video: 'videos' };
+    const countCity = (row) => {
+      const n = row.querySelector('[data-f=intro]').value.trim().length;
+      row.querySelector('[data-count]').textContent = n >= st.city_intro_min ? `${n} characters. Offered to Google.` : `${n} of ${st.city_intro_min} characters. Not offered to Google yet.`;
+    };
+    const f = document.getElementById('wf'), msg = document.getElementById('w-msg');
+    // Uploads and deletes redraw only this list, so unsaved edits elsewhere on the page stay put.
+    const renderDocs = (files, urls) => {
+      const box = document.getElementById('docs');
+      box.innerHTML = files.map((r) => `<div class="grid2" data-doc="${esc(r.file)}" style="align-items:end"><div><label>Title</label><input data-f="title" maxlength="120" value="${esc(r.title)}"></div><div><label>Short description</label><input data-f="description" maxlength="300" value="${esc(r.description)}"></div><div class="row"><a class="btn ghost sm" href="${esc(urls[r.file])}" target="_blank" rel="noopener">Open</a>${owner ? `<button class="btn ghost sm" type="button" data-del="${esc(r.file)}">Delete</button>` : ''}</div></div>`).join('') || '<p class="muted small">No files yet.</p>';
+      linkLabels(box);
+    };
+    renderDocs(P.resources, st.file_urls);
+    view.querySelectorAll('[data-row=cities]').forEach(countCity);
+    f.addEventListener('input', (e) => { const r = e.target.closest('[data-row=cities]'); if (r) countCity(r); });
+    f.addEventListener('click', async (e) => {
+      const del = e.target.closest('[data-del]');
+      if (del) {
+        if (del.dataset.confirm !== '1') { del.dataset.confirm = '1'; del.textContent = 'Delete for good?'; return; }
+        try { const ns = await api('/api/website/resources/' + encodeURIComponent(del.dataset.del), { method: 'DELETE' }); renderDocs(ns.profile.resources, ns.file_urls); }
+        catch (err) { flash(msg, err.message, 'err'); }
+        return;
+      }
+      const add = e.target.closest('[data-add]');
+      if (add) { const box = document.getElementById(lists[add.dataset.add]); box.insertAdjacentHTML('beforeend', rows[add.dataset.add]()); const r = box.lastElementChild; linkLabels(r); if (add.dataset.add === 'city') countCity(r); r.querySelector('input,select,textarea').focus(); }
+      const rmb = e.target.closest('[data-remove]');
+      if (rmb) rmb.closest('[data-row]').remove();
+    });
+    document.getElementById('w-247').addEventListener('change', (e) => { document.getElementById('days').hidden = e.target.checked; });
+
+    const collect = (name) => [...view.querySelectorAll(`[data-row=${name}]`)].map((r) => Object.fromEntries([...r.querySelectorAll('[data-f]')].map((i) => [i.dataset.f, i.value])));
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      view.querySelectorAll('[aria-invalid]').forEach((x) => x.removeAttribute('aria-invalid'));
+      const days = {};
+      view.querySelectorAll('[data-day]').forEach((d) => { if (!d.querySelector('[data-closed]').checked) days[d.dataset.day] = { open: d.querySelector('[data-open]').value, close: d.querySelector('[data-close]').value }; });
+      const body = {
+        service_phrase: document.getElementById('w-phrase').value, base_city: document.getElementById('w-city').value, base_state: document.getElementById('w-state').value, radius_miles: document.getElementById('w-radius').value.trim(),
+        cities: collect('cities'), credentials: collect('credentials'), faqs: collect('faqs'), videos: collect('videos'),
+        hours: { always_open: document.getElementById('w-247').checked, note: document.getElementById('w-hnote').value, days },
+        links: Object.fromEntries([...view.querySelectorAll('[data-link]')].map((i) => [i.dataset.link, i.value])),
+        search_console: document.getElementById('w-sc').value,
+        resources: [...view.querySelectorAll('[data-doc]')].map((d) => ({ file: d.dataset.doc, title: d.querySelector('[data-f=title]').value, description: d.querySelector('[data-f=description]').value })),
+      };
+      try { await api('/api/website', { method: 'PUT', body }); await websiteView(); flash(document.getElementById('w-msg'), 'Saved. Your website is updated.'); }
+      catch (err) {
+        const fe = err.data && err.data.field_errors;
+        if (!fe) return flash(msg, err.message, 'err');
+        const names = { cities: 'City', credentials: 'Credential', faqs: 'Question', videos: 'Video' };
+        const lines = Object.entries(fe).map(([k, v]) => {
+          const [sec, idx, field] = k.split('.');
+          if (names[sec] && /^\d+$/.test(idx || '')) {
+            const row = view.querySelectorAll(`[data-row=${sec}]`)[Number(idx)];
+            const inp = row && (row.querySelector(`[data-k="${field}"]`) || row.querySelector('[data-f]'));
+            if (inp) inp.setAttribute('aria-invalid', 'true');
+            return `${names[sec]} ${Number(idx) + 1}: ${v}`;
+          }
+          const inp = view.querySelector(`[data-k="${k}"]`); if (inp) inp.setAttribute('aria-invalid', 'true');
+          return v;
+        });
+        flash(msg, 'Please fix: ' + lines.join(' '), 'err');
+        const first = view.querySelector('[aria-invalid]'); if (first) first.focus();
+      }
+    });
+
+    const up = document.getElementById('d-up');
+    if (up) up.addEventListener('click', async () => {
+      const dm = document.getElementById('d-msg'), file = document.getElementById('d-file').files[0], title = document.getElementById('d-title').value.trim();
+      if (!title) return flash(dm, 'Give the file a title customers will recognize.', 'err');
+      if (!file || file.type !== 'application/pdf') return flash(dm, 'Choose a PDF file.', 'err');
+      if (file.size > 10_000_000) return flash(dm, 'That PDF is larger than 10 MB. Save a smaller copy and try again.', 'err');
+      const data = await new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = () => resolve(null); r.readAsDataURL(file); });
+      up.disabled = true; up.textContent = 'Uploading…';
+      try {
+        const ns = await api('/api/website/resources', { method: 'POST', body: { title, description: document.getElementById('d-desc').value, file: data } });
+        renderDocs(ns.profile.resources, ns.file_urls);
+        ['d-title', 'd-desc', 'd-file'].forEach((id) => { document.getElementById(id).value = ''; });
+        flash(dm, 'Uploaded. It’s on your website now.');
+      } catch (err) { flash(dm, err.message, 'err'); }
+      up.disabled = false; up.textContent = 'Upload PDF';
+    });
   }
 
   // ---------- settings ----------
@@ -1091,6 +1286,7 @@
       else if (a === 'quotes') await quotesView();
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();
+      else if (a === 'website') await websiteView();
       else if (a === 'settings') await settingsView(b);
       else if (a === 'terms') await termsView();
       else await requestsView();

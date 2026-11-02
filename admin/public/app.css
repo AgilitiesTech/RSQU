@@ -143,3 +143,6 @@ code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background:
 .terms-box h2 { font-size: 22px; } .terms-box h3 { font-size: 18px; margin-top: 18px; } .terms-box p, .terms-box li { font-size: 15px; }
 #tc-edit { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
 .terms-box p { margin: 8px 0; } .terms-box h2 { margin: 12px 0 6px; }
+
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+[aria-invalid="true"] { border-color: var(--red) !important; box-shadow: 0 0 0 2px rgba(176, 20, 28, .2); }

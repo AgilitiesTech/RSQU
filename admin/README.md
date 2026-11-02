@@ -81,6 +81,11 @@ A business can serve its hosted site from its own domain: it adds a CNAME pointi
 ## Business owners
 
 - **Business:** name, phone, service area, colors, logo and photo, website text, own domain, team members, and the snippet to connect an existing website’s form.
+- **Website sections and Google search** (`#/website`, from the Business page): base city and travel radius, up to 20 cities served (each gets a page at `/areas/<city-st>`), hours, certifications, FAQs, YouTube videos, Google Business Profile / review / social links, the Google Search Console verification tag, and downloadable PDFs (checklists, guides; up to 20, 10 MB each). A checklist shows what's still missing for local search.
+  - The site publishes schema.org markup (`AutoRepair` with service areas, hours, credentials and services; `FAQPage`; `Service` and breadcrumbs on city pages), canonical URLs (the business's own domain when it has one) and Open Graph tags.
+  - City pages are offered to search engines (`index`, and listed in the sitemap) only once the owner writes at least 120 characters about that city, so they aren't near-duplicate doorway pages. Until then they're `noindex`.
+  - Sitemaps: a business on its own domain gets `/sitemap.xml` and `/robots.txt` there; businesses hosted at `/s/<slug>` are listed in the platform sitemap.
+  - Videos show a preview image and load YouTube's privacy-enhanced player only when a visitor presses play; the site's Content-Security-Policy allows just `i.ytimg.com` and `www.youtube-nocookie.com` for this.
 - **Products:** prices for quotes; “Show on website” lists one on the site; “Customers can book it” makes a fixed-price package bookable from the form.
 - **Settings:** customer Terms & Conditions status, their own Stripe account (opens the Stripe Dashboard for refunds, disputes and payouts), recent online payments with the Processing Fee on each, the deposit name and amount, default tax and job notes, change password.
 - **Customer Terms & Conditions** (Settings → Review your terms): one-time business details, the generated draft, edits, and the owner’s final approval. Online payments turn on after approval.
