@@ -44,7 +44,7 @@
     const data = await res.json().catch(() => ({}));
     if (res.status === 401 && !opts.quiet) { me = null; showAuth('login'); throw new Error('Please log in.'); }
     if (res.status === 428) { await loadMe(); route(); throw new Error('Please log in.'); }
-    if (!res.ok) throw new Error(data.error || 'Something went wrong.');
+    if (!res.ok) { const e = new Error(data.error || 'Something went wrong.'); e.data = data; throw e; }
     return data;
   }
   function flash(el, msg, kind = 'ok') {
@@ -130,13 +130,13 @@
         <form class="card login stack" id="af" style="max-width:480px">
           ${brandHead}
           <h1>Create your business account</h1>
-          <p class="muted">Your branded website, job inbox, onsite quotes, e-signatures and payments by direct deposit. No monthly fee.</p>
+          <p class="muted">Your branded website, job inbox, onsite quotes, e-signatures and online payments to your own Stripe account. No monthly fee.</p>
           <div><label for="a-biz">Business name</label><input id="a-biz" name="business_name" required autocomplete="organization"></div>
           <div><label for="a-name">Your name</label><input id="a-name" name="name" required autocomplete="name"></div>
           <div><label for="a-email">Email</label><input id="a-email" name="email" type="email" required autocomplete="email"></div>
           <div><label for="a-phone">Mobile phone (for request alerts)</label><input id="a-phone" name="phone" type="tel" autocomplete="tel"></div>
           <div><label for="a-pw">Password (10+ characters)</label><input id="a-pw" name="password" type="password" minlength="10" required autocomplete="new-password"></div>
-          <label class="check"><input type="checkbox" name="agree" required> <span>I agree to the ${LEGAL}, including the Processing Fee (Stripe’s fee + 3%) deducted from online payments before payout.</span></label>
+          <label class="check"><input type="checkbox" name="agree" required> <span>I agree to the ${LEGAL}, including the Processing Fee on online payments (Stripe’s fee, billed by Stripe, plus ${PLATFORM}’s 3%). My business is the seller and merchant of record for its own sales.</span></label>
           <p class="alert err" id="a-err" hidden></p>
           <button class="btn primary block" type="submit">Create account</button>
           <p class="small">Already have an account? <a href="#/login">Log in</a></p>
@@ -214,23 +214,25 @@
   async function onboardingView(sub) {
     showChrome(false);
     if (sub === 'return' || sub === 'refresh') { try { await api('/api/stripe/refresh', { method: 'POST' }); await loadMe(); } catch { /* shown below */ } if (!me.needs_payout_setup) { location.hash = '#/business'; return route(); } }
+    const legacy = me.tenant && me.tenant.stripe_account_id && me.tenant.stripe_account_type !== 'v2_merchant';
     view.innerHTML = `
-      <section class="card login stack" style="max-width:520px">
+      <section class="card login stack" style="max-width:540px">
         ${brandHead}
-        <h1>Set up direct deposit</h1>
-        <p>Online payments from your customers are deposited to your bank account. Stripe, our payments partner, verifies your identity and collects your bank details securely. It takes about 10 minutes.</p>
+        <h1>${legacy ? 'Move payments to your own Stripe account' : 'Connect your Stripe account'}</h1>
+        ${legacy ? '<p class="alert ok">Customers now pay your business directly, so your business is the seller of record for its own sales. Connect your own Stripe account to keep taking online payments. Payments you already received still pay out to your old account.</p>' : ''}
+        <p>Your customers pay <strong>your business</strong> directly through your own Stripe account, and Stripe pays out to your bank. Your business name appears on their card statement, and you handle your own refunds, disputes and sales tax from your Stripe Dashboard. It takes about 10 minutes.</p>
         <p class="small"><strong>Have ready:</strong> your legal or business name, EIN or SSN, business address, bank routing and account numbers, and a photo ID.</p>
-        <p class="small muted">The Processing Fee on each online payment (Stripe’s fee + 3%) is deducted before your payout. Cash and check payments have no fee. See the <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>.</p>
+        <p class="small muted">Processing Fee on each online payment: Stripe’s fee (billed to you by Stripe) plus ${PLATFORM}’s 3%. Cash and check payments have no fee. See the <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>.</p>
         ${sub === 'return' ? '<p class="alert err">Stripe still needs a few details. Pick up where you left off.</p>' : ''}
         <p class="alert err" id="ob-err" hidden></p>
-        <button class="btn primary block" type="button" id="ob-go">Connect my bank with Stripe</button>
+        <button class="btn primary block" type="button" id="ob-go">Connect with Stripe</button>
         <button class="linkbtn" type="button" id="ob-out">Log out</button>
       </section>`;
     const go = document.getElementById('ob-go');
     go.addEventListener('click', async () => {
       go.disabled = true; go.textContent = 'Opening Stripe…';
       try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); location.href = url; }
-      catch (err) { flash(document.getElementById('ob-err'), err.message, 'err'); go.disabled = false; go.textContent = 'Connect my bank with Stripe'; }
+      catch (err) { flash(document.getElementById('ob-err'), err.message, 'err'); go.disabled = false; go.textContent = 'Connect with Stripe'; }
     });
     document.getElementById('ob-out').addEventListener('click', logout);
   }
@@ -331,7 +333,7 @@
               <button class="btn ghost" type="button" data-dep="cash">Got cash</button>
               <button class="btn ghost" type="button" data-dep="check">Got a check</button>
             </div>
-            ${!online ? '<p class="small muted">Online payments start once direct deposit is set up. <a href="#/settings">See Settings.</a></p>' : ''}
+            ${!online ? '<p class="small muted">Online payments start once your Stripe account can take card payments and you’ve approved your <a href="#/terms">customer Terms &amp; Conditions</a>.</p>' : ''}
             ${depPending.map((p) => payLinkBox(location.origin + '/pay/' + p.token, r.phone)).join('')}`}
           </section>` : ''}
           <section class="card stack">
@@ -535,8 +537,8 @@
   function payoutLine(p) {
     if (p.method !== 'card') return '';
     if (!p.transfer_status || (p.transfer_status === 'pending' && !p.payout_cents)) return '<p class="small muted">Payout details appear once Stripe settles the payment.</p>';
-    const st = p.transfer_status === 'sent' ? 'sent to your bank' : p.transfer_status === 'failed' ? 'delayed: support has been notified' : 'pending';
-    return `<p class="small">Processing Fee ${money(p.stripe_fee_cents + p.fee_cents)} · Payout ${money(p.payout_cents)} ${st}</p>`;
+    const st = p.transfer_status === 'direct' ? 'in your Stripe balance' : p.transfer_status === 'sent' ? 'sent to your bank' : p.transfer_status === 'failed' ? 'delayed: support has been notified' : 'pending';
+    return `<p class="small">Processing Fee ${money(p.stripe_fee_cents + p.fee_cents)} · You receive ${money(p.payout_cents)} ${st}</p>`;
   }
 
   // ---------- products ----------
@@ -685,14 +687,15 @@
     const ro = isOwner() ? '' : 'disabled';
     view.innerHTML = `
       <h1>Settings</h1>
+      ${termsCard(cfg.customer_terms)}
       <section class="card stack">
-        <h2>Direct deposit</h2>
+        <h2>Payments (your Stripe account)</h2>
         ${!st.platform_ready ? '<p>Online payments aren’t switched on yet. You’ll be notified when they are.</p>' :
-          st.payouts_enabled ? `<p class="alert ok">Direct deposit is on. Online payments are paid out to your bank${st.test_mode ? ' (test mode: no real money moves)' : ''}.</p>` :
-          st.details_submitted ? '<p class="alert ok">Details submitted. Stripe is verifying them; payouts start as soon as that’s done. Payments you take in the meantime are held and paid out then.</p>' :
-          '<p>Connect your bank so online payments can be paid out to you.</p>'}
-        ${isOwner() && st.platform_ready ? `<div class="row">${st.account && st.details_submitted ? '<button class="btn" type="button" id="bank">Update bank or tax details</button>' : ''}${!st.details_submitted ? '<button class="btn primary" type="button" id="connect">Set up direct deposit</button>' : ''}</div>` : ''}
-        <p class="small muted">Processing Fee on online payments: ${FEE_TEXT(pf.bp)}, deducted before payout. Cash and check payments have no fee. <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment terms</a></p>
+          st.payouts_enabled ? `<p class="alert ok">Card payments are on. Customers pay your business directly and Stripe pays out to your bank${st.test_mode ? ' (test mode: no real money moves)' : ''}.</p>` :
+          st.details_submitted ? '<p class="alert ok">Details submitted. Stripe is verifying them; card payments turn on as soon as that’s done.</p>' :
+          '<p>Connect your Stripe account so customers can pay you online.</p>'}
+        ${isOwner() && st.platform_ready ? `<div class="row">${st.account && st.details_submitted ? '<button class="btn" type="button" id="bank">Open your Stripe Dashboard</button>' : ''}${!st.details_submitted ? '<button class="btn primary" type="button" id="connect">Connect with Stripe</button>' : ''}</div>` : ''}
+        <p class="small muted">Your business is the seller of record: refunds, disputes and payouts are managed in your Stripe Dashboard. Processing Fee on online payments: Stripe’s fee (billed by Stripe) plus ${FEE_TEXT(pf.bp).replace(/^Stripe’s fee \+ /, '')}. Cash and check payments have no fee. <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment terms</a></p>
         <p class="alert" id="st-msg" hidden></p>
         <div id="payouts"></div>
       </section>
@@ -703,7 +706,7 @@
           <div><label for="s-dep">Deposit amount ($, 0 = no deposit)</label><input id="s-dep" name="dep" inputmode="decimal" value="${dollars(s.deposit_cents)}"></div>
           <div><label for="s-tax">Default sales tax % (taxable lines)</label><input id="s-tax" name="tax" inputmode="decimal" value="${s.tax_rate_bp / 100}"></div>
         </div>
-        <div><label for="s-terms">Default terms on proposals</label><textarea id="s-terms" name="terms" rows="4">${esc(s.terms)}</textarea></div>
+        <div><label for="s-terms">Default job notes on proposals</label><textarea id="s-terms" name="terms" rows="4">${esc(s.terms)}</textarea><p class="small muted">Shown on each proposal as job-specific terms, in addition to your <a href="#/terms">customer Terms &amp; Conditions</a>.</p></div>
         <p class="alert" id="s-msg" hidden></p>
         ${ro ? '' : '<button class="btn primary" type="submit">Save settings</button>'}
       </fieldset></form>
@@ -720,7 +723,7 @@
     if (c) c.addEventListener('click', async () => {
       c.disabled = true; c.textContent = 'Opening Stripe…';
       try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); location.href = url; }
-      catch (err) { flash(document.getElementById('st-msg'), err.message, 'err'); c.disabled = false; c.textContent = 'Set up direct deposit'; }
+      catch (err) { flash(document.getElementById('st-msg'), err.message, 'err'); c.disabled = false; c.textContent = 'Connect with Stripe'; }
     });
     const bank = document.getElementById('bank');
     if (bank) bank.addEventListener('click', async () => {
@@ -730,7 +733,7 @@
     api('/api/payments').then((rows) => {
       const online = rows.filter((p) => p.method === 'card');
       if (!online.length) return;
-      document.getElementById('payouts').innerHTML = `<h3 style="margin-top:8px">Recent online payments</h3><table class="items"><thead><tr><th>Date</th><th class="num">Paid</th><th class="num">Processing Fee</th><th class="num">Payout</th></tr></thead><tbody>${online.slice(0, 20).map((p) => `<tr><td>${esc((p.paid_at || '').slice(0, 10))}<div class="small muted">${esc(p.description)}</div></td><td class="num">${money(p.amount_cents)}</td><td class="num">${money(p.stripe_fee_cents + p.fee_cents)}</td><td class="num">${money(p.payout_cents)}${p.transfer_status === 'sent' ? '' : `<div class="small muted">${esc(p.transfer_status || 'pending')}</div>`}</td></tr>`).join('')}</tbody></table>`;
+      document.getElementById('payouts').innerHTML = `<h3 style="margin-top:8px">Recent online payments</h3><table class="items"><thead><tr><th>Date</th><th class="num">Paid</th><th class="num">Processing Fee</th><th class="num">You receive</th></tr></thead><tbody>${online.slice(0, 20).map((p) => `<tr><td>${esc((p.paid_at || '').slice(0, 10))}<div class="small muted">${esc(p.description)}</div></td><td class="num">${money(p.amount_cents)}</td><td class="num">${money(p.stripe_fee_cents + p.fee_cents)}</td><td class="num">${money(p.payout_cents)}${['sent', 'direct'].includes(p.transfer_status) ? '' : `<div class="small muted">${esc(p.transfer_status || 'pending')}</div>`}</td></tr>`).join('')}</tbody></table>`;
     }).catch(() => {});
     const f = document.getElementById('sf'), el = f.elements;
     f.addEventListener('submit', async (e) => {
@@ -747,12 +750,174 @@
     document.getElementById('logout').addEventListener('click', logout);
   }
 
+  // ---------- customer Terms & Conditions (the business is the seller of record) ----------
+  // Same safe Markdown subset the server renders: everything is escaped first.
+  function mdToHtml(md) {
+    const inline = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    const out = [];
+    for (const block of String(md || '').replace(/\r\n/g, '\n').split(/\n{2,}/)) {
+      let para = []; let list = [];
+      const fp = () => { if (para.length) out.push(`<p>${para.map(inline).join('<br>')}</p>`); para = []; };
+      const fl = () => { if (list.length) out.push(`<ul>${list.map((li) => `<li>${inline(li)}</li>`).join('')}</ul>`); list = []; };
+      for (const line of block.split('\n').filter((l) => l.trim())) {
+        const h = /^(#{1,3})\s+(.*)$/.exec(line);
+        if (h) { fp(); fl(); out.push(`<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`); }
+        else if (/^\s*-{3,}\s*$/.test(line)) { fp(); fl(); out.push('<hr>'); }
+        else if (/^\s*[-*]\s+/.test(line)) { fp(); list.push(line.replace(/^\s*[-*]\s+/, '')); }
+        else { fl(); para.push(line); }
+      }
+      fp(); fl();
+    }
+    return out.join('');
+  }
+
+  function termsCard(ct) {
+    if (!ct) return '';
+    const msg = ct.approved_version
+      ? ct.needs_review
+        ? `<p class="alert err">Your business details changed since you approved version ${ct.approved_version}. Customers still see version ${ct.approved_version} until you review and approve the update.</p>`
+        : `<p class="alert ok">Approved: version ${ct.approved_version}. Customers accept it when they sign a proposal or pay online.</p>`
+      : `<p class="alert err">Not approved yet. Online payments turn on after you complete your business details and approve your customer terms.</p>`;
+    return `<section class="card stack"><h2>Customer Terms &amp; Conditions</h2>${msg}<div><a class="btn ${ct.approved_version && !ct.needs_review ? '' : 'primary'}" href="#/terms">${ct.approved_version ? 'Review your terms' : 'Set up and approve'}</a></div></section>`;
+  }
+
+  async function termsView() {
+    setNav('settings');
+    const [lp, ct] = await Promise.all([api('/api/legal-profile'), api('/api/customer-terms')]);
+    const pr = lp.profile; const ro = isOwner() ? '' : 'disabled';
+    const opt = (obj, cur, blank) => (blank ? `<option value="">${blank}</option>` : '') + Object.entries(obj).map(([k, v]) => `<option value="${esc(k)}" ${cur === k ? 'selected' : ''}>${esc(v)}</option>`).join('');
+    const f = (id, label, val, extra = '') => `<div><label for="lp-${id}">${label}</label><input id="lp-${id}" name="${id}" value="${esc(val ?? '')}" ${extra}></div>`;
+    const usd = (c) => (c ? dollars(c) : '');
+    const ck = (id, label) => `<label class="check"><input type="checkbox" name="${id}" ${pr[id] ? 'checked' : ''}> <span>${label}</span></label>`;
+    const missingContact = [!lp.phone && 'phone', !lp.email && 'email'].filter(Boolean);
+    view.innerHTML = `
+      <a href="#/settings" class="small">← Settings</a>
+      <h1>Customer Terms &amp; Conditions</h1>
+      <p class="muted">Your business is the seller of record for its own sales, so your customers agree to <strong>your</strong> terms when they sign a proposal or pay online. Fill in your details once; they’re used in your terms, proposals and payment pages. Then review the draft and give final approval.</p>
+      ${missingContact.length ? `<p class="alert err">Add your business ${missingContact.join(' and ')} on the <a href="#/business">Business page</a>; they appear in your terms as your contact for notices.</p>` : ''}
+      <form class="card stack" id="lp"><fieldset ${ro} style="border:0;padding:0;margin:0" class="stack">
+        <h2>1. Business details (one time)</h2>
+        <div class="grid2">
+          ${f('legalName', 'Legal business name *', pr.legalName, 'maxlength="120" placeholder="As registered, including LLC or Inc."')}
+          ${f('licenseNumber', 'License number', pr.licenseNumber, 'maxlength="60"')}
+          ${f('addressLine1', 'Street address *', pr.addressLine1, 'maxlength="120"')}
+          ${f('addressLine2', 'Address line 2', pr.addressLine2, 'maxlength="120"')}
+          ${f('city', 'City *', pr.city, 'maxlength="80"')}
+          <div><label for="lp-state">State *</label><select id="lp-state" name="state">${opt(lp.options.states, pr.state, 'Choose…')}</select></div>
+          ${f('postalCode', 'ZIP code *', pr.postalCode, 'inputmode="numeric" maxlength="10"')}
+          ${f('licenseAuthority', 'Licensing authority', pr.licenseAuthority, 'maxlength="120"')}
+          ${f('insuranceCarrier', 'Insurance carrier', pr.insuranceCarrier, 'maxlength="120"')}
+        </div>
+        ${ck('insured', 'We carry general liability insurance')}
+        <h3>Sales tax</h3>
+        <div class="grid2">
+          ${f('tax', 'Sales tax rate % *', lp.tax_rate_bp / 100, 'inputmode="decimal"')}
+        </div>
+        ${ck('taxConfirmed', 'I confirmed this is the right rate for my location (enter 0 if I don’t collect sales tax). It’s the default on new quotes; I collect and remit the tax.')}
+        <h3>Payment and service policies</h3>
+        <div class="grid2">
+          <div><label for="lp-balanceDue">Balance due</label><select id="lp-balanceDue" name="balanceDue">${opt(lp.options.balance_due, pr.balanceDue)}</select></div>
+          ${f('warrantyDays', 'Workmanship guarantee (days) *', pr.warrantyDays, 'inputmode="numeric"')}
+          ${f('lateFeePercent', 'Late fee (% per month, 0 = none)', pr.lateFeePercent, 'inputmode="decimal"')}
+          ${f('returnedPaymentFee', 'Returned payment fee ($)', usd(pr.returnedPaymentFeeCents), 'inputmode="decimal"')}
+          ${f('cancellationNoticeHours', 'Cancellation notice (hours)', pr.cancellationNoticeHours, 'inputmode="numeric"')}
+          ${f('cancellationFee', 'Late cancellation fee ($)', usd(pr.cancellationFeeCents), 'inputmode="decimal"')}
+          ${f('estimateValidDays', 'Estimates valid for (days)', pr.estimateValidDays, 'inputmode="numeric"')}
+          ${f('hourlyRate', 'Hourly labor rate ($, optional)', usd(pr.hourlyRateCents), 'inputmode="decimal"')}
+        </div>
+        ${ck('marketingPhotos', 'We may use non-identifying photos of finished work in our marketing')}
+        <h3>Legal</h3>
+        <div class="grid2">
+          <div><label for="lp-governingState">Governing law state</label><select id="lp-governingState" name="governingState">${opt(lp.options.states, pr.governingState === pr.state ? '' : pr.governingState, 'Same as business address')}</select></div>
+          ${f('venueCounty', 'County for legal venue *', pr.venueCounty, 'maxlength="60"')}
+        </div>
+        <p class="alert" id="lp-msg" hidden></p>
+        ${ro ? '' : '<button class="btn primary" type="submit">Save details</button>'}
+      </fieldset></form>
+      <section class="card stack" id="tc"></section>`;
+
+    const form = document.getElementById('lp');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const el = form.elements; const num = (v) => (String(v).trim() === '' ? '' : Number(v));
+      const profile = {
+        legalName: el.legalName.value, addressLine1: el.addressLine1.value, addressLine2: el.addressLine2.value, city: el.city.value, state: el.state.value, postalCode: el.postalCode.value,
+        licenseNumber: el.licenseNumber.value, licenseAuthority: el.licenseAuthority.value, insured: el.insured.checked, insuranceCarrier: el.insuranceCarrier.value,
+        taxConfirmed: el.taxConfirmed.checked, balanceDue: el.balanceDue.value, warrantyDays: num(el.warrantyDays.value), lateFeePercent: num(el.lateFeePercent.value),
+        returnedPaymentFeeCents: toCents(el.returnedPaymentFee.value), cancellationNoticeHours: num(el.cancellationNoticeHours.value), cancellationFeeCents: toCents(el.cancellationFee.value),
+        estimateValidDays: num(el.estimateValidDays.value), hourlyRateCents: toCents(el.hourlyRate.value), marketingPhotos: el.marketingPhotos.checked,
+        governingState: el.governingState.value, venueCounty: el.venueCounty.value,
+      };
+      try {
+        await api('/api/legal-profile', { method: 'PUT', body: { profile, tax_rate_bp: toCents(el.tax.value) } });
+        flash(document.getElementById('lp-msg'), 'Saved. Review the updated draft below.');
+        renderTerms(await api('/api/customer-terms'));
+      } catch (err) {
+        const fe = err.data && err.data.field_errors;
+        flash(document.getElementById('lp-msg'), fe ? 'Please fix: ' + Object.values(fe).join(' ') : err.message, 'err');
+      }
+    });
+    renderTerms(ct);
+  }
+
+  function renderTerms(ct) {
+    const box = document.getElementById('tc');
+    if (!ct.profile_complete) { box.innerHTML = '<h2>2. Review and approve</h2><p class="muted">Save your business details above (everything marked *) to generate your draft.</p>'; return; }
+    const a = ct.approved;
+    const base = a && !ct.needs_review ? a.markdown : ct.draft;
+    const status = !a ? '<p class="alert err">Not approved yet. Online payments turn on after you approve.</p>'
+      : ct.needs_review ? `<p class="alert err">Your details or the template changed since version ${a.version}. Customers still see version ${a.version} until you approve this update.${a.source === 'customized' ? ' Your last version had your own edits; re-apply any you still need.' : ''}</p>`
+      : `<p class="alert ok">Version ${a.version} approved by ${esc(a.approver_name)}, ${esc(a.approver_title)} on ${when(a.approved_at)}.</p>`;
+    box.innerHTML = `
+      <h2>2. Review and give final approval</h2>
+      ${status}
+      <p class="small"><strong>This is a starting template, not legal advice.</strong> ${esc(ct.platform_name)} provides it for convenience and isn’t a party to your terms. Laws on warranties, refunds, cancellations, late fees and liens vary by state; have your attorney review it. You give the final approval.</p>
+      <div class="terms-box" id="tc-view">${mdToHtml(base)}</div>
+      <textarea id="tc-edit" rows="18" hidden aria-label="Edit the wording">${esc(base)}</textarea>
+      <div class="row"><button class="btn ghost sm" type="button" id="tc-toggle">Edit wording</button><button class="btn ghost sm" type="button" id="tc-reset">Reset to template</button>${a ? `<a class="btn ghost sm" href="${esc(ct.public_url)}" target="_blank" rel="noopener">View public page</a>` : ''}</div>
+      ${ct.can_approve ? `
+      <form class="stack" id="tc-form">
+        <h3>Final approval (business owner)</h3>
+        <div class="grid2"><div><label for="tc-name">Your full name</label><input id="tc-name" name="name" required autocomplete="name"></div><div><label for="tc-title">Your title</label><input id="tc-title" name="title" required placeholder="Owner"></div></div>
+        <label class="check"><input type="checkbox" name="authorized"> <span>I am an owner or officer of ${esc(ct.legal_name)} and am authorized to approve these terms on its behalf.</span></label>
+        <label class="check"><input type="checkbox" name="reviewed"> <span>I have reviewed these terms, have had the opportunity to have them reviewed by an attorney, and approve them as ${esc(ct.legal_name)}’s terms with its customers.</span></label>
+        <label class="check"><input type="checkbox" name="seller_of_record"> <span>${esc(ct.legal_name)} is the seller and merchant of record for its sales and is solely responsible for these terms, its services, refunds, disputes, and collecting and remitting sales tax. ${esc(ct.platform_name)} is not a party to these terms and doesn’t provide legal or tax advice.</span></label>
+        <p class="small muted">Your name, title, these statements, the exact wording, the time and your IP address are recorded with the approved version.</p>
+        <p class="alert" id="tc-msg" hidden></p>
+        <button class="btn primary" type="submit" id="tc-approve">${a ? 'Approve as new version' : 'Approve these terms'}</button>
+      </form>` : '<p class="small muted">Only the business owner can give final approval.</p>'}`;
+    const view2 = document.getElementById('tc-view'), edit = document.getElementById('tc-edit');
+    document.getElementById('tc-toggle').addEventListener('click', (e) => {
+      const editing = view2.hidden; // switching back to preview
+      if (editing) view2.innerHTML = mdToHtml(edit.value);
+      view2.hidden = !editing; edit.hidden = editing; e.currentTarget.textContent = editing ? 'Edit wording' : 'Preview';
+    });
+    document.getElementById('tc-reset').addEventListener('click', () => {
+      if (edit.value !== ct.draft && !confirm('Discard your edits and go back to the template draft?')) return;
+      edit.value = ct.draft; view2.innerHTML = mdToHtml(ct.draft);
+    });
+    const tf = document.getElementById('tc-form');
+    if (tf) tf.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const el = tf.elements;
+      if (!el.authorized.checked || !el.reviewed.checked || !el.seller_of_record.checked) return flash(document.getElementById('tc-msg'), 'Check all three statements to approve.', 'err');
+      if (a && !ct.needs_review && edit.value === a.markdown) return flash(document.getElementById('tc-msg'), 'Nothing has changed since your approved version.', 'err');
+      const btn = document.getElementById('tc-approve'); btn.disabled = true;
+      try {
+        const r = await api('/api/customer-terms/approve', { method: 'POST', body: { markdown: edit.value, name: el.name.value, title: el.title.value, authorized: true, reviewed: true, seller_of_record: true } });
+        renderTerms(await api('/api/customer-terms'));
+        flash(document.getElementById('tc-msg') || box, `Version ${r.version} approved. Customers will accept it from now on.`);
+      } catch (err) { flash(document.getElementById('tc-msg'), err.message, 'err'); btn.disabled = false; }
+    });
+  }
+
   // ---------- Agilities super admin ----------
   async function superView() {
     setNav('super');
     const d = await api('/api/super/overview');
     const t = d.totals;
-    const stripeTag = (r) => r.stripe_payouts_enabled ? '<span class="tag paid">Payouts on</span>' : r.stripe_details_submitted ? '<span class="tag">Verifying</span>' : '<span class="tag void">No bank yet</span>';
+    const stripeTag = (r) => (r.stripe_account_id && r.stripe_account_type !== 'v2_merchant' ? '<span class="tag new">Legacy payouts</span>' : r.stripe_payouts_enabled ? '<span class="tag paid">Payments on</span>' : r.stripe_details_submitted ? '<span class="tag">Verifying</span>' : '<span class="tag void">No Stripe yet</span>')
+      + (r.terms_version ? '' : '<span class="tag void">Terms not approved</span>');
     view.innerHTML = `
       <div class="row between"><h1>Businesses</h1><a class="btn ghost sm" href="/api/super/fees.csv">Download Processing Fees (CSV)</a></div>
       <div class="grid2">
@@ -803,8 +968,8 @@
         <form class="card stack" id="tf">
           <h2>Account</h2>
           <div><label for="t-status">Status</label><select id="t-status" name="status"><option value="active" ${t.status === 'active' ? 'selected' : ''}>Active</option><option value="suspended" ${t.status === 'suspended' ? 'selected' : ''}>Suspended</option></select></div>
-          <div><label for="t-fee">Platform share % of the Processing Fee (blank = platform default)</label><input id="t-fee" name="fee" inputmode="decimal" value="${d.fee_bp == null ? '' : d.fee_bp / 100}"><p class="small muted">Processing Fee = Stripe’s actual fee + this %.</p></div>
-          <div><label for="t-acct">Payout account (Stripe Express)</label><input id="t-acct" name="acct" value="${esc(t.stripe_account_id || '')}" placeholder="acct_…"><p class="small muted">${t.stripe_payouts_enabled ? 'Payouts on.' : t.stripe_details_submitted ? 'Submitted, Stripe is verifying.' : t.stripe_account_id ? 'Started, not finished.' : 'Not connected yet. The owner sets it up at sign-up.'}</p></div>
+          <div><label for="t-fee">Platform share % (application fee; blank = platform default)</label><input id="t-fee" name="fee" inputmode="decimal" value="${d.fee_bp == null ? '' : d.fee_bp / 100}"><p class="small muted">Processing Fee = Stripe’s fee (billed to the business by Stripe) + this %.</p></div>
+          <div><label for="t-acct">Business’s own Stripe account</label><input id="t-acct" name="acct" value="${esc(t.stripe_account_id || '')}" placeholder="acct_…"><p class="small muted">${t.stripe_account_id && t.stripe_account_type !== 'v2_merchant' ? 'Legacy Express payout account: the owner is asked to connect their own Stripe account at next log-in.' : t.stripe_payouts_enabled ? 'Card payments on. The business is merchant of record.' : t.stripe_details_submitted ? 'Submitted, Stripe is verifying.' : t.stripe_account_id ? 'Started, not finished.' : 'Not connected yet. The owner sets it up at sign-up.'}</p></div>
           <button class="btn primary" type="submit">Save</button>
         </form>
         <section class="card stack">
@@ -812,11 +977,13 @@
           ${d.users.map((u) => `<div class="row between"><div><strong>${esc(u.name || u.email)}</strong> <span class="tag">${esc(u.role)}</span><div class="small muted">${esc(u.email)} · last in ${u.last_login_at ? when(u.last_login_at) : 'never'}</div></div><button class="btn ghost sm" type="button" data-reset="${u.id}">Reset link</button></div>`).join('')}
           <h2 style="margin-top:12px">Agreements</h2>
           ${d.agreements.length ? `<ul class="small" style="margin:0;padding-left:18px">${d.agreements.map((a) => `<li>${esc(a.doc)} v${esc(a.version)} · ${esc(a.email || '')} · ${esc(a.accepted_at)} · ${esc(a.ip || '')}</li>`).join('')}</ul>` : '<p class="small muted">Not accepted yet.</p>'}
+          <h2 style="margin-top:12px">Customer Terms &amp; Conditions</h2>
+          ${d.customer_terms.length ? `<ul class="small" style="margin:0;padding-left:18px">${d.customer_terms.map((c) => `<li>v${c.version} (${esc(c.source)}) approved by ${esc(c.approver_name)}, ${esc(c.approver_title)} · ${esc(c.approved_at)} · ${esc(c.ip || '')}</li>`).join('')}</ul><p class="small"><a href="${esc(d.terms_url)}" target="_blank" rel="noopener">Public terms page</a></p>` : '<p class="small muted">Not approved by the owner yet. Online payments stay off until they are.</p>'}
         </section>
       </div>
       <section class="card stack">
         <h2>Payments</h2>
-        ${d.payments.length ? `<div style="overflow-x:auto"><table class="items"><thead><tr><th>Date</th><th>For</th><th>Method</th><th class="num">Paid</th><th class="num">Stripe fee</th><th class="num">Platform</th><th class="num">Payout</th><th>Payout status</th></tr></thead><tbody>${d.payments.map((p) => `<tr><td>${esc((p.paid_at || p.created_at).slice(0, 10))}${p.status === 'paid' ? '' : ' <span class="tag">' + esc(p.status) + '</span>'}</td><td>${esc(p.description)}</td><td>${esc(p.method)}</td><td class="num">${money(p.amount_cents)}</td><td class="num">${money(p.stripe_fee_cents)}</td><td class="num">${money(p.fee_cents)}</td><td class="num">${money(p.payout_cents)}</td><td>${p.method === 'card' && p.status === 'paid' ? `${esc(p.transfer_status || 'pending')}${p.transfer_error ? `<div class="small muted">${esc(p.transfer_error)}</div>` : ''}${p.transfer_status !== 'sent' ? ` <button class="btn ghost sm" type="button" data-settle="${p.id}">Retry</button>` : ''}` : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">No payments yet.</p>'}
+        ${d.payments.length ? `<div style="overflow-x:auto"><table class="items"><thead><tr><th>Date</th><th>For</th><th>Method</th><th class="num">Paid</th><th class="num">Stripe fee</th><th class="num">Platform</th><th class="num">To business</th><th>Status</th></tr></thead><tbody>${d.payments.map((p) => `<tr><td>${esc((p.paid_at || p.created_at).slice(0, 10))}${p.status === 'paid' ? '' : ' <span class="tag">' + esc(p.status) + '</span>'}</td><td>${esc(p.description)}</td><td>${esc(p.method)}</td><td class="num">${money(p.amount_cents)}</td><td class="num">${money(p.stripe_fee_cents)}</td><td class="num">${money(p.fee_cents)}</td><td class="num">${money(p.payout_cents)}</td><td>${p.method === 'card' && p.status === 'paid' ? `${esc(p.transfer_status || 'pending')}${p.transfer_error ? `<div class="small muted">${esc(p.transfer_error)}</div>` : ''}${!['sent', 'direct'].includes(p.transfer_status) ? ` <button class="btn ghost sm" type="button" data-settle="${p.id}">Retry</button>` : ''}` : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">No payments yet.</p>'}
       </section>`;
     const msg = document.getElementById('st-msg');
     document.getElementById('open').addEventListener('click', async () => { await api('/api/super/view-as', { method: 'POST', body: { tenant_id: t.id } }); await loadMe(); location.hash = '#/requests'; route(); });
@@ -830,7 +997,7 @@
     });
     view.querySelectorAll('[data-settle]').forEach((b) => b.addEventListener('click', async () => {
       b.disabled = true;
-      try { const r = await api(`/api/super/payments/${b.dataset.settle}/settle`, { method: 'POST' }); await superTenantView(id); flash(document.getElementById('st-msg'), r.transfer_status === 'sent' ? 'Payout sent.' : `Still ${r.transfer_status}: ${r.transfer_error || ''}`, r.transfer_status === 'sent' ? 'ok' : 'err'); }
+      try { const r = await api(`/api/super/payments/${b.dataset.settle}/settle`, { method: 'POST' }); await superTenantView(id); const done = ['sent', 'direct'].includes(r.transfer_status); flash(document.getElementById('st-msg'), done ? 'Done.' : `Still ${r.transfer_status}: ${r.transfer_error || ''}`, done ? 'ok' : 'err'); }
       catch (err) { flash(msg, err.message, 'err'); b.disabled = false; }
     }));
     view.querySelectorAll('[data-reset]').forEach((b) => b.addEventListener('click', async () => {
@@ -847,7 +1014,7 @@
       <h1>Platform</h1>
       <form class="card stack" id="pf">
         <h2>Processing Fee</h2>
-        <p class="small muted">Every online payment is charged on the platform Stripe account. Before payout, the platform keeps Stripe’s actual fee plus this %. Businesses see the total as “Processing Fee”; customers pay only the amount due.</p>
+        <p class="small muted">Every online payment is a direct charge on the business’s own Stripe account (the business is merchant of record). Stripe bills its fee to the business; the platform collects this % as an application fee. Businesses see the total as “Processing Fee”; customers pay only the amount due.</p>
         <div style="max-width:260px"><label for="p-fee">Platform share %</label><input id="p-fee" name="fee" inputmode="decimal" value="${p.fee_bp / 100}"></div>
         <p class="alert" id="p-msg" hidden></p>
         <button class="btn primary" type="submit">Save</button>
@@ -925,6 +1092,7 @@
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();
       else if (a === 'settings') await settingsView(b);
+      else if (a === 'terms') await termsView();
       else await requestsView();
       window.scrollTo(0, 0);
     } catch (err) {

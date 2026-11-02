@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb, platformSettings, platformFee, quoteTotals, slugify, AGREEMENT_VERSION, BUSINESS_AGREEMENTS } from './src/db.js';
 import { hashPassword, verifyPassword, sessions, randomToken, sha256 } from './src/auth.js';
 import { stripeClient, verifyStripeSignature } from './src/stripe.js';
+import * as customerTerms from './src/customer-terms.js';
 import { notifier } from './src/notify.js';
 import { renderSite } from './src/site.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
@@ -100,8 +101,8 @@ export function createApp(env = process.env) {
 
   function publicTenant(t) {
     if (!t) return null;
-    const { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_payouts_enabled, stripe_details_submitted, statement_name, created_at } = t;
-    return { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_payouts_enabled, stripe_details_submitted, statement_name, created_at };
+    const { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_account_type, stripe_payouts_enabled, stripe_details_submitted, statement_name, created_at } = t;
+    return { id, slug, name, status, phone, email, notify_phone, tagline, hero_headline, about, service_area, primary_color, accent_color, logo, owner_photo, website_url, custom_domain, tax_rate_bp, deposit_cents, deposit_label, terms, stripe_account_id, stripe_account_type, stripe_payouts_enabled, stripe_details_submitted, statement_name, created_at };
   }
   // Brand details safe to show customers.
   const brand = (t) => ({ name: t.name, phone: t.phone, primary_color: t.primary_color, accent_color: t.accent_color, logo: t.logo ? `/media/${t.slug}/${t.logo}` : null, slug: t.slug });
@@ -117,9 +118,14 @@ export function createApp(env = process.env) {
     const have = db.prepare(`SELECT doc FROM agreements WHERE tenant_id = ? AND user_id = ? AND version = ?`).all(user.tenant_id, user.id, AGREEMENT_VERSION).map((r) => r.doc);
     return user.role === 'owner' && BUSINESS_AGREEMENTS.some((d) => !have.includes(d));
   }
-  // Owners must connect a bank account for direct deposit (Stripe Express) before using the dashboard.
+  // The business's own Stripe account (Accounts v2, merchant configuration): customers pay it
+  // directly, so the business is the merchant of record. Anything else is a legacy Express payout
+  // account from when the platform was the merchant of record.
+  const isMerchant = (t) => Boolean(t && t.stripe_account_id && t.stripe_account_type === 'v2_merchant');
+  // Owners must connect their own Stripe account before using the dashboard. Businesses still on a
+  // legacy Express payout account are sent through this again so they become the seller of record.
   function needsPayoutSetup(user, tenant) {
-    return Boolean(stripe.enabled && user && user.role === 'owner' && tenant && !tenant.stripe_details_submitted);
+    return Boolean(stripe.enabled && user && user.role === 'owner' && tenant && !(isMerchant(tenant) && tenant.stripe_details_submitted));
   }
   function recordAgreements(req, user, tenantId) {
     const ins = db.prepare(`INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)`);
@@ -181,9 +187,32 @@ export function createApp(env = process.env) {
     fs.createReadStream(file).pipe(res);
   }
 
+  // ---------- customer Terms & Conditions (each business is the seller of record) ----------
+  const latestTerms = (tid) => db.prepare('SELECT * FROM customer_terms WHERE tenant_id = ? ORDER BY version DESC LIMIT 1').get(tid) || null;
+  const termsPath = (t, version) => `/s/${t.slug}/terms${version ? `?v=${version}` : ''}`;
+  // Profile, personalised draft, last owner-approved version, and whether it needs re-approval.
+  function termsState(t) {
+    const profile = customerTerms.parseProfile(t.legal_profile);
+    const missing = customerTerms.missingFields(t, profile);
+    const complete = missing.length === 0;
+    const vars = complete ? customerTerms.templateVars(t, profile, platformName) : null;
+    const draft = complete ? customerTerms.renderTemplate(vars) : null;
+    const adopted = latestTerms(t.id);
+    const needsReview = Boolean(adopted && complete && (adopted.template_version !== customerTerms.TEMPLATE_VERSION || adopted.profile_fingerprint !== customerTerms.fingerprint(vars)));
+    return { profile, missing, complete, vars, draft, adopted, needsReview };
+  }
+  // What customers are shown next to a proposal or payment: the version they accept.
+  function publicTerms(t, version) {
+    const v = version ? db.prepare('SELECT version FROM customer_terms WHERE tenant_id = ? AND version = ?').get(t.id, version) : latestTerms(t.id);
+    return v ? { version: v.version, url: termsPath(t, v.version) } : null;
+  }
+
   // ---------- payments ----------
-  // Online payments are charged on the platform's Stripe account. The customer pays only the amount due.
-  const onlineReady = (t) => stripe.enabled && Boolean(t.stripe_account_id && t.stripe_details_submitted);
+  // Online payments are DIRECT charges on the business's own Stripe account: the business is the
+  // merchant of record and Stripe bills its processing fee to the business; the platform's share
+  // is an application fee. The customer pays only the amount due. Requires the business's
+  // owner-approved customer terms, because the business is the seller.
+  const onlineReady = (t) => stripe.enabled && isMerchant(t) && Boolean(t.stripe_payouts_enabled) && Boolean(latestTerms(t.id));
   function onlineQuote(t, amount) {
     return { fee: 0, charge: amount, bp: platformFee(db, t, amount).bp, card_payments: onlineReady(t) };
   }
@@ -192,25 +221,35 @@ export function createApp(env = process.env) {
     if (!onlineReady(t)) throw new HttpError(503, 'Online payments aren’t set up yet for this business. Please pay directly.');
     const base = baseUrl(req);
     const sep = successPath.includes('?') ? '&' : '?';
+    const terms = latestTerms(t.id);
     const session = await stripe.createCheckout({
+      account: t.stripe_account_id, // direct charge: the business is the merchant of record
       name: payment.description,
       amountCents: payment.amount_cents,
+      applicationFeeCents: platformFee(db, t, payment.amount_cents).fee, // the platform's 3%
       successUrl: `${base}${successPath}${sep}paid=${payment.token}&session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl: `${base}${cancelPath}`,
       ref: payment.token,
       email,
       statementName: t.statement_name || t.name,
+      // Which customer terms applied to this payment (also visible in the business's Stripe Dashboard).
+      metadata: { customer_terms_version: String(terms.version), customer_terms_sha256: terms.sha256 },
     });
-    db.prepare(`UPDATE payments SET stripe_session_id = ? WHERE id = ?`).run(session.id, payment.id);
+    db.prepare(`UPDATE payments SET stripe_session_id = ?, charge_type = 'direct', stripe_account = ?, customer_terms_version = ? WHERE id = ?`)
+      .run(session.id, t.stripe_account_id, terms.version, payment.id);
     return session.url;
   }
 
-  // After an online payment succeeds: read Stripe's actual fee, keep it plus the platform share
-  // (together the "Processing Fee"), and transfer the rest to the business's Stripe account for payout.
+  // After an online payment succeeds, record the Processing Fee (Stripe's fee + platform share).
+  // Direct charges: the money is already in the business's Stripe balance; we only read the fees.
+  // Legacy platform charges: keep the fees and transfer the rest to the business's Express account.
   async function settle(token) {
     let pay = getPayment(token);
-    if (!pay || pay.status !== 'paid' || pay.method !== 'card' || pay.transfer_status === 'sent') return pay;
+    if (!pay || pay.status !== 'paid' || pay.method !== 'card' || ['sent', 'direct'].includes(pay.transfer_status)) return pay;
+    if (pay.charge_type === 'direct') return settleDirect(pay);
     const t = getTenant(pay.tenant_id);
+    // Legacy payouts go to the old Express account even after the business moved to its own account.
+    const legacyDest = isMerchant(t) ? t.legacy_stripe_account_id : t.stripe_account_id;
     const fail = (msg) => db.prepare(`UPDATE payments SET transfer_status = 'failed', transfer_error = ? WHERE id = ?`).run(String(msg).slice(0, 300), pay.id);
     try {
       if (!pay.charge_id) {
@@ -226,9 +265,9 @@ export function createApp(env = process.env) {
         db.prepare(`UPDATE payments SET charge_id = ?, stripe_fee_cents = ?, fee_cents = ?, payout_cents = ?, transfer_status = 'pending' WHERE id = ?`).run(ch.id, bt.fee, fee, payout, pay.id);
         pay = getPayment(token);
       }
-      if (!t.stripe_account_id) { fail('The business hasn’t connected a payout account yet.'); return getPayment(token); }
+      if (!legacyDest) { fail('The business hasn’t connected a payout account yet.'); return getPayment(token); }
       if (pay.payout_cents <= 0) { db.prepare(`UPDATE payments SET transfer_status = 'sent', transfer_error = NULL WHERE id = ?`).run(pay.id); return getPayment(token); }
-      const tr = await stripe.createTransfer({ amountCents: pay.payout_cents, destination: t.stripe_account_id, sourceTransaction: pay.charge_id, group: pay.token, ref: pay.token });
+      const tr = await stripe.createTransfer({ amountCents: pay.payout_cents, destination: legacyDest, sourceTransaction: pay.charge_id, group: pay.token, ref: pay.token });
       db.prepare(`UPDATE payments SET transfer_id = ?, transfer_status = 'sent', transfer_error = NULL WHERE id = ?`).run(tr.id, pay.id);
       notify.sms(t.notify_phone, `${money(pay.payout_cents)} is on its way to your bank (${money(pay.amount_cents)} paid, ${money(pay.stripe_fee_cents + pay.fee_cents)} Processing Fee).`);
     } catch (e) {
@@ -236,6 +275,33 @@ export function createApp(env = process.env) {
     }
     return getPayment(token);
   }
+  // Direct charge on the business's account. The charge's balance transaction lists Stripe's fee
+  // and the platform's application fee separately; `net` is what the business keeps.
+  async function settleDirect(pay) {
+    const t = getTenant(pay.tenant_id);
+    try {
+      const s = await stripe.retrieveCheckout(pay.stripe_session_id, pay.stripe_account);
+      const ch = s.payment_intent && s.payment_intent.latest_charge;
+      const bt = ch && ch.balance_transaction;
+      if (!ch || !bt || typeof bt !== 'object') {
+        db.prepare(`UPDATE payments SET transfer_status = 'pending', transfer_error = 'Waiting for Stripe to settle the payment' WHERE id = ?`).run(pay.id);
+        return getPayment(pay.token);
+      }
+      const details = Array.isArray(bt.fee_details) ? bt.fee_details : [];
+      const share = details.some((d) => d.type === 'application_fee')
+        ? details.filter((d) => d.type === 'application_fee').reduce((a, d) => a + d.amount, 0)
+        : platformFee(db, t, pay.amount_cents).fee;
+      const stripeFee = Math.max(0, bt.fee - share);
+      const net = typeof bt.net === 'number' ? bt.net : pay.amount_cents - bt.fee;
+      db.prepare(`UPDATE payments SET charge_id = ?, stripe_fee_cents = ?, fee_cents = ?, payout_cents = ?, transfer_status = 'direct', transfer_error = NULL WHERE id = ?`)
+        .run(ch.id, stripeFee, share, net, pay.id);
+      notify.sms(t?.notify_phone, `${money(net)} added to your Stripe balance (${money(pay.amount_cents)} paid, ${money(stripeFee + share)} Processing Fee).`);
+    } catch (e) {
+      db.prepare(`UPDATE payments SET transfer_status = 'pending', transfer_error = ? WHERE id = ?`).run(String(e.message).slice(0, 300), pay.id);
+    }
+    return getPayment(pay.token);
+  }
+
   async function retryPayouts(tenantId) {
     const rows = db.prepare(`SELECT token FROM payments WHERE tenant_id = ? AND status = 'paid' AND method = 'card' AND transfer_status IN ('pending','failed')`).all(tenantId);
     for (const r of rows) await settle(r.token);
@@ -244,7 +310,7 @@ export function createApp(env = process.env) {
   async function confirmCheckout(payment, sessionId) {
     if (payment.status === 'paid') return true;
     if (!sessionId || !stripe.enabled || sessionId !== payment.stripe_session_id) return false;
-    const s = await stripe.retrieveCheckout(sessionId);
+    const s = await stripe.retrieveCheckout(sessionId, payment.charge_type === 'direct' ? payment.stripe_account : undefined);
     if (s.client_reference_id !== payment.token) return false;
     if (s.payment_status === 'paid') { markPaid(getPayment(payment.token), 'card', s.id); await settle(payment.token); return true; }
     return false;
@@ -252,6 +318,12 @@ export function createApp(env = process.env) {
 
   async function refreshStripeStatus(t) {
     if (!stripe.enabled || !t.stripe_account_id) return t;
+    if (isMerchant(t)) {
+      // stripe_payouts_enabled = the account can take card payments (and is paid out by Stripe).
+      const st = await stripe.merchantStatus(t.stripe_account_id);
+      db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(st.chargesEnabled ? 1 : 0, st.detailsSubmitted || st.chargesEnabled ? 1 : 0, t.id);
+      return getTenant(t.id);
+    }
     const a = await stripe.getAccount(t.stripe_account_id);
     const ready = a.payouts_enabled && (!a.capabilities || a.capabilities.transfers === 'active');
     db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(ready ? 1 : 0, a.details_submitted ? 1 : 0, t.id);
@@ -403,6 +475,8 @@ export function createApp(env = process.env) {
       totals: full.totals, signer_name: full.signer_name, signature_png: full.signature_png, signed_at: full.signed_at, paid_at: full.paid_at,
       online: onlineQuote(t, full.totals.balance),
       business: brand(t),
+      // The business's customer Terms & Conditions: the version signed, or the current one to accept.
+      customer_terms: publicTerms(t, full.customer_terms_version),
     });
   });
 
@@ -413,11 +487,15 @@ export function createApp(env = process.env) {
     const b = await json(req, 1_000_000);
     const name = clean(b.name, 120);
     if (!name || !b.agree) throw new HttpError(400, 'Type your name and check the box to accept.');
+    // The customer accepts the business's current Terms & Conditions with the proposal. If the
+    // business approved a new version since the page loaded, ask them to review it first.
+    const terms = latestTerms(q.tenant_id);
+    if (terms && Number(b.terms_version) !== terms.version) throw new HttpError(409, 'The business updated its Terms & Conditions. Reload the page to review them, then sign.');
     if (!/^data:image\/png;base64,[A-Za-z0-9+/=]{200,}$/.test(b.signature || '')) throw new HttpError(400, 'Please sign in the box.');
     if (b.signature.length > 700_000) throw new HttpError(413, 'Signature is too large.');
     const ts = now();
-    db.prepare(`UPDATE quotes SET status = 'signed', signer_name = ?, signature_png = ?, signer_ip = ?, signer_ua = ?, signed_at = ?, updated_at = ? WHERE id = ?`)
-      .run(name, b.signature, clientIp(req), clean(req.headers['user-agent'], 400), ts, ts, q.id);
+    db.prepare(`UPDATE quotes SET status = 'signed', signer_name = ?, signature_png = ?, signer_ip = ?, signer_ua = ?, signed_at = ?, updated_at = ?, customer_terms_version = ?, customer_terms_sha256 = ? WHERE id = ?`)
+      .run(name, b.signature, clientIp(req), clean(req.headers['user-agent'], 400), ts, ts, terms?.version ?? null, terms?.sha256 ?? null, q.id);
     setRequestStatus(q.request_id, 'accepted');
     notify.sms(getTenant(q.tenant_id)?.notify_phone, `Proposal #${q.id} signed by ${name}.`);
     send(res, 200, { ok: true });
@@ -446,7 +524,7 @@ export function createApp(env = process.env) {
     const pay = getPayment(p.token);
     const t = pay && getTenant(pay.tenant_id);
     if (!pay || !t) throw new HttpError(404, 'This payment link isn’t valid.');
-    send(res, 200, { description: pay.description, amount_cents: pay.amount_cents, status: pay.status, kind: pay.kind, paid_at: pay.paid_at, fee_cents: 0, online: onlineQuote(t, pay.amount_cents), business: brand(t) });
+    send(res, 200, { description: pay.description, amount_cents: pay.amount_cents, status: pay.status, kind: pay.kind, paid_at: pay.paid_at, fee_cents: 0, online: onlineQuote(t, pay.amount_cents), business: brand(t), customer_terms: publicTerms(t, pay.customer_terms_version) });
   });
 
   route('POST', '/api/public/payments/:token/checkout', async (req, res, p) => {
@@ -474,12 +552,22 @@ export function createApp(env = process.env) {
     const o = evt.data?.object;
     if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(evt.type) && o?.payment_status === 'paid') {
       const pay = getPayment(o.client_reference_id || o.metadata?.payment_token || '');
-      if (pay && !evt.account && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); }
+      // Direct charges arrive from the business's account (Connect endpoint, evt.account set);
+      // legacy platform charges arrive on the platform endpoint (no evt.account).
+      const rightAccount = pay && (pay.charge_type === 'direct' ? evt.account === pay.stripe_account : !evt.account);
+      if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); }
     } else if (evt.type === 'account.updated' && o?.id) {
-      const ready = o.payouts_enabled && (!o.capabilities || o.capabilities.transfers === 'active');
-      db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE stripe_account_id = ?`).run(ready ? 1 : 0, o.details_submitted ? 1 : 0, o.id);
-      const t = db.prepare('SELECT id FROM tenants WHERE stripe_account_id = ?').get(o.id);
-      if (t && ready) await retryPayouts(t.id);
+      const t = db.prepare('SELECT * FROM tenants WHERE stripe_account_id = ? OR legacy_stripe_account_id = ?').get(o.id, o.id);
+      if (t && isMerchant(t) && t.stripe_account_id === o.id) {
+        // v2 accounts also emit v1 account.updated (Connected accounts scope): ready = card payments active.
+        const ready = Boolean(o.charges_enabled) && (!o.capabilities || o.capabilities.card_payments === 'active');
+        db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(ready ? 1 : 0, o.details_submitted || ready ? 1 : 0, t.id);
+      } else if (t) {
+        // Legacy Express payout account: release held payouts once transfers are active.
+        const ready = o.payouts_enabled && (!o.capabilities || o.capabilities.transfers === 'active');
+        if (!isMerchant(t)) db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(ready ? 1 : 0, o.details_submitted ? 1 : 0, t.id);
+        if (ready) await retryPayouts(t.id);
+      }
     }
     send(res, 200, { received: true });
   });
@@ -487,7 +575,8 @@ export function createApp(env = process.env) {
   // ===== business dashboard =====
   route('GET', '/api/config', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, {
-      stripe: { platform_ready: stripe.enabled, test_mode: stripe.testMode, account: t.stripe_account_id, online_ready: onlineReady(t), payouts_enabled: Boolean(t.stripe_payouts_enabled), details_submitted: Boolean(t.stripe_details_submitted) },
+      stripe: { platform_ready: stripe.enabled, test_mode: stripe.testMode, account: t.stripe_account_id, account_type: isMerchant(t) ? 'merchant' : t.stripe_account_id ? 'legacy_express' : null, online_ready: onlineReady(t), payouts_enabled: Boolean(t.stripe_payouts_enabled), details_submitted: Boolean(t.stripe_details_submitted) },
+      customer_terms: (() => { const st = termsState(t); return { profile_complete: st.complete, approved_version: st.adopted?.version || null, needs_review: st.needsReview }; })(),
       processing_fee: { bp: platformFee(db, t, 0).bp },
       sms_alerts: notify.smsEnabled && Boolean(t.notify_phone),
       settings: { tax_rate_bp: t.tax_rate_bp, deposit_cents: t.deposit_cents, deposit_label: t.deposit_label, terms: t.terms || '' },
@@ -684,15 +773,17 @@ export function createApp(env = process.env) {
     send(res, 200, { ok: true });
   }, { auth: 'owner' });
 
-  // Direct deposit: Stripe Express onboarding for the business owner.
+  // The business's own Stripe account (Accounts v2, merchant configuration, full Stripe Dashboard).
+  // Businesses on a legacy Express payout account get a new account here; the old one is kept so
+  // payments taken before the switch can still pay out.
   route('POST', '/api/stripe/connect', async (req, res, p, url, { tenant: t, user }) => {
-    if (!stripe.enabled) throw new HttpError(503, 'Payouts aren’t switched on for the platform yet. Contact support.');
-    let acct = t.stripe_account_id;
+    if (!stripe.enabled) throw new HttpError(503, 'Payments aren’t switched on for the platform yet. Contact support.');
+    let acct = isMerchant(t) ? t.stripe_account_id : null;
     if (!acct) {
-      acct = (await stripe.createAccount({ email: t.email || user.email, businessName: t.name, tenantId: t.id })).id;
-      db.prepare('UPDATE tenants SET stripe_account_id = ? WHERE id = ?').run(acct, t.id);
+      acct = (await stripe.createMerchantAccount({ email: t.email || user.email, businessName: t.name, tenantId: t.id })).id;
+      db.prepare(`UPDATE tenants SET legacy_stripe_account_id = COALESCE(legacy_stripe_account_id, stripe_account_id), stripe_account_id = ?, stripe_account_type = 'v2_merchant', stripe_payouts_enabled = 0, stripe_details_submitted = 0 WHERE id = ?`).run(acct, t.id);
     }
-    const link = await stripe.accountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
+    const link = await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
     send(res, 200, { url: link.url });
   }, { auth: 'owner', onboarding: true });
   route('POST', '/api/stripe/refresh', async (req, res, p, url, { tenant: t }) => {
@@ -700,8 +791,71 @@ export function createApp(env = process.env) {
     send(res, 200, { payouts_enabled: Boolean(fresh.stripe_payouts_enabled), details_submitted: Boolean(fresh.stripe_details_submitted) });
   }, { auth: 'tenant', onboarding: true });
   route('POST', '/api/stripe/dashboard', async (req, res, p, url, { tenant: t }) => {
-    if (!t.stripe_account_id) throw new HttpError(409, 'Set up direct deposit first.');
+    if (!t.stripe_account_id) throw new HttpError(409, 'Connect your Stripe account first.');
+    // Full-Dashboard accounts sign in to Stripe directly; login links are only for legacy Express accounts.
+    if (isMerchant(t)) return send(res, 200, { url: 'https://dashboard.stripe.com/' });
     send(res, 200, { url: (await stripe.loginLink(t.stripe_account_id)).url });
+  }, { auth: 'owner' });
+
+  // ===== one-time business setup + customer Terms & Conditions =====
+  route('GET', '/api/legal-profile', async (req, res, p, url, { tenant: t }) => {
+    const st = termsState(t);
+    send(res, 200, {
+      profile: st.profile || customerTerms.defaultProfile(), saved: Boolean(st.profile), complete: st.complete, missing: st.missing,
+      tax_rate_bp: t.tax_rate_bp, phone: t.phone || '', email: t.email || '',
+      options: { states: customerTerms.STATE_NAMES, balance_due: Object.fromEntries(Object.entries(customerTerms.BALANCE_DUE).map(([k, v]) => [k, v.label])) },
+    });
+  }, { auth: 'tenant' });
+
+  route('PUT', '/api/legal-profile', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    const { profile, errors } = customerTerms.validateProfile(b.profile || {});
+    let taxBp = t.tax_rate_bp;
+    if (b.tax_rate_bp !== undefined) {
+      const n = Number(b.tax_rate_bp);
+      if (!Number.isInteger(n) || n < 0 || n > 3000) errors.tax_rate_bp = 'Sales tax must be between 0% and 30%.'; else taxBp = n;
+    }
+    if (Object.keys(errors).length) return send(res, 422, { error: 'Please fix the highlighted fields.', field_errors: errors });
+    // The sales tax rate here is the same default used on new quotes (Settings).
+    db.prepare('UPDATE tenants SET legal_profile = ?, tax_rate_bp = ? WHERE id = ?').run(JSON.stringify(profile), taxBp, t.id);
+    const st = termsState(getTenant(t.id));
+    send(res, 200, { profile, saved: true, complete: st.complete, missing: st.missing, needs_review: st.needsReview, tax_rate_bp: taxBp });
+  }, { auth: 'owner' });
+
+  route('GET', '/api/customer-terms', async (req, res, p, url, { tenant: t, user, isSuper }) => {
+    const st = termsState(t);
+    const a = st.adopted;
+    send(res, 200, {
+      profile_complete: st.complete, missing: st.missing, template_version: customerTerms.TEMPLATE_VERSION,
+      draft: st.draft, legal_name: st.profile?.legalName || '', platform_name: platformName,
+      approved: a ? { version: a.version, approved_at: a.approved_at, approver_name: a.approver_name, approver_title: a.approver_title, source: a.source, sha256: a.sha256, markdown: a.markdown } : null,
+      needs_review: st.needsReview,
+      public_url: `${baseUrl(req)}${termsPath(t)}`,
+      // Final approval belongs to the business owner, never to platform staff viewing the account.
+      can_approve: !isSuper && user.role === 'owner',
+    });
+  }, { auth: 'tenant' });
+
+  // Final approval by the business owner. Each approval is a new immutable version with the exact
+  // wording, a SHA-256 fingerprint, the owner's typed name and title, the attestation they
+  // confirmed, and their IP and device.
+  route('POST', '/api/customer-terms/approve', async (req, res, p, url, { tenant: t, user, isSuper }) => {
+    if (isSuper) throw new HttpError(403, 'Only the business owner can give final approval of their customer terms.');
+    const st = termsState(t);
+    if (!st.complete) throw new HttpError(409, 'Complete your business details first.');
+    const b = await json(req, 200_000);
+    const name = clean(b.name, 120), title = clean(b.title, 80);
+    if (!name || !title) throw new HttpError(400, 'Type your full name and your title (for example, Owner).');
+    if (!b.authorized || !b.reviewed || !b.seller_of_record) throw new HttpError(400, 'Please confirm all three statements to give final approval.');
+    const markdown = String(b.markdown || '').replace(/\r\n/g, '\n').trim() + '\n';
+    if (markdown.length < 500 || markdown.length > 60000) throw new HttpError(400, 'The terms must be between 500 and 60,000 characters.');
+    if (/\[\[MISSING:|\{\{[#/]?\w+\}\}/.test(markdown)) throw new HttpError(400, 'The terms still contain unfilled placeholders. Replace or remove them first.');
+    const attestation = customerTerms.attestationText({ name, title, legalName: st.profile.legalName, platformName });
+    const version = (st.adopted?.version || 0) + 1;
+    const sha = customerTerms.sha256(markdown);
+    db.prepare(`INSERT INTO customer_terms (tenant_id, version, markdown, sha256, source, template_version, profile_fingerprint, approver_user_id, approver_name, approver_title, attestation, ip, ua) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(t.id, version, markdown, sha, markdown === st.draft ? 'template' : 'customized', customerTerms.TEMPLATE_VERSION, customerTerms.fingerprint(st.vars), user.id, name, title, attestation, clientIp(req), clean(req.headers['user-agent'], 400));
+    send(res, 201, { version, sha256: sha, public_url: `${baseUrl(req)}${termsPath(t, version)}` });
   }, { auth: 'owner' });
 
   // Payments and payouts for the business.
@@ -713,7 +867,8 @@ export function createApp(env = process.env) {
   route('GET', '/api/super/overview', async (req, res) => {
     const month = new Date().toISOString().slice(0, 7);
     const rows = db.prepare(`
-      SELECT t.id, t.slug, t.name, t.status, t.created_at, t.stripe_account_id, t.stripe_payouts_enabled, t.stripe_details_submitted, t.fee_bp, t.custom_domain,
+      SELECT t.id, t.slug, t.name, t.status, t.created_at, t.stripe_account_id, t.stripe_account_type, t.stripe_payouts_enabled, t.stripe_details_submitted, t.fee_bp, t.custom_domain,
+        (SELECT MAX(version) FROM customer_terms ct WHERE ct.tenant_id = t.id) AS terms_version,
         (SELECT email FROM users u WHERE u.tenant_id = t.id AND u.role = 'owner' ORDER BY u.id LIMIT 1) AS owner_email,
         (SELECT MAX(last_login_at) FROM users u WHERE u.tenant_id = t.id) AS last_login_at,
         (SELECT COUNT(*) FROM requests r WHERE r.tenant_id = t.id) AS requests,
@@ -722,7 +877,7 @@ export function createApp(env = process.env) {
         (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS fee_cents,
         (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND substr(p.paid_at,1,7) = ?) AS fee_month_cents,
         (SELECT COALESCE(SUM(stripe_fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS stripe_fee_cents,
-        (SELECT COALESCE(SUM(payout_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status = 'sent') AS payout_cents,
+        (SELECT COALESCE(SUM(payout_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status IN ('sent','direct')) AS payout_cents,
         (SELECT COUNT(*) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status IN ('pending','failed')) AS payouts_waiting
       FROM tenants t ORDER BY t.id DESC`).all(month);
     const sum = (k) => rows.reduce((a, r) => a + (r[k] || 0), 0);
@@ -752,6 +907,9 @@ export function createApp(env = process.env) {
       tenant: publicTenant(t), fee_bp: t.fee_bp, site_url: `${baseUrl(req)}/s/${t.slug}`,
       users: db.prepare('SELECT id, name, email, role, last_login_at, created_at FROM users WHERE tenant_id = ? ORDER BY id').all(t.id),
       agreements: db.prepare('SELECT a.doc, a.version, a.accepted_at, a.ip, u.email FROM agreements a LEFT JOIN users u ON u.id = a.user_id WHERE a.tenant_id = ? ORDER BY a.id DESC').all(t.id),
+      // Owner approvals of the business's customer Terms & Conditions (audit trail).
+      customer_terms: db.prepare('SELECT version, source, sha256, approver_name, approver_title, approved_at, ip FROM customer_terms WHERE tenant_id = ? ORDER BY version DESC').all(t.id),
+      terms_url: `${baseUrl(req)}${termsPath(t)}`,
       payments: db.prepare(`SELECT id, kind, description, amount_cents, stripe_fee_cents, fee_cents, payout_cents, transfer_status, transfer_error, method, status, paid_at, created_at FROM payments WHERE tenant_id = ? ORDER BY id DESC LIMIT 100`).all(t.id),
     });
   }, { auth: 'super' });
@@ -776,7 +934,8 @@ export function createApp(env = process.env) {
     const feeBp = b.fee_bp === null || b.fee_bp === '' ? null : b.fee_bp !== undefined ? Math.min(1000, cents(b.fee_bp)) : t.fee_bp;
     const acct = b.stripe_account_id !== undefined ? (clean(b.stripe_account_id, 80) || null) : t.stripe_account_id;
     if (acct && !/^acct_[A-Za-z0-9]+$/.test(acct)) throw new HttpError(400, 'Stripe account IDs look like acct_123…');
-    db.prepare('UPDATE tenants SET status = ?, fee_bp = ?, stripe_account_id = ? WHERE id = ?').run(status, feeBp, acct, t.id);
+    // A manually linked account is treated as the business's own (v2 merchant) Stripe account.
+    db.prepare('UPDATE tenants SET status = ?, fee_bp = ?, stripe_account_id = ?, stripe_account_type = CASE WHEN ? THEN \'v2_merchant\' ELSE stripe_account_type END WHERE id = ?').run(status, feeBp, acct, acct && acct !== t.stripe_account_id ? 1 : 0, t.id);
     let fresh = getTenant(t.id);
     if (acct && acct !== t.stripe_account_id) fresh = await refreshStripeStatus(fresh).catch(() => fresh);
     send(res, 200, publicTenant(fresh));
@@ -863,6 +1022,32 @@ export function createApp(env = process.env) {
     res.end(renderSite(t, products));
   }
 
+  // A business's customer Terms & Conditions, as approved by its owner. ?v=N shows an earlier version
+  // (the exact wording a customer accepted then).
+  function serveTerms(res, t, url) {
+    if (!t || t.status !== 'active') throw new HttpError(404, 'Not found');
+    const all = db.prepare('SELECT version, markdown, sha256, approved_at FROM customer_terms WHERE tenant_id = ? ORDER BY version').all(t.id);
+    const current = all[all.length - 1];
+    const want = Number(url.searchParams.get('v')) || 0;
+    const shown = want ? all.find((x) => x.version === want) : current;
+    if (!shown) throw new HttpError(404, 'This business hasn’t published its terms yet.');
+    const e = customerTerms.escapeHtml;
+    const color = hexColor(t.primary_color, '#10243A');
+    const date = new Date(shown.approved_at.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { dateStyle: 'long' });
+    const others = all.filter((x) => x !== shown).map((x) => `<a href="?v=${x.version}">v${x.version}</a>`).join(' · ');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...securityHeaders });
+    res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terms and Conditions — ${e(t.name)}</title><link rel="icon" href="/favicon.svg">
+<style>body{margin:0;font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1a1f2b;background:#f6f7f9}main{max-width:820px;margin:0 auto;padding:24px 16px 48px}
+header{border-top:6px solid ${color};background:#fff;padding:14px 16px}header strong{display:block;max-width:820px;margin:0 auto}article{background:#fff;border:1px solid #e3e6ec;border-radius:10px;padding:8px 24px}
+h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;font-size:.9rem}.mono{font-family:ui-monospace,Menlo,monospace;font-size:.8rem;overflow-wrap:anywhere}a{color:${color}}</style></head>
+<body><header><strong>${e(t.name)}</strong></header><main>
+<p class="muted">Version ${shown.version} · Approved ${e(date)}${shown === current ? '' : ` · <strong>Superseded</strong> — <a href="?">current version</a>`}</p>
+<article>${customerTerms.markdownToHtml(shown.markdown)}</article>
+<p class="muted mono">Document fingerprint (SHA-256): ${shown.sha256}</p>${others ? `<p class="muted">Other versions: ${others}</p>` : ''}
+</main></body></html>`);
+  }
+
   async function handler(req, res) {
     const url = new URL(req.url, 'http://x');
     const pathname = url.pathname;
@@ -919,6 +1104,8 @@ export function createApp(env = process.env) {
       if (pathname === '/signup') { res.writeHead(302, { Location: '/admin/#/signup' }); return res.end(); }
       let m;
       if ((m = /^\/s\/([\w-]+)\/?$/.exec(pathname))) return serveSite(res, getTenantBySlug(m[1]));
+      if ((m = /^\/s\/([\w-]+)\/terms\/?$/.exec(pathname))) return serveTerms(res, getTenantBySlug(m[1]), url);
+      if (domainTenant && pathname === '/terms') return serveTerms(res, domainTenant, url);
       if ((m = /^\/media\/([\w-]+)\/([\w.-]+)$/.exec(pathname))) {
         const t = getTenantBySlug(m[1]);
         if (!t || !m[2].startsWith(`t${t.id}-brand-`) || ![t.logo, t.owner_photo].includes(m[2])) throw new HttpError(404, 'Not found');

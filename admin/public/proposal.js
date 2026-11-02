@@ -61,7 +61,7 @@
       ${q.terms ? `<section class="card"><h2>Terms</h2><p class="small" style="white-space:pre-wrap">${esc(q.terms)}</p></section>` : ''}
       <section class="card stack" id="sign"></section>
       <section class="card stack no-print" id="pay"></section>
-      <p class="small muted no-print">${contactLine(q.business)} <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer terms</a> · <button class="linkbtn" type="button" id="print">Print or save a copy</button></p>`;
+      <p class="small muted no-print">${contactLine(q.business)} ${q.customer_terms ? `<a href="${esc(q.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> · ` : ''}<a href="/legal/customer-terms" target="_blank" rel="noopener">Payment and e-signature notice</a> · <button class="linkbtn" type="button" id="print">Print or save a copy</button></p>`;
     document.getElementById('print').addEventListener('click', () => window.print());
 
     const sign = document.getElementById('sign');
@@ -75,7 +75,7 @@
           <div><p id="sig-label" style="font-family:var(--cond);font-weight:600;font-size:17px;margin-bottom:4px">Sign with your finger or mouse</p>
             <canvas class="sigpad" id="pad" role="img" aria-labelledby="sig-label"></canvas>
             <button class="linkbtn" type="button" id="clear">Clear signature</button></div>
-          <label class="check"><input type="checkbox" name="agree" id="agree"> <span>I approve this work and the total above, and I agree to the terms above and the <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer Terms</a>, including signing electronically.</span></label>
+          <label class="check"><input type="checkbox" name="agree" id="agree"> <span>I approve this work and the total above, and I agree to the terms above${q.customer_terms ? `, ${esc(q.business.name)}’s <a href="${esc(q.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> (version ${q.customer_terms.version})` : ''} and the <a href="/legal/customer-terms" target="_blank" rel="noopener">payment and e-signature notice</a>, including signing electronically.</span></label>
           <p class="alert err" id="serr" hidden></p>
           <button class="btn primary block" type="submit">Accept and sign</button>
         </form>`;
@@ -139,7 +139,7 @@
       const o = out.getContext('2d'); o.fillStyle = '#fff'; o.fillRect(0, 0, out.width, out.height); o.drawImage(canvas, 0, 0, out.width, out.height);
       const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
       try {
-        await api(`/api/public/proposals/${encodeURIComponent(token)}/sign`, { name: f.elements.name.value, agree: true, signature: out.toDataURL('image/png') });
+        await api(`/api/public/proposals/${encodeURIComponent(token)}/sign`, { name: f.elements.name.value, agree: true, signature: out.toDataURL('image/png'), terms_version: q.customer_terms ? q.customer_terms.version : undefined });
         load();
       } catch (ex) { err.textContent = ex.message; err.hidden = false; btn.disabled = false; }
     });

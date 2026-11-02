@@ -137,3 +137,9 @@ table.items .num { text-align: right; white-space: nowrap; font-variant-numeric:
 .tag.booking { background: #DCE9F7; color: #12395E; }
 code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background: #EEE8DE; padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
 .brand img { display: block; }
+
+/* Customer Terms & Conditions preview */
+.terms-box { max-height: 440px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 4px 18px; background: var(--card); }
+.terms-box h2 { font-size: 22px; } .terms-box h3 { font-size: 18px; margin-top: 18px; } .terms-box p, .terms-box li { font-size: 15px; }
+#tc-edit { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.terms-box p { margin: 8px 0; } .terms-box h2 { margin: 12px 0 6px; }

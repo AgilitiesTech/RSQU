@@ -2,7 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const AGREEMENT_VERSION = '2026-11-02';
+// Bump when the platform legal documents change: every owner is asked to accept again.
+// 2026-11-02.2: businesses become the merchant of record (direct charges on their own Stripe account).
+export const AGREEMENT_VERSION = '2026-11-02.2';
 export const BUSINESS_AGREEMENTS = ['terms', 'privacy', 'payment-terms'];
 
 export function openDb(dataDir) {
@@ -27,7 +29,7 @@ export function openDb(dataDir) {
       deposit_cents INTEGER NOT NULL DEFAULT 0,
       deposit_label TEXT NOT NULL DEFAULT 'Diagnosis and onsite review',
       terms TEXT,
-      -- Stripe Express connected account that receives payouts (direct deposit)
+      -- The business's own Stripe account (see stripe_account_type in migrate()); legacy: Express payout account
       stripe_account_id TEXT, stripe_payouts_enabled INTEGER NOT NULL DEFAULT 0, stripe_details_submitted INTEGER NOT NULL DEFAULT 0,
       statement_name TEXT,                            -- short name on customers' card statements
       fee_bp INTEGER,                                 -- platform share in basis points; NULL = platform default
@@ -129,7 +131,7 @@ export function openDb(dataDir) {
       -- Online payments: Processing Fee = stripe_fee_cents + fee_cents, retained before payout
       stripe_fee_cents INTEGER NOT NULL DEFAULT 0,    -- Stripe's actual fee to the platform
       fee_cents INTEGER NOT NULL DEFAULT 0,           -- platform share (3%)
-      payout_cents INTEGER NOT NULL DEFAULT 0,        -- transferred to the business
+      payout_cents INTEGER NOT NULL DEFAULT 0,        -- what the business keeps (direct) or was transferred (legacy)
       transfer_id TEXT, transfer_status TEXT,         -- NULL (offline) | pending | sent | failed
       transfer_error TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -150,6 +152,7 @@ export function openDb(dataDir) {
     CREATE INDEX IF NOT EXISTS ix_pay_tenant ON payments(tenant_id, status);
     CREATE INDEX IF NOT EXISTS ix_products_tenant ON products(tenant_id);
   `);
+  migrate(db);
   const set = db.prepare(`INSERT OR IGNORE INTO platform_settings (key, value) VALUES (?, ?)`);
   set.run('fee_bp', '300');
   return db;
@@ -183,4 +186,54 @@ export function quoteTotals(quote, items) {
 
 export function slugify(name) {
   return String(name || '').toLowerCase().normalize('NFKD').replace(/[^\w\s-]/g, '').trim().replace(/[\s_]+/g, '-').replace(/-+/g, '-').slice(0, 48) || 'business';
+}
+
+// ---------- additive migrations (safe to run on every start) ----------
+function addColumn(db, table, column, definition) {
+  const have = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+  if (!have) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function migrate(db) {
+  // Seller of record. 'v2_merchant': the business's own Stripe account (Accounts v2, merchant
+  // configuration). Customers pay it directly (direct charges), so the business is the merchant
+  // of record. NULL with a stripe_account_id = a legacy Express payout account from the old
+  // model, where the platform was the merchant of record and transferred payouts.
+  addColumn(db, 'tenants', 'stripe_account_type', 'TEXT');
+  addColumn(db, 'tenants', 'legacy_stripe_account_id', 'TEXT');
+  // One-time business setup used in the customer Terms & Conditions, proposals and payment pages
+  // (legal name, address, license, insurance, policies). JSON; see src/customer-terms.js.
+  addColumn(db, 'tenants', 'legal_profile', 'TEXT');
+
+  // Which terms version a customer accepted when signing a proposal.
+  addColumn(db, 'quotes', 'customer_terms_version', 'INTEGER');
+  addColumn(db, 'quotes', 'customer_terms_sha256', 'TEXT');
+
+  // 'direct' = charged on the business's own Stripe account (business is merchant of record).
+  // NULL = legacy platform charge followed by a transfer.
+  addColumn(db, 'payments', 'charge_type', 'TEXT');
+  addColumn(db, 'payments', 'stripe_account', 'TEXT');
+  addColumn(db, 'payments', 'customer_terms_version', 'INTEGER');
+
+  // Every customer Terms & Conditions version a business owner approved. Append-only, so the
+  // exact wording any customer agreed to can always be shown again.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS customer_terms (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      markdown TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      source TEXT NOT NULL,                 -- template | customized
+      template_version TEXT NOT NULL,
+      profile_fingerprint TEXT NOT NULL,
+      approver_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      approver_name TEXT NOT NULL,
+      approver_title TEXT NOT NULL,
+      attestation TEXT NOT NULL,            -- the exact statement the owner confirmed
+      ip TEXT, ua TEXT,
+      approved_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (tenant_id, version)
+    );
+  `);
 }

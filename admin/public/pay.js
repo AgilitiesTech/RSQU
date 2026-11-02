@@ -32,11 +32,12 @@
         ${isDeposit ? `<p>If you go ahead with the job, this full amount is credited toward it.</p>` : ''}
         ${p.status === 'paid' ? `<p class="alert ok">Paid${p.fee_cents ? ` (plus ${money(p.fee_cents)} Processing Fee)` : ''}. ${esc(p.business.name)} has been notified.</p>` : o.card_payments ? `
           ${o.fee ? `<dl class="totals"><dt>Amount</dt><dd>${money(p.amount_cents)}</dd><dt>Processing Fee (${o.bp / 100}%)</dt><dd>${money(o.fee)}</dd><dt class="big">Total paid online</dt><dd class="big">${money(o.charge)}</dd></dl>` : ''}
+          ${p.customer_terms ? `<p class="small">By paying, you agree to ${esc(p.business.name)}’s <a href="${esc(p.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> (version ${p.customer_terms.version}).</p>` : ''}
           <button class="btn primary block" id="paybtn" type="button">Pay ${money(o.charge)} by card or bank</button>
           <p class="small muted">You’ll go to Stripe’s secure checkout, then come right back here.${o.fee ? ` Paying by cash or check instead? No Processing Fee.` : ''}</p>` : `<p>Online payment isn’t available yet. Please pay ${esc(p.business.name)} directly.</p>`}
         <p class="alert err" id="perr" hidden></p>
       </section>
-      <p class="small muted">${contactLine(p.business)} <a href="/legal/customer-terms" target="_blank" rel="noopener">Customer terms</a></p>`;
+      <p class="small muted">${contactLine(p.business)} ${p.customer_terms ? `<a href="${esc(p.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> · ` : ''}<a href="/legal/customer-terms" target="_blank" rel="noopener">Payment notice</a></p>`;
     const pb = document.getElementById('paybtn');
     if (pb) pb.addEventListener('click', async () => {
       pb.disabled = true; pb.textContent = 'Opening secure checkout…';
