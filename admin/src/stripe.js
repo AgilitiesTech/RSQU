@@ -86,18 +86,24 @@ export function stripeClient(env) {
         use_case: { type: 'account_onboarding', account_onboarding: { refresh_url: refreshUrl, return_url: returnUrl } },
       });
     },
-    // Live status: can it take card payments, and is anything due from the owner?
+    // Live status. Card payments come from the v2 merchant configuration; whether the owner has
+    // finished onboarding comes from v1 `details_submitted`, which Stripe documents for v1 and v2
+    // accounts and which doesn't flip back when a new requirement appears later.
     async merchantStatus(id) {
-      const a = await callV2('GET', `/v2/core/accounts/${encodeURIComponent(id)}`, null, { include: ['configuration.merchant', 'requirements'] });
+      const [a, v1] = await Promise.all([
+        callV2('GET', `/v2/core/accounts/${encodeURIComponent(id)}`, null, { include: ['configuration.merchant', 'requirements'] }),
+        call('GET', `/v1/accounts/${encodeURIComponent(id)}`),
+      ]);
       const cardStatus = a?.configuration?.merchant?.capabilities?.card_payments?.status || 'inactive';
-      const due = a?.requirements?.summary?.minimum_deadline?.status;
-      return {
-        id: a.id,
-        chargesEnabled: cardStatus === 'active',
-        // The owner has submitted everything Stripe needs right now (Stripe may still be verifying).
-        detailsSubmitted: due !== 'currently_due' && due !== 'past_due',
-        cardStatus,
-      };
+      return { id: a.id, chargesEnabled: cardStatus === 'active', detailsSubmitted: Boolean(v1?.details_submitted), cardStatus };
+    },
+    // Return the platform's application fee (all or part) to the business, e.g. after a refund.
+    // Application fees live on the platform account, so no Stripe-Account header.
+    getApplicationFee(id) {
+      return call('GET', `/v1/application_fees/${encodeURIComponent(id)}`);
+    },
+    refundApplicationFee(id, amountCents, idempotencyKey) {
+      return call('POST', `/v1/application_fees/${encodeURIComponent(id)}/refunds`, { amount: amountCents }, { idempotencyKey });
     },
 
     // LEGACY: Express payout account (platform-as-merchant model). Not used for new accounts.

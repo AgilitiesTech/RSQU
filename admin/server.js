@@ -217,11 +217,13 @@ export function createApp(env = process.env) {
     return { fee: 0, charge: amount, bp: platformFee(db, t, amount).bp, card_payments: onlineReady(t) };
   }
 
-  async function startCheckout(req, t, payment, { successPath, cancelPath, email }) {
+  // `termsVersion`: the customer terms version the customer accepted (signed on the proposal, or
+  // shown on the payment page). Recorded on the payment and in Stripe metadata.
+  async function startCheckout(req, t, payment, { successPath, cancelPath, email, termsVersion }) {
     if (!onlineReady(t)) throw new HttpError(503, 'Online payments aren’t set up yet for this business. Please pay directly.');
     const base = baseUrl(req);
     const sep = successPath.includes('?') ? '&' : '?';
-    const terms = latestTerms(t.id);
+    const terms = (termsVersion && db.prepare('SELECT * FROM customer_terms WHERE tenant_id = ? AND version = ?').get(t.id, termsVersion)) || latestTerms(t.id);
     const session = await stripe.createCheckout({
       account: t.stripe_account_id, // direct charge: the business is the merchant of record
       name: payment.description,
@@ -293,13 +295,28 @@ export function createApp(env = process.env) {
         : platformFee(db, t, pay.amount_cents).fee;
       const stripeFee = Math.max(0, bt.fee - share);
       const net = typeof bt.net === 'number' ? bt.net : pay.amount_cents - bt.fee;
-      db.prepare(`UPDATE payments SET charge_id = ?, stripe_fee_cents = ?, fee_cents = ?, payout_cents = ?, transfer_status = 'direct', transfer_error = NULL WHERE id = ?`)
+      const r = db.prepare(`UPDATE payments SET charge_id = ?, stripe_fee_cents = ?, fee_cents = ?, payout_cents = ?, transfer_status = 'direct', transfer_error = NULL WHERE id = ? AND COALESCE(transfer_status, '') != 'direct'`)
         .run(ch.id, stripeFee, share, net, pay.id);
-      notify.sms(t?.notify_phone, `${money(net)} added to your Stripe balance (${money(pay.amount_cents)} paid, ${money(stripeFee + share)} Processing Fee).`);
+      // A webhook and the return-page confirm can arrive together: only the first one notifies.
+      if (r.changes) notify.sms(t?.notify_phone, `${money(net)} added to your Stripe balance (${money(pay.amount_cents)} paid, ${money(stripeFee + share)} Processing Fee).`);
     } catch (e) {
       db.prepare(`UPDATE payments SET transfer_status = 'pending', transfer_error = ? WHERE id = ?`).run(String(e.message).slice(0, 300), pay.id);
     }
     return getPayment(pay.token);
+  }
+
+  // When a business refunds a customer from its Stripe Dashboard, return the platform's 3%
+  // in proportion to the amount refunded (Payment Terms § 6). Safe to repeat: it refunds only the
+  // difference from what has already been returned, with an idempotency key per target amount.
+  async function returnPlatformFee(account, charge) {
+    const pay = db.prepare(`SELECT * FROM payments WHERE charge_id = ? AND stripe_account = ? AND charge_type = 'direct'`).get(charge.id, account);
+    const feeId = typeof charge.application_fee === 'string' ? charge.application_fee : charge.application_fee?.id;
+    if (!pay || !feeId || !charge.amount) return;
+    const fee = await stripe.getApplicationFee(feeId);
+    const target = Math.min(fee.amount, Math.round((fee.amount * (charge.amount_refunded || 0)) / charge.amount));
+    const due = target - (fee.amount_refunded || 0);
+    if (due > 0) await stripe.refundApplicationFee(feeId, due, `appfee-refund-${feeId}-${target}`);
+    db.prepare('UPDATE payments SET fee_refunded_cents = ? WHERE id = ?').run(Math.max(target, fee.amount_refunded || 0), pay.id);
   }
 
   async function retryPayouts(tenantId) {
@@ -322,6 +339,7 @@ export function createApp(env = process.env) {
       // stripe_payouts_enabled = the account can take card payments (and is paid out by Stripe).
       const st = await stripe.merchantStatus(t.stripe_account_id);
       db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(st.chargesEnabled ? 1 : 0, st.detailsSubmitted || st.chargesEnabled ? 1 : 0, t.id);
+      await retryPayouts(t.id); // re-read fees for any payment that was still settling
       return getTenant(t.id);
     }
     const a = await stripe.getAccount(t.stripe_account_id);
@@ -516,7 +534,7 @@ export function createApp(env = process.env) {
         .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
       pay = getPayment(tok);
     }
-    const url = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email: q.customer_email });
+    const url = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email: q.customer_email, termsVersion: q.customer_terms_version });
     send(res, 200, { url });
   });
 
@@ -532,8 +550,11 @@ export function createApp(env = process.env) {
     const t = pay && getTenant(pay.tenant_id);
     if (!pay || !t) throw new HttpError(404, 'This payment link isn’t valid.');
     if (pay.status === 'paid') throw new HttpError(409, 'This is already paid.');
+    const b = await json(req);
+    const latest = latestTerms(t.id);
+    if (latest && b.terms_version !== undefined && Number(b.terms_version) !== latest.version) throw new HttpError(409, 'The business updated its Terms & Conditions. Reload the page to review them, then pay.');
     const r = pay.request_id ? db.prepare('SELECT email FROM requests WHERE id = ?').get(pay.request_id) : null;
-    const url = await startCheckout(req, t, pay, { successPath: `/pay/${pay.token}`, cancelPath: `/pay/${pay.token}`, email: r?.email });
+    const url = await startCheckout(req, t, pay, { successPath: `/pay/${pay.token}`, cancelPath: `/pay/${pay.token}`, email: r?.email, termsVersion: latest?.version });
     send(res, 200, { url });
   });
 
@@ -556,12 +577,15 @@ export function createApp(env = process.env) {
       // legacy platform charges arrive on the platform endpoint (no evt.account).
       const rightAccount = pay && (pay.charge_type === 'direct' ? evt.account === pay.stripe_account : !evt.account);
       if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); }
+    } else if (evt.type === 'charge.refunded' && evt.account && o?.id) {
+      await returnPlatformFee(evt.account, o);
     } else if (evt.type === 'account.updated' && o?.id) {
       const t = db.prepare('SELECT * FROM tenants WHERE stripe_account_id = ? OR legacy_stripe_account_id = ?').get(o.id, o.id);
       if (t && isMerchant(t) && t.stripe_account_id === o.id) {
         // v2 accounts also emit v1 account.updated (Connected accounts scope): ready = card payments active.
         const ready = Boolean(o.charges_enabled) && (!o.capabilities || o.capabilities.card_payments === 'active');
         db.prepare(`UPDATE tenants SET stripe_payouts_enabled = ?, stripe_details_submitted = ? WHERE id = ?`).run(ready ? 1 : 0, o.details_submitted || ready ? 1 : 0, t.id);
+        await retryPayouts(t.id);
       } else if (t) {
         // Legacy Express payout account: release held payouts once transfers are active.
         const ready = o.payouts_enabled && (!o.capabilities || o.capabilities.transfers === 'active');
@@ -776,12 +800,21 @@ export function createApp(env = process.env) {
   // The business's own Stripe account (Accounts v2, merchant configuration, full Stripe Dashboard).
   // Businesses on a legacy Express payout account get a new account here; the old one is kept so
   // payments taken before the switch can still pay out.
+  const creatingAccount = new Map(); // tenant id -> in-flight account creation (double-click safety)
   route('POST', '/api/stripe/connect', async (req, res, p, url, { tenant: t, user }) => {
     if (!stripe.enabled) throw new HttpError(503, 'Payments aren’t switched on for the platform yet. Contact support.');
     let acct = isMerchant(t) ? t.stripe_account_id : null;
     if (!acct) {
-      acct = (await stripe.createMerchantAccount({ email: t.email || user.email, businessName: t.name, tenantId: t.id })).id;
-      db.prepare(`UPDATE tenants SET legacy_stripe_account_id = COALESCE(legacy_stripe_account_id, stripe_account_id), stripe_account_id = ?, stripe_account_type = 'v2_merchant', stripe_payouts_enabled = 0, stripe_details_submitted = 0 WHERE id = ?`).run(acct, t.id);
+      if (!creatingAccount.has(t.id)) {
+        creatingAccount.set(t.id, (async () => {
+          const fresh = getTenant(t.id);
+          if (isMerchant(fresh)) return fresh.stripe_account_id;
+          const id = (await stripe.createMerchantAccount({ email: fresh.email || user.email, businessName: fresh.name, tenantId: fresh.id })).id;
+          db.prepare(`UPDATE tenants SET legacy_stripe_account_id = COALESCE(legacy_stripe_account_id, stripe_account_id), stripe_account_id = ?, stripe_account_type = 'v2_merchant', stripe_payouts_enabled = 0, stripe_details_submitted = 0 WHERE id = ? AND COALESCE(stripe_account_type, '') != 'v2_merchant'`).run(id, fresh.id);
+          return getTenant(fresh.id).stripe_account_id;
+        })().finally(() => creatingAccount.delete(t.id)));
+      }
+      acct = await creatingAccount.get(t.id);
     }
     const link = await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
     send(res, 200, { url: link.url });
@@ -841,9 +874,9 @@ export function createApp(env = process.env) {
   // confirmed, and their IP and device.
   route('POST', '/api/customer-terms/approve', async (req, res, p, url, { tenant: t, user, isSuper }) => {
     if (isSuper) throw new HttpError(403, 'Only the business owner can give final approval of their customer terms.');
-    const st = termsState(t);
-    if (!st.complete) throw new HttpError(409, 'Complete your business details first.');
     const b = await json(req, 200_000);
+    const st = termsState(getTenant(t.id)); // computed after reading the body, from fresh data
+    if (!st.complete) throw new HttpError(409, 'Complete your business details first.');
     const name = clean(b.name, 120), title = clean(b.title, 80);
     if (!name || !title) throw new HttpError(400, 'Type your full name and your title (for example, Owner).');
     if (!b.authorized || !b.reviewed || !b.seller_of_record) throw new HttpError(400, 'Please confirm all three statements to give final approval.');
@@ -853,8 +886,13 @@ export function createApp(env = process.env) {
     const attestation = customerTerms.attestationText({ name, title, legalName: st.profile.legalName, platformName });
     const version = (st.adopted?.version || 0) + 1;
     const sha = customerTerms.sha256(markdown);
-    db.prepare(`INSERT INTO customer_terms (tenant_id, version, markdown, sha256, source, template_version, profile_fingerprint, approver_user_id, approver_name, approver_title, attestation, ip, ua) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(t.id, version, markdown, sha, markdown === st.draft ? 'template' : 'customized', customerTerms.TEMPLATE_VERSION, customerTerms.fingerprint(st.vars), user.id, name, title, attestation, clientIp(req), clean(req.headers['user-agent'], 400));
+    try {
+      db.prepare(`INSERT INTO customer_terms (tenant_id, version, markdown, sha256, source, template_version, profile_fingerprint, approver_user_id, approver_name, approver_title, attestation, ip, ua) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(t.id, version, markdown, sha, markdown === st.draft ? 'template' : 'customized', customerTerms.TEMPLATE_VERSION, customerTerms.fingerprint(st.vars), user.id, name, title, attestation, clientIp(req), clean(req.headers['user-agent'], 400));
+    } catch (e) {
+      if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'Another approval was just saved. Reload the page to see it.');
+      throw e;
+    }
     send(res, 201, { version, sha256: sha, public_url: `${baseUrl(req)}${termsPath(t, version)}` });
   }, { auth: 'owner' });
 
@@ -874,8 +912,8 @@ export function createApp(env = process.env) {
         (SELECT COUNT(*) FROM requests r WHERE r.tenant_id = t.id) AS requests,
         (SELECT COALESCE(SUM(amount_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS paid_cents,
         (SELECT COALESCE(SUM(amount_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND p.method = 'card') AS online_cents,
-        (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS fee_cents,
-        (SELECT COALESCE(SUM(fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND substr(p.paid_at,1,7) = ?) AS fee_month_cents,
+        (SELECT COALESCE(SUM(fee_cents - fee_refunded_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS fee_cents,
+        (SELECT COALESCE(SUM(fee_cents - fee_refunded_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid' AND substr(p.paid_at,1,7) = ?) AS fee_month_cents,
         (SELECT COALESCE(SUM(stripe_fee_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.status = 'paid') AS stripe_fee_cents,
         (SELECT COALESCE(SUM(payout_cents),0) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status IN ('sent','direct')) AS payout_cents,
         (SELECT COUNT(*) FROM payments p WHERE p.tenant_id = t.id AND p.transfer_status IN ('pending','failed')) AS payouts_waiting
@@ -935,7 +973,13 @@ export function createApp(env = process.env) {
     const acct = b.stripe_account_id !== undefined ? (clean(b.stripe_account_id, 80) || null) : t.stripe_account_id;
     if (acct && !/^acct_[A-Za-z0-9]+$/.test(acct)) throw new HttpError(400, 'Stripe account IDs look like acct_123…');
     // A manually linked account is treated as the business's own (v2 merchant) Stripe account.
-    db.prepare('UPDATE tenants SET status = ?, fee_bp = ?, stripe_account_id = ?, stripe_account_type = CASE WHEN ? THEN \'v2_merchant\' ELSE stripe_account_type END WHERE id = ?').run(status, feeBp, acct, acct && acct !== t.stripe_account_id ? 1 : 0, t.id);
+    db.prepare('UPDATE tenants SET status = ?, fee_bp = ? WHERE id = ?').run(status, feeBp, t.id);
+    if (acct !== t.stripe_account_id) {
+      // Keep a legacy Express payout account so earlier payments still pay out; start the new
+      // account unverified until Stripe says otherwise.
+      db.prepare(`UPDATE tenants SET legacy_stripe_account_id = COALESCE(legacy_stripe_account_id, CASE WHEN stripe_account_type IS NULL THEN stripe_account_id END),
+        stripe_account_id = ?, stripe_account_type = CASE WHEN ? IS NULL THEN NULL ELSE 'v2_merchant' END, stripe_payouts_enabled = 0, stripe_details_submitted = 0 WHERE id = ?`).run(acct, acct, t.id);
+    }
     let fresh = getTenant(t.id);
     if (acct && acct !== t.stripe_account_id) fresh = await refreshStripeStatus(fresh).catch(() => fresh);
     send(res, 200, publicTenant(fresh));
@@ -1074,7 +1118,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
               if (!ctx.tenant) throw new HttpError(ctx.isSuper ? 409 : 403, ctx.isSuper ? 'Choose a business to view first.' : 'Forbidden');
               if (!ctx.isSuper && ctx.tenant.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact support.');
               if (!ctx.isSuper && needsAgreements(ctx.user)) throw new HttpError(428, 'Please accept the updated agreements.');
-              if (!ctx.isSuper && !r.onboarding && needsPayoutSetup(ctx.user, ctx.tenant)) throw new HttpError(428, 'Please set up direct deposit first.');
+              if (!ctx.isSuper && !r.onboarding && needsPayoutSetup(ctx.user, ctx.tenant)) throw new HttpError(428, 'Please connect your Stripe account first.');
               if (r.auth === 'owner' && !ctx.isSuper && ctx.user.role !== 'owner') throw new HttpError(403, 'Only the business owner can change this.');
             }
           }

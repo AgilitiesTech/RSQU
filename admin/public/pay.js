@@ -41,7 +41,7 @@
     const pb = document.getElementById('paybtn');
     if (pb) pb.addEventListener('click', async () => {
       pb.disabled = true; pb.textContent = 'Opening secure checkout…';
-      try { const { url } = await api(`/api/public/payments/${encodeURIComponent(token)}/checkout`, {}); location.href = url; }
+      try { const { url } = await api(`/api/public/payments/${encodeURIComponent(token)}/checkout`, { terms_version: p.customer_terms ? p.customer_terms.version : undefined }); location.href = url; }
       catch (e) { const el = document.getElementById('perr'); el.textContent = e.message; el.hidden = false; pb.disabled = false; pb.textContent = 'Try again'; }
     });
   }

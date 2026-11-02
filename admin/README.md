@@ -34,10 +34,10 @@ Online payments for a business turn on only when **both** are true: Stripe has e
 1. **Connect → Platform setup:** set the platform up as a **Platform** (businesses sell to their own customers; connected accounts get the full Stripe Dashboard; Stripe handles risk and negative balances), and make sure **Accounts v2** is enabled for Connect. Connect → Settings → Branding: HitchPoint name, icon (`public/brand/favicon.svg`) and color `#10243A` (shown during onboarding).
 2. Developers → **API keys**: secret key into `STRIPE_SECRET_KEY` (start with `sk_test_…`).
 3. Developers → **Webhooks**, both to `https://<BASE_URL>/api/stripe/webhook`:
-   - **Connected accounts** events `account.updated`, `checkout.session.completed`, `checkout.session.async_payment_succeeded` → secret into `STRIPE_CONNECT_WEBHOOK_SECRET`. (Payments now happen on businesses’ accounts, so checkout events arrive here.)
+   - **Connected accounts** events `account.updated`, `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded` → secret into `STRIPE_CONNECT_WEBHOOK_SECRET`. (Payments now happen on businesses’ accounts, so checkout and refund events arrive here.)
    - **Your account** events `checkout.session.completed`, `checkout.session.async_payment_succeeded` → secret into `STRIPE_WEBHOOK_SECRET`. Only needed while payments taken under the old model are still settling.
 4. Connect → Settings → **Payment methods**: allow **ACH Direct Debit** for connected accounts (new business accounts request it; set `STRIPE_ACH_PAYMENTS=off` to stop).
-5. **Refunds and the 3%:** the Payment Terms promise to return the 3% proportionally when a business refunds. Stripe doesn’t do this automatically for refunds a business issues from its own Dashboard: refund the matching application fee from Connect → **Collected fees** (or automate it later from `charge.refunded` events).
+5. **Refunds and the 3%:** businesses refund customers from their own Stripe Dashboard. When the `charge.refunded` event arrives, the app automatically returns the matching share of HitchPoint’s 3% (refunds the application fee proportionally, safe to replay), as the Payment Terms promise. You can see returned fees under Connect → **Collected fees**.
 
 Your 3% builds up in the HitchPoint Stripe balance and pays out to the Agilities bank account on your normal schedule.
 

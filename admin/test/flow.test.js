@@ -20,6 +20,8 @@ const accounts = new Map(); // v1 Express (legacy)
 const merchants = new Map(); // v2 merchant accounts
 const transfers = [];
 const v2Requests = [];
+const appFees = new Map(); // application fees (platform account) for refund tests
+const appFeeRefunds = [];
 const stripeFee = (amt) => Math.round(amt * 0.029) + 30;
 const stripeMock = http.createServer((req, res) => {
   let body = '';
@@ -37,7 +39,7 @@ const stripeMock = http.createServer((req, res) => {
       if (req.method === 'POST' && req.url === '/v2/core/accounts') {
         if ('type' in j) return bad('v2 accounts take no top-level type');
         const id = 'acct_' + crypto.randomBytes(5).toString('hex');
-        merchants.set(id, { id, body: j, card: 'inactive', due: 'currently_due' });
+        merchants.set(id, { id, body: j, card: 'inactive', due: 'currently_due', submitted: false });
         return ok({ id, object: 'v2.core.account' });
       }
       if (req.method === 'POST' && req.url === '/v2/core/account_links') {
@@ -59,7 +61,23 @@ const stripeMock = http.createServer((req, res) => {
     }
     if (req.method === 'POST' && req.url === '/v1/account_links') return ok({ url: 'https://connect.stripe.test/setup/' + p.get('account') });
     if (req.method === 'POST' && (m = /^\/v1\/accounts\/(.+)\/login_links$/.exec(req.url))) return ok({ url: 'https://connect.stripe.test/express/' + m[1] });
-    if (req.method === 'GET' && (m = /^\/v1\/accounts\/([^/?]+)$/.exec(req.url))) return ok(accounts.get(m[1]));
+    if (req.method === 'GET' && (m = /^\/v1\/accounts\/([^/?]+)$/.exec(req.url))) {
+      if (accounts.has(m[1])) return ok(accounts.get(m[1]));
+      const a = merchants.get(m[1]); // v2 accounts are also readable through v1
+      return a ? ok({ id: a.id, object: 'account', details_submitted: a.submitted, charges_enabled: a.card === 'active' }) : bad('No such account');
+    }
+    if (req.method === 'GET' && (m = /^\/v1\/application_fees\/([^/?]+)$/.exec(req.url)) && appFees.has(m[1])) return ok(appFees.get(m[1]));
+    if (req.method === 'POST' && (m = /^\/v1\/application_fees\/([^/]+)\/refunds$/.exec(req.url)) && appFees.has(m[1])) {
+      const key = req.headers['idempotency-key'];
+      const prior = appFeeRefunds.find((r) => r.key === key);
+      if (prior) return ok(prior);
+      const f = appFees.get(m[1]); const amt = Number(p.get('amount'));
+      if (f.amount_refunded + amt > f.amount) return bad('Refund exceeds the application fee');
+      f.amount_refunded += amt;
+      const r = { id: 'fr_' + crypto.randomBytes(4).toString('hex'), key, fee: f.id, amount: amt };
+      appFeeRefunds.push(r);
+      return ok(r);
+    }
     if (req.method === 'POST' && req.url === '/v1/checkout/sessions') {
       if (onAccount && !merchants.has(onAccount)) return bad('No such account');
       const id = 'cs_test_' + crypto.randomBytes(6).toString('hex');
@@ -179,7 +197,7 @@ test('super admin creates a business; owner sets password and must accept agreem
   });
   // Still owes Stripe information: dashboard stays closed.
   assert.equal((await mike('POST', '/api/stripe/refresh')).json.details_submitted, false);
-  merchants.get(acct).due = 'eventually_due'; // owner finished Stripe's form; card payments still being verified
+  Object.assign(merchants.get(acct), { due: 'eventually_due', submitted: true }); // owner finished Stripe's form; card payments still being verified
   assert.equal((await mike('POST', '/api/stripe/refresh')).json.details_submitted, true);
   assert.equal((await mike('GET', '/api/me')).json.needs_payout_setup, false);
   assert.equal((await mike('GET', '/api/requests')).status, 200);
@@ -203,7 +221,7 @@ test('self sign-up records agreements; businesses cannot see each other', async 
   assert.equal((await other('GET', '/api/me')).json.needs_agreements, false);
   assert.equal((await other('GET', '/api/me')).json.needs_payout_setup, true);
   await other('POST', '/api/stripe/connect');
-  for (const a of merchants.values()) a.due = null;
+  for (const a of merchants.values()) Object.assign(a, { due: null, submitted: true });
   await other('POST', '/api/stripe/refresh');
   assert.equal((await other('GET', '/api/me')).json.needs_payout_setup, false);
   assert.equal((await other('POST', '/api/signup', { business_name: 'X', name: 'Y', email: 'OLA@other.test', password: 'long-enough-pw', agree: true })).status, 409);
@@ -323,6 +341,20 @@ test('deposit paid online: direct charge on the business account with the 3% app
   assert.equal(transfers.length, 0, 'no transfers: the money was paid to the business directly');
   const mine = (await mike('GET', '/api/payments')).json.find((p) => p.method === 'card');
   assert.equal(mine.stripe_fee_cents + mine.fee_cents, 791);
+
+  // The business refunds half from its Stripe Dashboard: the platform returns half of its 3%.
+  appFees.set('fee_dep', { id: 'fee_dep', amount: 387, amount_refunded: 0 });
+  const refunded = { id: 'ch_' + sess.id, object: 'charge', amount: 12900, amount_refunded: 6450, application_fee: 'fee_dep' };
+  await post(anon, { type: 'charge.refunded', account: mikeAcct, data: { object: refunded } });
+  await post(anon, { type: 'charge.refunded', account: mikeAcct, data: { object: refunded } }); // replay
+  assert.equal(appFees.get('fee_dep').amount_refunded, 194);
+  assert.equal(appFeeRefunds.length, 1);
+  await post(anon, { type: 'charge.refunded', data: { object: refunded } }); // not from the business's account: ignored
+  assert.equal(appFeeRefunds.length, 1);
+
+  // A payment page loaded before the owner approved new terms can't check out on the old version.
+  const dep2 = await mike('POST', `/api/requests/${rid}/deposit`, { method: 'card' });
+  assert.equal((await anon('POST', `/api/public/payments/${dep2.json.token}/checkout`, { terms_version: 99 })).status, 409);
 });
 
 test('quote: signed with the business’s terms, paid online with the Processing Fee on the balance', async () => {
@@ -384,7 +416,7 @@ test('custom platform share, cash has no fee; super overview, CSV, leads', async
   assert.deepEqual([cp.fee_cents, cp.stripe_fee_cents, cp.transfer_status], [0, 0, null]);
 
   const o = (await superA('GET', '/api/super/overview')).json;
-  assert.equal(o.totals.fee_cents, 387 + 1376 + 998);
+  assert.equal(o.totals.fee_cents, 387 - 194 + 1376 + 998, 'net of the 3% returned on the refund');
   assert.equal(o.totals.stripe_fee_cents, 404 + 1360 + 1477);
   assert.equal(o.totals.payout_cents, 12109 + 43117 + 47425, 'direct payments count as paid to the business');
   assert.equal(o.totals.payouts_waiting, 0);
@@ -433,6 +465,13 @@ test('legacy business on an Express payout account must move to its own Stripe a
   assert.equal(tr.amount, 10000 - stripeFee(10000) - 300);
   const after = appDb.prepare('SELECT * FROM tenants WHERE id = ?').get(tid);
   assert.equal(after.stripe_account_type, 'v2_merchant', 'legacy webhook does not overwrite the new account status');
+
+  // Super admin relinks a legacy business by hand: the old payout account is kept and the new one starts unverified.
+  const t2 = appDb.prepare(`INSERT INTO tenants (slug, name, stripe_account_id, stripe_payouts_enabled, stripe_details_submitted) VALUES ('relink-co', 'Relink Co', 'acct_oldexpress', 1, 1)`).run();
+  const rid2 = Number(t2.lastInsertRowid);
+  assert.equal((await superA('PATCH', `/api/super/tenants/${rid2}`, { stripe_account_id: 'acct_newmerchant' })).status, 200);
+  const rl = appDb.prepare('SELECT * FROM tenants WHERE id = ?').get(rid2);
+  assert.deepEqual([rl.stripe_account_id, rl.stripe_account_type, rl.legacy_stripe_account_id, rl.stripe_payouts_enabled, rl.stripe_details_submitted], ['acct_newmerchant', 'v2_merchant', 'acct_oldexpress', 0, 0]);
 });
 
 test('view-as, suspension, hosted website and custom domain', async () => {

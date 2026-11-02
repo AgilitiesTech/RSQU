@@ -214,6 +214,8 @@ function migrate(db) {
   addColumn(db, 'payments', 'charge_type', 'TEXT');
   addColumn(db, 'payments', 'stripe_account', 'TEXT');
   addColumn(db, 'payments', 'customer_terms_version', 'INTEGER');
+  // Part of the platform's 3% returned to the business on refunds (Payment Terms § 6).
+  addColumn(db, 'payments', 'fee_refunded_cents', 'INTEGER NOT NULL DEFAULT 0');
 
   // Every customer Terms & Conditions version a business owner approved. Append-only, so the
   // exact wording any customer agreed to can always be shown again.

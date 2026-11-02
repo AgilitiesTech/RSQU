@@ -166,8 +166,16 @@ export function fingerprint(vars) {
   return sha256(JSON.stringify(vars));
 }
 
+// Cached, but re-read when the file changes so template edits apply without a restart.
+let cached = { mtimeMs: 0, text: '' };
+function loadTemplate() {
+  const { mtimeMs } = fs.statSync(TEMPLATE_PATH);
+  if (mtimeMs !== cached.mtimeMs) cached = { mtimeMs, text: fs.readFileSync(TEMPLATE_PATH, 'utf8') };
+  return cached.text;
+}
+
 /** Fill the template. {{field}}, {{#if field}}…{{else}}…{{/if}} (nestable). Unknown fields show as [[MISSING: …]]. */
-export function renderTemplate(vars, template = fs.readFileSync(TEMPLATE_PATH, 'utf8')) {
+export function renderTemplate(vars, template = loadTemplate()) {
   let text = template.replace(/<!--[\s\S]*?-->\s*/g, '');
   const innermost = /\{\{#if (\w+)\}\}((?:(?!\{\{#if )[\s\S])*?)\{\{\/if\}\}/;
   let m;
