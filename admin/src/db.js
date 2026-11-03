@@ -248,6 +248,11 @@ function migrate(db) {
   // technician (findings, safety notes, questions). Both JSON.
   addColumn(db, 'quotes', 'photos', 'TEXT');
   addColumn(db, 'quotes', 'ai_draft', 'TEXT');
+  // Products as services on the website: a tile picture, a longer write-up for the service's own page,
+  // and the order they appear in.
+  addColumn(db, 'products', 'image', 'TEXT');
+  addColumn(db, 'products', 'details', 'TEXT');
+  addColumn(db, 'products', 'sort', 'INTEGER NOT NULL DEFAULT 0');
   // When the customer's receipt was sent (text and/or email), so it's sent once.
   addColumn(db, 'payments', 'receipt_sent_at', 'TEXT');
 

@@ -1,7 +1,7 @@
 // Server-rendered, white-label website for a business on the platform: the home page, one page per
 // city it serves, and the files it shares with customers. Local-search markup (schema.org JSON-LD,
 // canonical URLs, sitemaps) is generated from the business's own data.
-import { DAYS, citySlug, cityIndexable, servicePhrase } from './site-profile.js';
+import { DAYS, citySlug, cityIndexable, servicePhrase, slugify } from './site-profile.js';
 
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hex = (c, d) => (/^#[0-9a-fA-F]{6}$/.test(c || '') ? c : d);
@@ -12,6 +12,36 @@ const jsonLd = (o) => `<script type="application/ld+json">${JSON.stringify(o).re
 const clip = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : t; };
 const ampm = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return `${((h + 11) % 12) + 1}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`; };
 const kb = (n) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1000))} KB`);
+export const serviceSlug = (p) => slugify(p.name) || String(p.id);
+export const hasPage = (p) => Boolean(p.on_site && String(p.details || '').trim());
+// Owner-written service write-up: blank lines between paragraphs, "## " headings, "- " bullets.
+function details(text) {
+  const out = []; let list = null;
+  const flush = () => { if (list) { out.push(`<ul class="ticks">${list.join('')}</ul>`); list = null; } };
+  for (const block of String(text || '').split(/\n{2,}/)) {
+    for (const line of block.split('\n')) {
+      const l = line.trim();
+      if (!l) continue;
+      if (/^[-*•] /.test(l)) { (list ||= []).push(`<li>${esc(l.replace(/^[-*•] /, ''))}</li>`); continue; }
+      flush();
+      if (/^#{1,3} /.test(l)) out.push(`<h2>${esc(l.replace(/^#{1,3} /, ''))}</h2>`);
+      else out.push(`<p>${esc(l)}</p>`);
+    }
+    flush();
+  }
+  return out.join('\n');
+}
+const ICONS = {
+  tools: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  pin: '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+  phone: '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>',
+  truck: '<rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/>',
+};
+const icon = (k, size = 40) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k] || ICONS.star}</svg>`;
 const SCHEMA_DAYS = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' };
 
 // Where this business's site lives. Its own domain is canonical when it has one; links within a page
@@ -62,6 +92,7 @@ function businessSchema(t, profile, products, u, mediaAbs) {
 }
 
 function head(t, profile, { title, description, canonical, robots, image, schemas }) {
+  const bold = profile.theme === 'bold';
   const primary = hex(t.primary_color, '#B0141C');
   return `<!doctype html>
 <html lang="en">
@@ -82,8 +113,8 @@ ${image ? `<meta property="og:image" content="${esc(image)}">` : ''}
 <meta name="rsqu-business" content="${esc(t.slug)}">
 <meta name="theme-color" content="${primary}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@600;700&amp;family=Barlow:wght@400;500;600&amp;display=swap" rel="stylesheet">
-<style>${css(t)}</style>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@600;700&amp;family=Barlow:wght@400;500;600${bold ? '&amp;family=Oswald:wght@500;600;700' : ''}&amp;display=swap" rel="stylesheet">
+<style>${css(t)}${bold ? boldCss(t) : ''}</style>
 ${schemas.map(jsonLd).join('\n')}
 </head>`;
 }
@@ -134,6 +165,7 @@ section.alt{background:var(--soft)}
 footer{background:var(--ink);color:#D9D3CA;padding:40px 0;font-size:16px}footer a{color:#fff}footer .wrap{display:flex;flex-wrap:wrap;gap:24px 48px;justify-content:space-between}
 footer h2{color:#fff;font-size:20px;margin-bottom:6px}footer dl{display:grid;grid-template-columns:auto auto;gap:2px 16px;margin:0}footer dd{margin:0}
 .big{font-family:var(--cond);font-weight:700;font-size:34px;color:var(--a);text-decoration:none}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .links{display:flex;flex-wrap:wrap;gap:8px 16px;padding:0;margin:8px 0 0;list-style:none}
 `;
 }
@@ -197,7 +229,60 @@ function footer(t, profile, u) {
 </html>`;
 }
 
-function topBar(t, u, img) {
+function boldCss(t) {
+  const p = hex(t.primary_color, '#C8101A');
+  return `
+body.bold{--cond:'Oswald','Arial Narrow',Arial,sans-serif;--ink:#141416;--text:#26282B;--muted:#5A5E64;--line:#DADDE1;--soft:#F2F3F5}
+body.bold h1,body.bold section.s h2{text-transform:uppercase;letter-spacing:.01em}
+.bhead{background:linear-gradient(180deg,#232427,#0E0E10);border-bottom:1px solid #2E3034;color:#fff}
+.bhead .wrap{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 20px;padding-top:8px;padding-bottom:8px}
+.bhead .brand{font-family:var(--cond);text-transform:uppercase;letter-spacing:.02em}
+.bnav{display:flex;flex-wrap:wrap;align-items:center}
+.bnav a{position:relative;font-family:var(--cond);font-weight:500;font-size:17px;letter-spacing:.04em;text-transform:uppercase;color:#fff;text-decoration:none;white-space:nowrap;padding:14px clamp(8px,1.3vw,18px);border-bottom:3px solid transparent}
+.bnav a+a::before{content:"";position:absolute;left:0;top:35%;height:30%;border-left:1px solid #5A5E64}
+.bnav a:hover{color:color-mix(in srgb,${p} 60%,#fff)}.bnav a[aria-current=page]{border-bottom-color:${p};color:color-mix(in srgb,${p} 70%,#fff)}
+.pill{display:inline-flex;align-items:center;gap:10px;min-height:48px;padding:0 24px;border-radius:999px;background:linear-gradient(180deg,color-mix(in srgb,${p} 82%,#fff),color-mix(in srgb,${p} 85%,#000));color:#fff;border:1px solid color-mix(in srgb,${p} 60%,#fff);box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 2px 0 color-mix(in srgb,${p} 45%,#000);font-family:var(--cond);font-weight:700;font-size:21px;letter-spacing:.02em;text-decoration:none;white-space:nowrap}
+.pill.ghost{background:transparent;border:2px solid #fff;box-shadow:none}
+.bhead.sub .brand{font-size:24px;font-weight:700}.bhead.sub .bnav{order:3;width:100%;border-top:1px solid #2E3034}.bhead.sub .bnav a:first-child{padding-left:0}
+@media (max-width:760px){.bhead .pill{order:-1;width:100%;justify-content:center}.bhead .wrap{justify-content:center}.bnav{width:100%;justify-content:center}.bnav a{font-size:16px;padding:10px 9px}.bnav a+a::before{display:none}}
+.banner{background:#0E0E10;line-height:0}.banner img{display:block;width:100%;max-width:1536px;height:auto;margin:0 auto}
+.tiles{background:radial-gradient(ellipse at 50% 0,#3A3C40 0,#1B1C1F 70%);padding:clamp(18px,3vw,32px) 0}
+.tile-grid{--gap:clamp(8px,1.4vw,18px);margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;justify-content:center;gap:var(--gap)}
+.tile-grid li{flex:0 0 calc((100% - 6 * var(--gap)) / 7);min-width:0}
+.tile-grid a{display:block;line-height:0;transition:transform .15s ease,filter .15s ease}.tile-grid a:hover{transform:translateY(-3px);filter:drop-shadow(0 6px 12px rgba(0,0,0,.5))}
+.tile-grid img{width:100%;height:auto;aspect-ratio:1/1;object-fit:contain}
+@media (max-width:900px){.tile-grid li{flex-basis:calc((100% - 3 * var(--gap)) / 4)}}@media (max-width:520px){.tile-grid li{flex-basis:calc((100% - 2 * var(--gap)) / 3)}}
+.hl{background:#0E0E10;border-top:1px solid #2E3034;border-bottom:1px solid #2E3034;color:#D4D7DB}
+.hl ul{margin:0;padding-top:18px;padding-bottom:18px;list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:16px}
+.hl li{display:flex;align-items:center;gap:14px;min-width:0;font-size:15px;line-height:1.35;text-transform:uppercase;letter-spacing:.02em}
+.hl li+li{border-left:2px solid ${p};padding-left:16px}.hl strong{display:block;font-family:var(--cond);font-weight:600;font-size:19px;color:#fff}.hl svg{flex:none;color:#fff}
+@media (max-width:900px){.hl li+li{border-left:0;padding-left:0}}
+.help{background:linear-gradient(180deg,#1B1C1F,#0F0F11);color:#fff;padding:clamp(36px,5vw,64px) 0 clamp(48px,6vw,88px)}
+.help .wrap{display:flex;flex-wrap:wrap;gap:clamp(32px,5vw,64px);align-items:flex-start}
+.help h1{color:#fff;font-size:clamp(34px,4vw,54px);margin-bottom:16px}.help p.lead{font-size:20px;max-width:32em;margin:0 0 22px;color:#E6E8EB}
+.svc .more{display:inline-block;margin-top:6px;font-weight:600}
+.ticks{padding-left:22px}.ticks li{margin:4px 0}
+.svc-hero{background:linear-gradient(180deg,#1B1C1F,#0F0F11);color:#fff;padding:clamp(28px,4vw,48px) 0}
+.svc-hero h1{color:#fff;font-size:clamp(32px,4vw,50px);margin:6px 0 10px}.svc-hero .crumbs a{color:#fff}
+.svc-hero .wrap{display:flex;flex-wrap:wrap;gap:24px 40px;align-items:center}.svc-hero img{width:min(180px,40vw);height:auto}
+.prose{max-width:46em}.prose h2{font-size:clamp(24px,2.6vw,32px);margin:28px 0 10px}
+`;
+}
+
+function boldHeader(t, profile, u, { current = 'home', sections = {} } = {}) {
+  const tel = telDigits(t.phone);
+  const items = [['/', 'Home', 'home'], [sections.services && '/#services', 'Services', 'services'], [sections.about && '/#about', 'About', 'about'],
+    [sections.areas && '/#areas', 'Service area', 'areas'], [sections.resources && '/#resources', 'Resources', 'resources'], ['/#request', 'Contact', 'contact']].filter(([h]) => h);
+  return `<body class="bold">
+<header class="bhead${current !== 'home' ? ' sub' : ''}"><div class="wrap">
+  ${current !== 'home' ? `<a class="brand" href="${u.rel('/')}" style="color:#fff;text-decoration:none">${esc(t.name)}</a>` : ''}
+  <nav class="bnav" aria-label="Main">${items.map(([h, l, k]) => `<a href="${h === '/' ? u.rel('/') : u.rel('/') + h.slice(1)}"${k === current ? ' aria-current="page"' : ''}>${l}</a>`).join('')}</nav>
+  ${tel ? `<a class="pill" href="tel:${tel}">${icon('phone', 20)}<span>${esc(t.phone)}</span></a>` : ''}
+</div></header>`;
+}
+
+function topBar(t, u, img, profile, opts) {
+  if (profile && profile.theme === 'bold') return boldHeader(t, profile, u, opts);
   const tel = telDigits(t.phone);
   return `<body>
 <header class="top"><div class="wrap">
@@ -206,7 +291,7 @@ function topBar(t, u, img) {
 </div></header>`;
 }
 
-const servicesSection = (services) => (services.length ? `<section class="s"><div class="wrap"><h2>Services</h2><div class="grid">${services.map((p) => `<div class="svc"><h3>${esc(p.name)}</h3>${p.bookable ? `<p class="price">${money(p.price_cents)}</p>` : ''}${p.description ? `<p>${esc(p.description)}</p>` : ''}</div>`).join('')}</div></div></section>` : '');
+const servicesSection = (services, u) => (services.length ? `<section class="s" id="services"><div class="wrap"><h2>Services</h2><div class="grid">${services.map((p) => `<div class="svc" id="svc-${p.id}"><h3>${esc(p.name)}</h3>${p.bookable && p.price_cents ? `<p class="price">${money(p.price_cents)}</p>` : ''}${p.description ? `<p>${esc(p.description)}</p>` : ''}${u && hasPage(p) ? `<a class="more" href="${u.rel('/services/' + serviceSlug(p))}">More about ${esc(p.name.toLowerCase())}</a>` : ''}</div>`).join('')}</div></div></section>` : '');
 
 const credentialsSection = (profile) => (profile.credentials.length ? `<section class="s alt" id="credentials"><div class="wrap"><h2>Certifications and experience</h2><div class="grid">${profile.credentials.map((c) => `<div class="cred"><h3>${esc(c.title)}</h3>${c.detail ? `<p>${esc(c.detail)}</p>` : ''}</div>`).join('')}</div></div></section>` : '');
 
@@ -226,6 +311,65 @@ const resourcesSection = (profile, u) => (profile.resources.length ? `<section c
 
 const faqSchema = (profile) => (profile.faqs.length ? [{ '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: profile.faqs.map((f) => ({ '@type': 'Question', name: f.q, acceptedAnswer: { '@type': 'Answer', text: f.a } })) }] : []);
 
+const sectionsOf = (t, profile, services) => ({ services: services.length > 0, about: Boolean(t.about || t.owner_photo), areas: Boolean(profile.cities.length || profile.base_city), resources: profile.resources.length > 0 });
+
+// Bold theme: menu, banner picture, service tiles, highlights, then the request form on dark.
+function boldTop(t, profile, u, img, services, bookable, tel) {
+  const B = profile.banner;
+  const tiles = services.filter((p) => p.image);
+  const phrase = servicePhrase(profile);
+  return `${boldHeader(t, profile, u, { current: 'home', sections: sectionsOf(t, profile, services) })}
+${B.desktop ? `<section class="banner" aria-label="${esc(t.name)}"><picture>${B.mobile ? `<source media="(max-width: 700px)" srcset="${img(B.mobile)}">` : ''}<img src="${img(B.desktop)}" alt="${esc(B.alt || t.name)}" fetchpriority="high"></picture></section>` : ''}
+${tiles.length ? `<section class="tiles" aria-labelledby="tiles-h"><div class="wrap"><h2 id="tiles-h" class="sr-only">What we work on</h2><ul class="tile-grid">${tiles.map((p) => `<li><a href="${hasPage(p) ? u.rel('/services/' + serviceSlug(p)) : '#svc-' + p.id}"><img src="${img(p.image)}" alt="${esc(p.name)}" loading="lazy" width="204" height="204"></a></li>`).join('')}</ul></div></section>` : ''}
+${profile.highlights.length ? `<section class="hl" aria-label="Why choose ${esc(t.name)}"><ul class="wrap">${profile.highlights.map((h) => `<li>${icon(h.icon)}<span><strong>${esc(h.title)}</strong>${esc(h.text)}</span></li>`).join('')}</ul></section>` : ''}
+<section class="help" id="contact"><div class="wrap">
+  <div class="hero-l">
+    <h1>${esc(t.hero_headline || `${phrase} that comes to you`)}</h1>
+    ${t.tagline ? `<p class="lead">${esc(t.tagline)}</p>` : ''}
+    ${tel ? `<div class="row"><a class="pill" href="tel:${tel}">${icon('phone', 22)}<span>Call ${esc(t.phone)}</span></a><a class="pill ghost" href="sms:${tel}"><span>Text ${esc(t.phone)}</span></a></div>` : ''}
+    ${t.service_area ? `<p style="margin-top:22px;color:#D4D7DB">Serving ${esc(t.service_area)}</p>` : ''}
+    ${profile.links.google_review ? `<p style="margin-top:12px"><a href="${esc(profile.links.google_review)}" target="_blank" rel="noopener" style="color:#fff;font-weight:600">Review us on Google</a></p>` : ''}
+  </div>
+  ${requestCard(t, bookable)}
+</div></section>`;
+}
+
+// A page for one service, from the owner's write-up.
+export function renderServicePage(t, products, profile, product, { platformBase, onDomain = false }) {
+  const u = siteUrls(t, platformBase, onDomain);
+  const img = (f) => `/media/${encodeURIComponent(t.slug)}/${encodeURIComponent(f)}`;
+  const mediaAbs = (f) => `${platformBase}${img(f)}`;
+  const tel = telDigits(t.phone);
+  const services = products.filter((p) => p.on_site);
+  const bookable = products.filter((p) => p.bookable);
+  const place = profile.base_city ? `${profile.base_city}, ${profile.base_state}` : '';
+  const canonical = u.abs('/services/' + serviceSlug(product));
+  const title = `${product.name}${place ? ` in ${place}` : ''} | ${t.name}`;
+  const description = clip(product.description || product.details || '', 160);
+  const business = businessSchema(t, profile, products, u, mediaAbs);
+  const service = { '@context': 'https://schema.org', '@type': 'Service', name: product.name, serviceType: product.name, url: canonical, description, provider: { '@id': business['@id'] },
+    ...(profile.cities.length ? { areaServed: profile.cities.map((c) => ({ '@type': 'City', name: `${c.name}, ${c.state}` })) } : {}),
+    ...(product.bookable && product.price_cents ? { offers: { '@type': 'Offer', price: (product.price_cents / 100).toFixed(2), priceCurrency: 'USD' } } : {}) };
+  const crumbs = { '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [{ '@type': 'ListItem', position: 1, name: t.name, item: u.abs('/') }, { '@type': 'ListItem', position: 2, name: product.name, item: canonical }] };
+  const others = services.filter((p) => p.id !== product.id && hasPage(p));
+  return `${head(t, profile, { title, description, canonical, robots: 'index,follow', image: product.image ? mediaAbs(product.image) : (t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : ''), schemas: [business, service, crumbs] })}
+${topBar(t, u, img, profile, { current: 'services', sections: sectionsOf(t, profile, services) })}
+<section class="${profile.theme === 'bold' ? 'svc-hero' : 'hero'}"><div class="wrap">
+  ${product.image && profile.theme === 'bold' ? `<img src="${img(product.image)}" alt="" width="204" height="204">` : ''}
+  <div class="hero-l">
+    <p class="crumbs"><a href="${u.rel('/')}">${esc(t.name)}</a> › ${esc(product.name)}</p>
+    <h1>${esc(product.name)}</h1>
+    ${product.description ? `<p class="lead">${esc(product.description)}</p>` : ''}
+    ${product.bookable && product.price_cents ? `<p class="price" style="color:inherit;font-size:28px">${money(product.price_cents)}</p>` : ''}
+    ${tel ? `<div class="row">${profile.theme === 'bold' ? `<a class="pill" href="tel:${tel}">${icon('phone', 22)}<span>Call ${esc(t.phone)}</span></a>` : `<a class="btn btn-a" href="tel:${tel}">Call ${esc(t.phone)}</a>`}</div>` : ''}
+  </div>
+</div></section>
+<section class="s"><div class="wrap prose">${details(product.details)}</div></section>
+<section class="s alt" id="request-wrap"><div class="wrap" style="display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start"><div style="flex:1 1 320px;min-width:0"><h2>${product.bookable ? `Book ${esc(product.name.toLowerCase())}` : 'Request service'}</h2><p>Send your location and a few details and we’ll call or text you back.</p></div>${requestCard(t, bookable)}</div></section>
+${others.length ? `<section class="s"><div class="wrap"><h2>Other services</h2><ul class="areas">${others.map((p) => `<li><a href="${u.rel('/services/' + serviceSlug(p))}">${esc(p.name)}</a></li>`).join('')}</ul></div></section>` : ''}
+${footer(t, profile, u)}`;
+}
+
 export function renderSite(t, products, profile, { platformBase, onDomain = false }) {
   const u = siteUrls(t, platformBase, onDomain);
   const img = (f) => `/media/${encodeURIComponent(t.slug)}/${encodeURIComponent(f)}`;
@@ -238,9 +382,10 @@ export function renderSite(t, products, profile, { platformBase, onDomain = fals
   const title = `${t.name} | ${t.tagline || `${phrase}${place ? ' in ' + place : ''}`}`;
   const description = clip(`${t.tagline || phrase}${place ? ` based in ${place}` : ''}${t.service_area ? `. Serving ${t.service_area}` : ''}.`, 160);
   const L = profile.links;
+  const bold = profile.theme === 'bold';
 
   return `${head(t, profile, { title, description, canonical: u.abs('/'), robots: 'index,follow', image: t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : '', schemas: [businessSchema(t, profile, products, u, mediaAbs), ...faqSchema(profile)] })}
-${topBar(t, u, img)}
+${bold ? boldTop(t, profile, u, img, services, bookable, tel) : `${topBar(t, u, img)}
 
 <section class="hero"><div class="wrap">
   <div class="hero-l">
@@ -252,12 +397,12 @@ ${topBar(t, u, img)}
     ${L.google_review ? `<p style="margin-top:12px"><a href="${esc(L.google_review)}" target="_blank" rel="noopener" style="color:#fff;font-weight:600">Review us on Google</a></p>` : ''}
   </div>
   ${requestCard(t, bookable)}
-</div></section>
+</div></section>`}
 
-${servicesSection(services)}
+${servicesSection(services, u)}
 ${credentialsSection(profile)}
 ${videosSection(profile)}
-${t.about || t.owner_photo ? `<section class="s"><div class="wrap about">${t.owner_photo ? `<img src="${img(t.owner_photo)}" alt="${esc(t.name)}">` : ''}<div><h2>About us</h2>${para(t.about)}</div></div></section>` : ''}
+${t.about || t.owner_photo ? `<section class="s" id="about"><div class="wrap about">${t.owner_photo ? `<img src="${img(t.owner_photo)}" alt="${esc(t.name)}">` : ''}<div><h2>About us</h2>${para(t.about)}</div></div></section>` : ''}
 ${areasSection(t, profile, u, null)}
 ${faqSection(profile)}
 ${resourcesSection(profile, u)}
@@ -282,7 +427,7 @@ export function renderCityPage(t, products, profile, city, { platformBase, onDom
   const crumbs = { '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [{ '@type': 'ListItem', position: 1, name: t.name, item: u.abs('/') }, { '@type': 'ListItem', position: 2, name: place, item: canonical }] };
 
   return `${head(t, profile, { title, description, canonical, robots: cityIndexable(city) ? 'index,follow' : 'noindex,follow', image: t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : '', schemas: [business, service, crumbs] })}
-${topBar(t, u, img)}
+${topBar(t, u, img, profile, { current: 'areas', sections: sectionsOf(t, profile, services) })}
 
 <section class="hero"><div class="wrap">
   <div class="hero-l">
@@ -296,16 +441,16 @@ ${topBar(t, u, img)}
 </div></section>
 
 ${city.intro ? `<section class="s"><div class="wrap intro"><h2>Serving ${esc(city.name)}</h2>${para(city.intro)}</div></section>` : ''}
-${servicesSection(services)}
+${servicesSection(services, u)}
 ${credentialsSection(profile)}
 ${areasSection(t, profile, u, slug)}
 ${footer(t, profile, u)}`;
 }
 
 // Pages search engines should index for one business, as absolute URLs.
-export function sitePages(t, profile, platformBase) {
+export function sitePages(t, profile, platformBase, products) {
   const u = siteUrls(t, platformBase);
-  return [u.abs('/'), ...profile.cities.filter(cityIndexable).map((c) => u.abs('/areas/' + citySlug(c))), ...profile.resources.map((r) => u.abs('/files/' + r.file))];
+  return [u.abs('/'), ...profile.cities.filter(cityIndexable).map((c) => u.abs('/areas/' + citySlug(c))), ...(products || []).filter(hasPage).map((p) => u.abs('/services/' + serviceSlug(p))), ...profile.resources.map((r) => u.abs('/files/' + r.file))];
 }
 
 export function tenantSitemap(urls) {

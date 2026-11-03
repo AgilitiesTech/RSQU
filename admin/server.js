@@ -8,7 +8,7 @@ import { hashPassword, verifyPassword, sessions, randomToken, sha256 } from './s
 import { stripeClient, verifyStripeSignature } from './src/stripe.js';
 import * as customerTerms from './src/customer-terms.js';
 import { notifier } from './src/notify.js';
-import { renderSite, renderCityPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
+import { renderSite, renderCityPage, renderServicePage, serviceSlug, hasPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
 import * as siteProfile from './src/site-profile.js';
 import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
 import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
@@ -747,8 +747,8 @@ export function createApp(env = process.env) {
   route('POST', '/api/products', async (req, res, p, url, { tenant: t }) => {
     const b = await json(req);
     if (!clean(b.name)) throw new HttpError(400, 'Name is required.');
-    const r = db.prepare(`INSERT INTO products (tenant_id, name, description, price_cents, taxable, on_site, bookable) VALUES (?,?,?,?,?,?,?)`)
-      .run(t.id, clean(b.name, 200), clean(b.description, 1000), cents(b.price_cents), b.taxable ? 1 : 0, b.on_site ? 1 : 0, b.bookable ? 1 : 0);
+    const r = db.prepare(`INSERT INTO products (tenant_id, name, description, price_cents, taxable, on_site, bookable, details, sort) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(t.id, clean(b.name, 200), clean(b.description, 1000), cents(b.price_cents), b.taxable ? 1 : 0, b.on_site ? 1 : 0, b.bookable ? 1 : 0, clean(b.details, 8000), Math.max(-999, Math.min(999, Math.trunc(Number(b.sort) || 0))));
     send(res, 201, scoped('products', Number(r.lastInsertRowid), t.id));
   }, { auth: 'tenant' });
   route('PATCH', '/api/products/:id', async (req, res, p, url, { tenant: t }) => {
@@ -756,11 +756,22 @@ export function createApp(env = process.env) {
     const b = await json(req);
     const pick = (k, f) => (b[k] !== undefined ? f(b[k]) : cur[k]);
     const flag = (v) => (v ? 1 : 0);
-    db.prepare(`UPDATE products SET name = ?, description = ?, price_cents = ?, taxable = ?, active = ?, on_site = ?, bookable = ? WHERE id = ?`).run(
+    db.prepare(`UPDATE products SET name = ?, description = ?, price_cents = ?, taxable = ?, active = ?, on_site = ?, bookable = ?, details = ?, sort = ? WHERE id = ?`).run(
       pick('name', (v) => clean(v, 200) || cur.name), pick('description', (v) => clean(v, 1000)), pick('price_cents', cents),
-      pick('taxable', flag), pick('active', flag), pick('on_site', flag), pick('bookable', flag), cur.id);
+      pick('taxable', flag), pick('active', flag), pick('on_site', flag), pick('bookable', flag),
+      pick('details', (v) => clean(v, 8000)), pick('sort', (v) => Math.max(-999, Math.min(999, Math.trunc(Number(v) || 0)))), cur.id);
     send(res, 200, scoped('products', cur.id, t.id));
   }, { auth: 'tenant' });
+  // Picture for the service's tile on the website (bold look). Send image: null to remove it.
+  route('POST', '/api/products/:id/image', async (req, res, p, url, { tenant: t }) => {
+    const cur = scoped('products', p.id, t.id); if (!cur) throw new HttpError(404, 'Not found');
+    const b = await json(req, 6_000_000);
+    const name = b.image ? saveImage(b.image, `t${t.id}-prod`, 4_000_000) : null;
+    if (b.image && !name) throw new HttpError(400, 'Use a JPG, PNG or WebP image.');
+    db.prepare('UPDATE products SET image = ? WHERE id = ?').run(name, cur.id);
+    if (cur.image) try { fs.unlinkSync(path.join(uploads, path.basename(cur.image))); } catch { /* gone */ }
+    send(res, 200, scoped('products', cur.id, t.id));
+  }, { auth: 'owner' });
 
   // Quotes
   route('GET', '/api/quotes', async (req, res, p, url, { tenant: t }) => {
@@ -930,7 +941,8 @@ export function createApp(env = process.env) {
       site_url: u.abs('/'),
       city_urls: profile.cities.map((c) => u.abs('/areas/' + siteProfile.citySlug(c))),
       file_urls: Object.fromEntries(profile.resources.map((r) => [r.file, u.abs('/files/' + r.file)])),
-      limits: siteProfile.LIMITS, states: siteProfile.STATES, city_intro_min: siteProfile.CITY_INTRO_MIN,
+      limits: siteProfile.LIMITS, states: siteProfile.STATES, city_intro_min: siteProfile.CITY_INTRO_MIN, icons: siteProfile.HIGHLIGHT_ICONS,
+      banner_urls: { desktop: profile.banner.desktop ? `/media/${t.slug}/${profile.banner.desktop}` : '', mobile: profile.banner.mobile ? `/media/${t.slug}/${profile.banner.mobile}` : '' },
       business: { name: t.name, phone: t.phone, service_area: t.service_area },
     };
   }
@@ -973,6 +985,29 @@ export function createApp(env = process.env) {
     profile.resources = profile.resources.filter((x) => x.file !== r.file);
     db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(profile), t.id);
     try { fs.unlinkSync(path.join(uploads, path.basename(r.file))); } catch { /* already gone */ }
+    send(res, 200, websiteState(req, getTenant(t.id)));
+  }, { auth: 'owner' });
+
+  // Banner picture for the bold site look: a wide one, and optionally a tighter crop for phones.
+  route('POST', '/api/website/banner', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req, 12_000_000);
+    if (!['desktop', 'mobile'].includes(b.kind)) throw new HttpError(400, 'Unknown banner.');
+    const name = saveImage(b.image, `t${t.id}-site`, 6_000_000);
+    if (!name) throw new HttpError(400, 'Use a JPG, PNG or WebP image.');
+    const profile = siteProfile.parseProfile(getTenant(t.id).site_profile);
+    const old = profile.banner[b.kind];
+    profile.banner[b.kind] = name;
+    db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(profile), t.id);
+    if (old) try { fs.unlinkSync(path.join(uploads, path.basename(old))); } catch { /* gone */ }
+    send(res, 200, websiteState(req, getTenant(t.id)));
+  }, { auth: 'owner' });
+  route('DELETE', '/api/website/banner/:kind', async (req, res, p, url, { tenant: t }) => {
+    if (!['desktop', 'mobile'].includes(p.kind)) throw new HttpError(404, 'Not found');
+    const profile = siteProfile.parseProfile(getTenant(t.id).site_profile);
+    const old = profile.banner[p.kind];
+    profile.banner[p.kind] = '';
+    db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(profile), t.id);
+    if (old) try { fs.unlinkSync(path.join(uploads, path.basename(old))); } catch { /* gone */ }
     send(res, 200, websiteState(req, getTenant(t.id)));
   }, { auth: 'owner' });
 
@@ -1264,7 +1299,7 @@ export function createApp(env = process.env) {
     ...securityHeaders,
     'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob: https://i.ytimg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-src https://www.youtube-nocookie.com; form-action 'self'; frame-ancestors 'none'",
   };
-  const activeProducts = (t) => db.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY bookable DESC, price_cents DESC, name').all(t.id);
+  const activeProducts = (t) => db.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY sort, bookable DESC, price_cents DESC, name').all(t.id);
   const liveTenant = (t) => { if (!t || t.status !== 'active') throw new HttpError(404, 'Not found'); return t; };
   function serveSite(req, res, t, onDomain = false) {
     liveTenant(t);
@@ -1278,6 +1313,14 @@ export function createApp(env = process.env) {
     if (!city) throw new HttpError(404, 'Not found');
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
     res.end(renderCityPage(t, activeProducts(t), profile, city, { platformBase: baseUrl(req), onDomain }));
+  }
+  function serveService(req, res, t, slug, onDomain = false) {
+    liveTenant(t);
+    const products = activeProducts(t);
+    const product = products.find((x) => hasPage(x) && serviceSlug(x) === slug);
+    if (!product) throw new HttpError(404, 'Not found');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+    res.end(renderServicePage(t, products, siteProfile.parseProfile(t.site_profile), product, { platformBase: baseUrl(req), onDomain }));
   }
   // A PDF the business shares with customers (checklists, guides). Only files listed on its site.
   function serveResource(res, t, file) {
@@ -1391,13 +1434,13 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if (domainTenant && pathname === '/robots.txt') return send(res, 200, tenantRobots(`https://${domainTenant.custom_domain}`), { 'Cache-Control': 'public, max-age=3600' });
       if (domainTenant && pathname === '/sitemap.xml') {
         liveTenant(domainTenant);
-        return send(res, 200, tenantSitemap(sitePages(domainTenant, siteProfile.parseProfile(domainTenant.site_profile), baseUrl(req))), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+        return send(res, 200, tenantSitemap(sitePages(domainTenant, siteProfile.parseProfile(domainTenant.site_profile), baseUrl(req), activeProducts(domainTenant))), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
       }
       if (!domainTenant && pathname === '/robots.txt') return send(res, 200, robotsTxt(siteOrigin(req)), { 'Cache-Control': 'public, max-age=3600' });
       if (!domainTenant && pathname === '/sitemap.xml') {
         // Business sites hosted here (no domain of their own) are listed in the platform sitemap.
         const hosted = db.prepare(`SELECT * FROM tenants WHERE status = 'active' AND (custom_domain IS NULL OR custom_domain = '' OR domain_live_at IS NULL) ORDER BY id`).all()
-          .flatMap((t) => sitePages(t, siteProfile.parseProfile(t.site_profile), baseUrl(req)));
+          .flatMap((t) => sitePages(t, siteProfile.parseProfile(t.site_profile), baseUrl(req), activeProducts(t)));
         return send(res, 200, sitemapXml(siteOrigin(req), hosted), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
       }
       if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req), platformEmail), { 'Cache-Control': 'public, max-age=3600' });
@@ -1409,13 +1452,17 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if ((m = /^\/s\/([\w-]+)\/?$/.exec(pathname))) return serveSite(req, res, getTenantBySlug(m[1]));
       if ((m = /^\/s\/([\w-]+)\/areas\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveCity(req, res, getTenantBySlug(m[1]), m[2]);
       if (domainTenant && (m = /^\/areas\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveCity(req, res, domainTenant, m[1], true);
+      if ((m = /^\/s\/([\w-]+)\/services\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveService(req, res, getTenantBySlug(m[1]), m[2]);
+      if (domainTenant && (m = /^\/services\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveService(req, res, domainTenant, m[1], true);
       if ((m = /^\/s\/([\w-]+)\/files\/([\w-]+\.pdf)$/.exec(pathname))) return serveResource(res, getTenantBySlug(m[1]), m[2]);
       if (domainTenant && (m = /^\/files\/([\w-]+\.pdf)$/.exec(pathname))) return serveResource(res, domainTenant, m[1]);
       if ((m = /^\/s\/([\w-]+)\/terms\/?$/.exec(pathname))) return serveTerms(res, getTenantBySlug(m[1]), url);
       if (domainTenant && pathname === '/terms') return serveTerms(res, domainTenant, url);
       if ((m = /^\/media\/([\w-]+)\/([\w.-]+)$/.exec(pathname))) {
         const t = getTenantBySlug(m[1]);
-        if (!t || !m[2].startsWith(`t${t.id}-brand-`) || ![t.logo, t.owner_photo].includes(m[2])) throw new HttpError(404, 'Not found');
+        const B = t ? siteProfile.parseProfile(t.site_profile).banner : {};
+        const shown = t ? [t.logo, t.owner_photo, B.desktop, B.mobile, ...db.prepare('SELECT image FROM products WHERE tenant_id = ? AND image IS NOT NULL').all(t.id).map((r) => r.image)] : [];
+        if (!t || !m[2].startsWith(`t${t.id}-`) || !shown.includes(m[2])) throw new HttpError(404, 'Not found');
         return sendUpload(res, m[2]);
       }
       if ((m = /^\/legal\/(terms|privacy|payment-terms|customer-terms)$/.exec(pathname)) && serveFile(res, `legal/${m[1]}.html`)) return;

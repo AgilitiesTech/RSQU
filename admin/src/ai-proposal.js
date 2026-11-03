@@ -104,7 +104,7 @@ export function normalizeDraft(draft, products, hourlyRateCents) {
   const items = (Array.isArray(draft.line_items) ? draft.line_items : []).slice(0, 20).map((li) => {
     const qty = Math.min(100, Math.max(0.25, Math.round((Number(li?.quantity) || 1) * 4) / 4));
     const p = byId.get(Number(li?.product_id));
-    if (p) return { product_id: p.id, name: p.name, description: str(li.description, 300) || p.description || '', qty, unit_cents: p.price_cents, taxable: p.taxable ? 1 : 0, needs_price: false };
+    if (p) return { product_id: p.id, name: p.name, description: str(li.description, 300) || p.description || '', qty, unit_cents: p.price_cents, taxable: p.taxable ? 1 : 0, needs_price: !p.price_cents };
     const name = str(li?.name, 120);
     if (!name) return null;
     if (li?.is_labor && hourlyRateCents) return { product_id: null, name: 'Labor', description: str(li.description, 300) || 'Estimated hours; final hours may vary.', qty, unit_cents: hourlyRateCents, taxable: 0, needs_price: false, estimate: true };

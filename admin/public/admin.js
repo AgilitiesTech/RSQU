@@ -64,7 +64,7 @@
         const s = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement('canvas');
         c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
-        resolve(c.toDataURL(file.type === 'image/png' ? 'image/png' : 'image/jpeg', 0.85));
+        resolve(c.toDataURL(/^image\/(png|webp)$/.test(file.type) ? 'image/png' : 'image/jpeg', 0.85)); // keep transparency
       };
       img.onerror = () => resolve(null);
       img.src = url;
@@ -623,7 +623,7 @@
   async function productsView() {
     setNav('products');
     const rows = await api('/api/products');
-    const flags = (p) => `${p.active ? '' : '<span class="tag void">Hidden</span>'} ${p.on_site ? '<span class="tag">On website</span>' : ''} ${p.bookable ? '<span class="tag winterize">Bookable</span>' : ''} ${p.taxable ? '<span class="tag">Taxable</span>' : ''}`;
+    const flags = (p) => `${p.active ? '' : '<span class="tag void">Hidden</span>'} ${p.on_site ? '<span class="tag">On website</span>' : ''} ${p.bookable ? '<span class="tag winterize">Bookable</span>' : ''} ${p.taxable ? '<span class="tag">Taxable</span>' : ''} ${p.image ? '<span class="tag">Tile picture</span>' : ''} ${p.details && p.on_site ? '<span class="tag">Own page</span>' : ''}`;
     view.innerHTML = `
       <h1>Products and services</h1>
       <p class="muted">These show up when you build a quote. Turn on “Show on website” to list one on your site, and “Customers can book it” for fixed-price packages.</p>
@@ -662,12 +662,29 @@
         <div><label for="e-p${p.id}">Price ($)</label><input id="e-p${p.id}" name="price" inputmode="decimal" value="${dollars(p.price_cents)}"></div></div>
         <div><label for="e-d${p.id}">Description</label><input id="e-d${p.id}" name="description" value="${esc(p.description || '')}"></div>
         <div class="row">${ck('taxable', 'Taxable')}${ck('on_site', 'Show on website')}${ck('bookable', 'Customers can book it')}${ck('active', 'Available in quotes')}</div>
+        <details ${p.details || p.image ? 'open' : ''}><summary class="small" style="cursor:pointer;min-height:44px;display:flex;align-items:center">Website extras: tile picture, order, its own page</summary>
+          <div class="stack" style="margin-top:8px">
+            <div class="row" style="align-items:center">${p.image ? `<img src="/media/${esc(me.tenant.slug)}/${esc(p.image)}" alt="" style="width:88px;height:88px;object-fit:contain;background:#1B1C1F;border-radius:8px">` : ''}
+              <button class="btn sm" type="button" data-img-pick>${p.image ? 'Replace tile picture' : 'Add tile picture'}</button>${p.image ? '<button class="btn ghost sm" type="button" data-img-rm>Remove picture</button>' : ''}<input type="file" accept="image/*" hidden data-img-file></div>
+            <p class="small muted">Square pictures work best. They show as tiles under the banner in the Bold look.</p>
+            <div style="max-width:200px"><label for="e-s${p.id}">Order on website</label><input id="e-s${p.id}" name="sort" inputmode="numeric" value="${p.sort || 0}"><p class="small muted">Lower numbers show first.</p></div>
+            <div><label for="e-x${p.id}">Write-up for its own page (optional)</label><textarea id="e-x${p.id}" name="details" rows="6" maxlength="8000" placeholder="What’s included, common problems you fix, what to expect. Start a line with “- ” for a bullet or “## ” for a heading.">${esc(p.details || '')}</textarea>
+            <p class="small muted">With a write-up and “Show on website” on, this service gets its own page that Google can find.</p></div>
+          </div></details>
         <div class="row"><button class="btn primary sm" type="submit">Save</button><button class="btn ghost sm" type="button" data-cancel>Cancel</button></div></form>`;
+      const pickBtn = box.querySelector('[data-img-pick]'), fileIn = box.querySelector('[data-img-file]'), rmBtn = box.querySelector('[data-img-rm]');
+      pickBtn.addEventListener('click', () => fileIn.click());
+      fileIn.addEventListener('change', async () => {
+        const image = await readImage(fileIn.files[0], 600);
+        if (!image) return;
+        try { await api(`/api/products/${p.id}/image`, { method: 'POST', body: { image } }); productsView(); } catch (err) { alert(err.message); }
+      });
+      if (rmBtn) rmBtn.addEventListener('click', async () => { try { await api(`/api/products/${p.id}/image`, { method: 'POST', body: { image: null } }); productsView(); } catch (err) { alert(err.message); } });
       const ef = box.querySelector('form'), x = ef.elements;
       ef.querySelector('[data-cancel]').addEventListener('click', productsView);
       ef.addEventListener('submit', async (e) => {
         e.preventDefault();
-        await api('/api/products/' + p.id, { method: 'PATCH', body: { name: x.name.value, description: x.description.value, price_cents: toCents(x.price.value), taxable: x.taxable.checked, on_site: x.on_site.checked, bookable: x.bookable.checked, active: x.active.checked } });
+        await api('/api/products/' + p.id, { method: 'PATCH', body: { name: x.name.value, description: x.description.value, price_cents: toCents(x.price.value), taxable: x.taxable.checked, on_site: x.on_site.checked, bookable: x.bookable.checked, active: x.active.checked, sort: Number(x.sort.value) || 0, details: x.details.value } });
         productsView();
       });
     }));
@@ -780,6 +797,7 @@
       },
       cred: (c = {}) => `<div class="grid2" data-row="credentials" style="align-items:end"><div><label>Certification or credential</label><input data-f="title" data-k="title" maxlength="120" value="${esc(c.title)}" placeholder="RVTI Certified Technician, Level 2"></div><div><label>Details (optional)</label><input data-f="detail" maxlength="300" value="${esc(c.detail)}" placeholder="Since 2015 · NRVTA graduate"></div><div>${rm}</div></div>`,
       faq: (f = {}) => `<div class="stack" data-row="faqs" style="border-bottom:1px solid var(--line);padding-bottom:12px"><div><label>Question</label><input data-f="q" maxlength="200" value="${esc(f.q)}" placeholder="Do you come to campgrounds?"></div><div><label>Answer</label><textarea data-f="a" rows="2" maxlength="1500">${esc(f.a)}</textarea></div><div>${rm}</div></div>`,
+      hl: (h = {}) => `<div class="grid2" data-row="highlights" style="align-items:end;grid-template-columns:repeat(auto-fit,minmax(min(160px,100%),1fr))"><div><label>Icon</label><select data-f="icon">${st.icons.map((k) => `<option value="${k}" ${h.icon === k ? 'selected' : ''}>${({ tools: 'Tools', shield: 'Shield', gear: 'Gear', pin: 'Map pin', clock: 'Clock', star: 'Star', phone: 'Phone', truck: 'Truck' })[k]}</option>`).join('')}</select></div><div><label>Title</label><input data-f="title" data-k="title" maxlength="40" value="${esc(h.title)}" placeholder="On-site service"></div><div><label>Line under it</label><input data-f="text" maxlength="80" value="${esc(h.text)}" placeholder="At your location"></div><div>${rm}</div></div>`,
       video: (v = {}) => `<div class="grid2" data-row="videos" style="align-items:end"><div><label>YouTube link</label><input data-f="url" data-k="url" maxlength="300" value="${v.id ? 'https://youtu.be/' + esc(v.id) : ''}" placeholder="https://youtu.be/…"></div><div><label>Title</label><input data-f="title" maxlength="120" value="${esc(v.title)}" placeholder="Water heater repair at a campground"></div><div>${rm}</div></div>`,
     };
     const hoursRow = ([k, label]) => {
@@ -801,6 +819,21 @@
         <div><a class="btn ghost" href="${esc(st.site_url)}" target="_blank" rel="noopener">View your website</a></div>
       </section>
       <form class="stack" id="wf"><fieldset ${owner ? '' : 'disabled'} style="border:0;padding:0;margin:0" class="stack">
+        <section class="card stack">
+          <h2>Look</h2>
+          <div class="row" role="radiogroup" aria-label="Site look">
+            <label class="check"><input type="radio" name="theme" value="classic" ${P.theme !== 'bold' ? 'checked' : ''}> <span><strong>Classic</strong><br><span class="small muted">Light, with the request form beside your headline.</span></span></label>
+            <label class="check"><input type="radio" name="theme" value="bold" ${P.theme === 'bold' ? 'checked' : ''}> <span><strong>Bold</strong><br><span class="small muted">Dark menu bar, a big banner picture, service tiles with pictures, and a highlights bar.</span></span></label>
+          </div>
+          <h3>Banner picture (Bold look)</h3>
+          <p class="small muted">A wide picture across the top, about 1536 × 515 pixels. Add a tighter, squarer crop for phones if the wide one gets too small.</p>
+          <div id="banner"></div>
+          <div><label for="w-balt">Describe the banner for people who can’t see it</label><input id="w-balt" maxlength="200" value="${esc(P.banner.alt)}" placeholder="${esc(st.business.name)} logo over an RV in the mountains"></div>
+          <h3>Highlights bar (Bold look)</h3>
+          <p class="small muted">Up to 4 short selling points under the service tiles. Service tile pictures are set on each product in <a href="#/products">Products</a>.</p>
+          <div class="stack" id="hls">${P.highlights.map((h) => rows.hl(h)).join('')}</div>
+          <div><button class="btn ghost" type="button" data-add="hl">+ Add a highlight</button></div>
+        </section>
         <section class="card stack">
           <h2>Where you work</h2>
           <div><label for="w-phrase">What you do, in the words customers search</label><input id="w-phrase" data-k="service_phrase" maxlength="60" value="${esc(P.service_phrase)}" placeholder="Mobile RV repair"><p class="small muted">Used in page titles, like “Mobile RV repair in Ogden, UT”.</p></div>
@@ -866,7 +899,7 @@
       if (inp && /^(INPUT|SELECT|TEXTAREA)$/.test(inp.tagName)) { if (!inp.id) inp.id = 'wf-' + (++uid); l.htmlFor = inp.id; }
     });
     linkLabels(view);
-    const lists = { city: 'cities', cred: 'creds', faq: 'faqs', video: 'videos' };
+    const lists = { city: 'cities', cred: 'creds', faq: 'faqs', video: 'videos', hl: 'hls' };
     const countCity = (row) => {
       const n = row.querySelector('[data-f=intro]').value.trim().length;
       row.querySelector('[data-count]').textContent = n >= st.city_intro_min ? `${n} characters. Offered to Google.` : `${n} of ${st.city_intro_min} characters. Not offered to Google yet.`;
@@ -879,6 +912,26 @@
       linkLabels(box);
     };
     renderDocs(P.resources, st.file_urls);
+    // Banner uploads redraw only this box, so unsaved edits elsewhere stay put.
+    const renderBanner = (urls) => {
+      const box = document.getElementById('banner');
+      const one = (kind, label) => `<div class="stack" style="gap:6px"><strong>${label}</strong>${urls[kind] ? `<img src="${esc(urls[kind])}" alt="" style="max-width:100%;max-height:160px;object-fit:contain;border-radius:6px;background:#111">` : '<p class="small muted">None yet.</p>'}
+        ${owner ? `<div class="row"><button class="btn sm" type="button" data-bpick="${kind}">${urls[kind] ? 'Replace' : 'Upload'}</button>${urls[kind] ? `<button class="btn ghost sm" type="button" data-bdel="${kind}">Remove</button>` : ''}<input type="file" accept="image/*" hidden data-bfile="${kind}"></div>` : ''}</div>`;
+      box.innerHTML = `<div class="grid2">${one('desktop', 'Wide (computers)')}${one('mobile', 'Phones (optional)')}</div><p class="alert" id="b-msg" hidden></p>`;
+    };
+    renderBanner(st.banner_urls);
+    document.getElementById('banner').addEventListener('click', async (e) => {
+      const pick = e.target.closest('[data-bpick]'); const del = e.target.closest('[data-bdel]');
+      if (pick) document.querySelector(`[data-bfile="${pick.dataset.bpick}"]`).click();
+      if (del) { try { const ns = await api('/api/website/banner/' + del.dataset.bdel, { method: 'DELETE' }); renderBanner(ns.banner_urls); } catch (err) { flash(document.getElementById('b-msg'), err.message, 'err'); } }
+    });
+    document.getElementById('banner').addEventListener('change', async (e) => {
+      const inp = e.target.closest('[data-bfile]'); if (!inp || !inp.files[0]) return;
+      const image = await readImage(inp.files[0], inp.dataset.bfile === 'desktop' ? 2400 : 1200);
+      if (!image) return flash(document.getElementById('b-msg'), 'Use a JPG, PNG or WebP image.', 'err');
+      try { const ns = await api('/api/website/banner', { method: 'POST', body: { kind: inp.dataset.bfile, image } }); renderBanner(ns.banner_urls); }
+      catch (err) { flash(document.getElementById('b-msg'), err.message, 'err'); }
+    });
     view.querySelectorAll('[data-row=cities]').forEach(countCity);
     f.addEventListener('input', (e) => { const r = e.target.closest('[data-row=cities]'); if (r) countCity(r); });
     f.addEventListener('click', async (e) => {
@@ -904,7 +957,8 @@
       view.querySelectorAll('[data-day]').forEach((d) => { if (!d.querySelector('[data-closed]').checked) days[d.dataset.day] = { open: d.querySelector('[data-open]').value, close: d.querySelector('[data-close]').value }; });
       const body = {
         service_phrase: document.getElementById('w-phrase').value, base_city: document.getElementById('w-city').value, base_state: document.getElementById('w-state').value, radius_miles: document.getElementById('w-radius').value.trim(),
-        cities: collect('cities'), credentials: collect('credentials'), faqs: collect('faqs'), videos: collect('videos'),
+        cities: collect('cities'), credentials: collect('credentials'), faqs: collect('faqs'), videos: collect('videos'), highlights: collect('highlights'),
+        theme: (view.querySelector('input[name=theme]:checked') || {}).value || 'classic', banner: { alt: document.getElementById('w-balt').value },
         hours: { always_open: document.getElementById('w-247').checked, note: document.getElementById('w-hnote').value, days },
         links: Object.fromEntries([...view.querySelectorAll('[data-link]')].map((i) => [i.dataset.link, i.value])),
         search_console: document.getElementById('w-sc').value,
@@ -914,7 +968,7 @@
       catch (err) {
         const fe = err.data && err.data.field_errors;
         if (!fe) return flash(msg, err.message, 'err');
-        const names = { cities: 'City', credentials: 'Credential', faqs: 'Question', videos: 'Video' };
+        const names = { cities: 'City', credentials: 'Credential', faqs: 'Question', videos: 'Video', highlights: 'Highlight' };
         const lines = Object.entries(fe).map(([k, v]) => {
           const [sec, idx, field] = k.split('.');
           if (names[sec] && /^\d+$/.test(idx || '')) {

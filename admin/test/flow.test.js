@@ -760,6 +760,51 @@ test('photo quote: AI draft from the price list, photos on the proposal, consent
   assert.equal((await anon('GET', '/r/nope')).status, 404);
 });
 
+test('bold look: banner, service tiles, highlights, service pages', async () => {
+  const st = (await mike('GET', '/api/website')).json;
+  assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);
+  const look = await mike('PUT', '/api/website', { ...st.profile, theme: 'bold', banner: { alt: 'Mike’s banner' }, highlights: [{ icon: 'tools', title: 'On-site service', text: 'At your location' }, { icon: 'nope', title: 'Reliable repairs', text: '' }, { title: '', text: 'no title' }] });
+  assert.equal(look.status, 422);
+  assert.ok(look.json.field_errors['highlights.2.title']);
+  const ok = await mike('PUT', '/api/website', { ...st.profile, theme: 'bold', banner: { alt: 'Mike’s banner' }, highlights: [{ icon: 'tools', title: 'On-site service', text: 'At your location' }, { icon: 'nope', title: 'Reliable repairs', text: '' }] });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.profile.highlights[1].icon, 'star');
+  assert.equal((await other('POST', '/api/website/banner', { kind: 'desktop', image: PNG })).status, 200); // other business, own banner
+  const banner = await mike('POST', '/api/website/banner', { kind: 'desktop', image: PNG });
+  assert.equal(banner.status, 200);
+  assert.equal((await mike('POST', '/api/website/banner', { kind: 'side', image: PNG })).status, 400);
+  assert.equal((await fetch(base + banner.json.banner_urls.desktop)).status, 200);
+
+  const products = (await mike('GET', '/api/products')).json;
+  const svc = products.find((p) => p.on_site) || products[0];
+  await mike('PATCH', `/api/products/${svc.id}`, { on_site: true, sort: -5, details: '## What’s included\n- Every step\n- Antifreeze\n\nCall to book.' });
+  const pic = await mike('POST', `/api/products/${svc.id}/image`, { image: PNG });
+  assert.equal(pic.status, 200);
+  assert.match(pic.json.image, /^t\d+-prod-/);
+  assert.equal((await other('POST', `/api/products/${svc.id}/image`, { image: PNG })).status, 404);
+
+  const home = await anon('GET', `/s/${mikeSlug}`);
+  assert.match(home.text, /<body class="bold">/);
+  assert.match(home.text, /class="bnav"/);
+  assert.match(home.text, new RegExp(`<img src="${banner.json.banner_urls.desktop}" alt="Mike’s banner"`));
+  assert.match(home.text, new RegExp(`/media/${mikeSlug}/${pic.json.image}`));
+  assert.match(home.text, /On-site service/);
+  assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 200);
+  const slug = svc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  assert.match(home.text, new RegExp(`/s/${mikeSlug}/services/${slug}`));
+  const page = await anon('GET', `/s/${mikeSlug}/services/${slug}`);
+  assert.equal(page.status, 200);
+  assert.match(page.text, /<h2>What’s included<\/h2>/);
+  assert.match(page.text, /<li>Antifreeze<\/li>/);
+  assert.match(page.text, /"@type":"Service"/);
+  assert.equal((await anon('GET', `/s/${mikeSlug}/services/not-a-service`)).status, 404);
+  assert.match((await viaHost('www.mikesrv.test', '/sitemap.xml')).text, new RegExp(`/services/${slug}`));
+  // Removing the picture stops serving it
+  await mike('POST', `/api/products/${svc.id}/image`, { image: null });
+  assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 404);
+  await mike('PUT', '/api/website', { ...ok.json.profile, theme: 'classic' });
+});
+
 test('static pages, legal pages and seed script', async () => {
   const home = await anon('GET', '/');
   assert.equal(home.status, 200);
@@ -778,5 +823,22 @@ test('static pages, legal pages and seed script', async () => {
   const seedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsqu-seed-'));
   const out = execFileSync(process.execPath, ['--no-warnings', 'scripts/seed-mike.js', 'mike@seed.test'], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir, BASE_URL: 'https://dash.test' } }).toString();
   assert.match(out, /https:\/\/dash\.test\/admin\/#\/reset\//);
+  // Moving Mike's RSQU site onto HitchPoint: twice, to prove it's safe to re-run
+  for (let i = 0; i < 2; i++) {
+    const applied = execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-site.js'], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
+    assert.match(applied, /Done\. 11 cities, 9 services \(7 with tile pictures\), 5 files/);
+  }
+  const { handler: h2 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
+  const srv2 = http.createServer(h2); await new Promise((r) => srv2.listen(0, r));
+  const b2 = `http://localhost:${srv2.address().port}`;
+  const rsqu = await (await fetch(b2 + '/s/mike-stevens')).text();
+  assert.match(rsqu, /<body class="bold">/);
+  assert.match(rsqu, /RSQU Mobile RV Service/);
+  assert.equal([...rsqu.matchAll(/class="tile-grid"[\s\S]*?<\/ul>/g)][0][0].match(/<img /g).length, 7);
+  const winter = await fetch(b2 + '/s/mike-stevens/services/onsite-rv-winterizing-package');
+  assert.equal(winter.status, 200);
+  assert.match(await winter.text(), /The 12-step winterizing checklist/);
+  assert.equal(fs.readdirSync(path.join(seedDir, 'uploads')).length, 15); // photo, 2 banners, 7 tiles, 5 PDFs: nothing left over
+  srv2.close();
   fs.rmSync(seedDir, { recursive: true, force: true });
 });

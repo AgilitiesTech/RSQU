@@ -86,6 +86,9 @@ A business can serve its hosted site from its own domain: it adds a CNAME pointi
   - City pages are offered to search engines (`index`, and listed in the sitemap) only once the owner writes at least 120 characters about that city, so they aren't near-duplicate doorway pages. Until then they're `noindex`.
   - Sitemaps: a business on its own domain gets `/sitemap.xml` and `/robots.txt` there; businesses hosted at `/s/<slug>` are listed in the platform sitemap.
   - Videos show a preview image and load YouTube's privacy-enhanced player only when a visitor presses play; the site's Content-Security-Policy allows just `i.ytimg.com` and `www.youtube-nocookie.com` for this.
+- **Site looks:** under Website sections → Look. **Classic** (light) or **Bold** (dark menu bar, a full-width banner picture with an optional phone crop, service tiles from products that have a tile picture, a highlights bar of up to 4 items, and the request form on dark).
+  - Products can also have an order on the website and a write-up. A product with a write-up that's shown on the website gets its own page at `/services/<name>`, with `Service` markup, and is listed in the sitemap.
+  - `node scripts/apply-rsqu-site.js [slug]` moves Mike's RSQU Mobile RV Service site onto his hosted site in the Bold look, using the files in `seed/rsqu/`. It's safe to re-run.
 - **Quote from photos** (Quotes → From photos, or on a request): take up to 4 photos and add a note. With `ANTHROPIC_API_KEY` set, Claude drafts the proposal:
   - The title, a plain-language summary for the customer, and lines from the business's own price list.
   - Anything not on the price list comes in at $0, flagged "Set a price". Labor uses the hourly rate from Customer Terms details.
