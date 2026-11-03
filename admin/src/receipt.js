@@ -1,9 +1,11 @@
 // Customer-facing receipt and email-unsubscribe pages, plus the consent wording shown when a customer
 // signs a proposal. The exact wording is stored with each consent.
+import { tzOf, reviewLink } from './owner-features.js';
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hex = (c, d) => (/^#[0-9a-fA-F]{6}$/.test(c || '') ? c : d);
 export const money = (c) => '$' + (Number(c || 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const day = (s) => (s ? new Date(String(s).replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/Denver' }) : '');
+// Dates in the business's own time zone (Business page).
+const day = (s, tz) => (s ? new Date(String(s).replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: tz }) : '');
 const METHOD = { card: 'Card or bank (online)', cash: 'Cash', check: 'Check', other: 'Other' };
 
 export const consentText = {
@@ -34,6 +36,8 @@ a{color:${p}}
 }
 
 export function renderReceipt({ t, pay, quote, items, totals, proposalUrl }) {
+  // Only for completed work (not a deposit), and only when the business asks for reviews.
+  const review = pay.kind === 'quote' ? reviewLink(t) : '';
   const rows = quote && items.length
     ? `<table><thead><tr><th>Work and parts</th><th class="num">Amount</th></tr></thead><tbody>
       ${items.map((it) => `<tr><td>${esc(it.name)}${Number(it.qty) !== 1 ? ` <span class="muted">× ${Number(it.qty)}</span>` : ''}</td><td class="num">${money(Math.round(it.qty * it.unit_cents))}</td></tr>`).join('')}
@@ -45,13 +49,14 @@ export function renderReceipt({ t, pay, quote, items, totals, proposalUrl }) {
   <div class="card" style="display:grid;gap:10px">
     <span class="paid">Paid</span>
     <h1>Receipt ${money(pay.amount_cents)}</h1>
-    <dl><dt>Receipt</dt><dd>#${pay.id}</dd><dt>Date</dt><dd>${day(pay.paid_at)}</dd><dt>Paid by</dt><dd>${esc(METHOD[pay.method] || pay.method)}</dd>${quote ? `<dt>For</dt><dd>${esc(quote.title)} (proposal #${quote.id})</dd>` : ''}</dl>
+    <dl><dt>Receipt</dt><dd>#${pay.id}</dd><dt>Date</dt><dd>${day(pay.paid_at, tzOf(t))}</dd><dt>Paid by</dt><dd>${esc(METHOD[pay.method] || pay.method)}</dd>${quote ? `<dt>For</dt><dd>${esc(quote.title)} (${quote.kind === 'invoice' ? 'invoice' : 'proposal'} #${quote.id})</dd>` : ''}</dl>
   </div>
   <div class="card">${rows}</div>
+  ${review ? `<div class="card" style="display:grid;gap:10px"><h2>Happy with the work? Leave us a Google review.</h2><p>It takes a minute and helps other customers find ${esc(t.name)}.</p><p><a class="btn" href="${esc(review)}" target="_blank" rel="noopener">Leave a Google review</a></p></div>` : ''}
   <div class="card" style="display:grid;gap:8px">
     <h2>Questions about this job?</h2>
     <p>${t.phone ? `Call or text ${esc(t.name)} at <a href="tel:${esc(String(t.phone).replace(/[^\d+]/g, ''))}">${esc(t.phone)}</a>` : `Contact ${esc(t.name)}`}${t.email ? ` or email <a href="mailto:${esc(t.email)}">${esc(t.email)}</a>` : ''}.</p>
-    ${proposalUrl ? `<p><a href="${esc(proposalUrl)}">View the signed proposal</a></p>` : ''}
+    ${proposalUrl ? `<p><a href="${esc(proposalUrl)}">${quote && quote.kind === 'invoice' ? 'View the invoice' : 'View the signed proposal'}</a></p>` : ''}
     <p class="muted">${esc(t.name)} is the seller for this job. Card payments are processed by Stripe.</p>
   </div>`);
 }

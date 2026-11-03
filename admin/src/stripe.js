@@ -37,7 +37,7 @@ export function stripeClient(env) {
     if (account) headers['Stripe-Account'] = account;
     const res = await fetch(base + pathname, { method, headers, body: body ? form(body).toString() : undefined });
     const json = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(json?.error?.message || `Stripe error ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(json?.error?.message || `Stripe error ${res.status}`), { status: res.status });
     return json;
   }
 
@@ -131,7 +131,8 @@ export function stripeClient(env) {
 
     // Direct charge: the Checkout Session is created ON the business's account (Stripe-Account),
     // so the business is the merchant of record and Checkout shows its branding. The platform's
-    // share is collected as an application fee.
+    // share is collected as an application fee. No payment_method_types: Checkout offers whatever
+    // the business turned on in its Stripe Dashboard (cards, ACH, Affirm, Klarna, ...).
     createCheckout({ account, name, amountCents, applicationFeeCents, successUrl, cancelUrl, ref, email, statementName, metadata = {} }) {
       return call('POST', '/v1/checkout/sessions', {
         mode: 'payment',
@@ -153,6 +154,10 @@ export function stripeClient(env) {
     // for direct charges; omit it for legacy platform charges.
     retrieveCheckout(id, account) {
       return call('GET', `/v1/checkout/sessions/${encodeURIComponent(id)}?expand[]=payment_intent.latest_charge.balance_transaction`, null, { account });
+    },
+    // Closes an open Checkout so it can't be paid. Stripe refuses if it isn't open (already paid or expired).
+    expireCheckout(id, account) {
+      return call('POST', `/v1/checkout/sessions/${encodeURIComponent(id)}/expire`, {}, { account });
     },
     // LEGACY: pays out a platform charge taken under the old model.
     createTransfer({ amountCents, destination, sourceTransaction, group, ref }) {
