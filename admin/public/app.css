@@ -146,3 +146,6 @@ code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background:
 
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 [aria-invalid="true"] { border-color: var(--red) !important; box-shadow: 0 0 0 2px rgba(176, 20, 28, .2); }
+
+/* Stripe not connected yet: a banner on every page (the dashboard still works) */
+.setup-banner { background: #FFF4E5; color: #5A3B00; border-bottom: 1px solid #F0C98B; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: center; padding: 8px max(16px, env(safe-area-inset-left, 0px)); font-weight: 600; text-align: center; }
