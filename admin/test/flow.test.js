@@ -1120,6 +1120,72 @@ test('calendar feed: a private link per person, valid VCALENDAR, owners see all,
   await superA('POST', '/api/super/view-as', { tenant_id: 0 });
 });
 
+test('quick invoices: no signature, the customer accepts the terms by paying, receipt sent, cash works too', async () => {
+  const inv = (await mike('POST', '/api/invoices', {})).json;
+  assert.deepEqual([inv.kind, inv.title, inv.tax_rate_bp], ['invoice', 'Invoice', 725]);
+  assert.equal((await other('GET', `/api/quotes/${inv.id}`)).status, 404);
+  const saved = await mike('PUT', `/api/quotes/${inv.id}`, { title: 'Furnace repair', customer_name: 'Ivy Payne', customer_phone: '801-555-0180', customer_email: '', rig: '', notes: 'Replaced the igniter.', terms: '', tax_rate_bp: 725, items: [{ name: 'Igniter', qty: 1, unit_cents: 4000, taxable: 1 }, { name: 'Labor', qty: 1, unit_cents: 12000 }] });
+  assert.deepEqual(saved.json.totals, { subtotal: 16000, tax: 290, total: 16290, credit: 0, balance: 16290 });
+  assert.ok((await mike('GET', '/api/quotes')).json.some((q) => q.id === inv.id && q.kind === 'invoice'));
+
+  const pub = (await anon('GET', `/api/public/proposals/${inv.token}`)).json;
+  assert.equal(pub.kind, 'invoice');
+  assert.equal(pub.customer_terms.version, 1);
+  assert.equal(pub.online.card_payments, true);
+  const pay = (body) => anon('POST', `/api/public/invoices/${inv.token}/checkout`, body);
+  assert.equal((await pay({})).status, 409, 'must be shown the current terms');
+  assert.equal((await pay({ terms_version: 99 })).status, 409);
+  assert.equal((await pay({ terms_version: 1, email: 'nope' })).status, 400);
+  assert.equal((await pay({ terms_version: 1, phone: '', subscribe_sms: true })).status, 400);
+  assert.equal((await anon('POST', `/api/public/invoices/${saved.json.token.replace(/.$/, '')}x/checkout`, { terms_version: 1 })).status, 404);
+  const proposal = (await mike('POST', '/api/quotes', {})).json;
+  assert.equal((await anon('POST', `/api/public/invoices/${proposal.token}/checkout`, { terms_version: 1 })).status, 404, 'proposals still need a signature');
+
+  const co = await pay({ terms_version: 1, phone: '801-555-0180', email: 'Ivy@Example.test', subscribe_email: true, subscribe_sms: false });
+  assert.equal(co.status, 200, JSON.stringify(co.json));
+  const sess = [...sessions.values()].find((x) => x.lines[0]?.name === `Furnace repair (#${inv.id})`);
+  assert.equal(sess.account, mikeAcct, 'paid to the business’s own Stripe account');
+  assert.deepEqual([sess.amount_total, sess.terms_version, sess.pi_terms_version], [16290, '1', '1']);
+  const row = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  assert.equal(row.customer_terms_version, 1, 'the terms version accepted by paying is recorded');
+  const ivy = appDb.prepare(`SELECT * FROM customers WHERE email = 'ivy@example.test'`).get();
+  assert.ok(ivy && ivy.email_opt_in === 1 && ivy.sms_opt_in === 0 && ivy.source === `Invoice #${inv.id}`);
+  assert.equal((await pay({ terms_version: 1, phone: '801-555-0180', email: 'ivy@example.test', subscribe_email: true })).status, 200, 'trying again reuses the payment');
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE quote_id = ?`).get(inv.id).n, 1);
+
+  const mark = outbox.length;
+  const latest = sessions.get(appDb.prepare('SELECT stripe_session_id FROM payments WHERE id = ?').get(row.id).stripe_session_id); // the second try's checkout
+  latest.payment_status = 'paid';
+  assert.equal((await anon('POST', `/api/public/payments/${row.token}/confirm`, { session_id: latest.id })).json.paid, true);
+  await new Promise((r) => setTimeout(r, 30));
+  const done = (await mike('GET', `/api/quotes/${inv.id}`)).json;
+  assert.equal(done.status, 'paid');
+  assert.equal(done.signed_at, null, 'never signed');
+  assert.equal(done.payments[0].transfer_status, 'direct');
+  const mail = sentTo('ivy@example.test', mark);
+  assert.equal(mail.length, 1);
+  assert.match(mail[0].text, /payment of \$162\.90 for Furnace repair/);
+  assert.match(sentTo('+18015550180', mark)[0].body, /Thanks, Ivy! We received your payment of \$162\.90/);
+  const receipt = (await anon('GET', `/r/${row.token}`)).text;
+  assert.match(receipt, new RegExp(`Furnace repair \\(invoice #${inv.id}\\)`));
+  assert.match(receipt, /Sales tax/);
+  assert.match(receipt, /View the invoice/);
+  assert.equal(reviewRows(row.id).length, 1, 'review request by email: Ivy agreed to emails, not texts');
+  assert.equal((await pay({ terms_version: 1 })).status, 409, 'already paid');
+
+  // Cash or check works the same, without a signature.
+  const cash = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${cash.id}`, { title: 'Battery swap', customer_name: 'Cal Cash', customer_phone: '801-555-0181', customer_email: 'cal@example.test', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Battery', qty: 1, unit_cents: 18900 }] });
+  const paid = await mike('POST', `/api/quotes/${cash.id}/payments`, { method: 'check' });
+  assert.equal(paid.json.status, 'paid');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(sentTo('cal@example.test', mark).length, 1, 'receipt email');
+  // An invoice from a request picks up the paid deposit, and other businesses can't use Mike's request.
+  const rid = (await mike('GET', '/api/requests?filter=all')).json.rows.find((r) => r.name === 'Dana').id;
+  assert.equal((await mike('POST', '/api/invoices', { request_id: rid })).json.deposit_credit_cents, 12900);
+  assert.equal((await other('POST', '/api/invoices', { request_id: rid })).json.request_id, null);
+});
+
 test('bold look: banner, service tiles, highlights, service pages', async () => {
   const st = (await mike('GET', '/api/website')).json;
   assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);

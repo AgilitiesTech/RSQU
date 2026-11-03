@@ -377,13 +377,14 @@
     setNav('quotes');
     const rows = await api('/api/quotes');
     view.innerHTML = `
-      <div class="row between"><h1>Quotes</h1><div class="row"><a class="btn ghost sm" href="#/customers">Customers</a><a class="btn sm" href="#/quotes/photo">+ From photos</a><button class="btn primary sm" id="q-new" type="button">+ New quote</button></div></div>
+      <div class="row between"><h1>Quotes</h1><div class="row"><a class="btn ghost sm" href="#/customers">Customers</a><a class="btn sm" href="#/quotes/photo">+ From photos</a><button class="btn sm" id="q-inv" type="button">+ New invoice</button><button class="btn primary sm" id="q-new" type="button">+ New quote</button></div></div>
       <div class="list">${rows.length ? rows.map((q) => `
         <a class="item" href="#/quotes/${q.id}">
-          <div class="grow"><div class="item-title">${esc(q.customer_name || 'No name')}</div><div class="small muted">${esc(q.title)} · #${q.id} · ${when(q.created_at)}</div></div>
+          <div class="grow"><div class="item-title">${esc(q.customer_name || 'No name')}</div><div class="small muted">${q.kind === 'invoice' ? '<span class="tag">Invoice</span> ' : ''}${esc(q.title)} · #${q.id} · ${when(q.created_at)}</div></div>
           <div class="stack" style="gap:4px;align-items:flex-end"><strong>${money(q.totals.total)}</strong><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
         </a>`).join('') : '<p class="empty">No quotes yet. Tap “From photos” to snap the problem and get a draft, or open a request and tap “Build a quote”.</p>'}</div>`;
     document.getElementById('q-new').addEventListener('click', async () => { const q = await api('/api/quotes', { method: 'POST', body: {} }); location.hash = '#/quotes/' + q.id; });
+    document.getElementById('q-inv').addEventListener('click', async () => { const q = await api('/api/invoices', { method: 'POST', body: {} }); location.hash = '#/quotes/' + q.id; });
   }
 
   async function quoteView(id) {
@@ -392,12 +393,14 @@
     const locked = Boolean(q.signed_at) || q.status === 'paid' || q.status === 'void';
     const items = q.items.map((it) => ({ ...it }));
     const active = products.filter((p) => p.active);
+    const inv = q.kind === 'invoice', noun = inv ? 'invoice' : 'proposal';
 
     view.innerHTML = `
       <a href="${q.request_id ? '#/requests/' + q.request_id : '#/quotes'}" class="small">← ${q.request_id ? 'Request #' + q.request_id : 'Quotes'}</a>
-      <div class="row between"><h1>Quote #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
+      <div class="row between"><h1>${inv ? 'Invoice' : 'Quote'} #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
       ${q.status !== 'void' ? `<div class="row"><a class="btn ghost sm" href="#/schedule/new/quote/${q.id}">Schedule this job</a></div>` : ''}
       <p class="alert" id="q-msg" hidden></p>
+      ${inv && !locked ? '<p class="small muted">No signature needed. Your customer pays from the invoice page, which shows your Terms &amp; Conditions. Or record cash or a check below.</p>' : ''}
       ${q.signed_at ? `<p class="alert ok">Signed by ${esc(q.signer_name)} on ${esc(new Date(q.signed_at.replace(' ', 'T') + 'Z').toLocaleString())}. Signed quotes can’t be edited.</p>` : ''}
       ${aiCard(q, locked)}
       <form id="qf" class="stack">
@@ -405,7 +408,7 @@
         <section class="card stack">
           <h2>Customer</h2>
           <div class="grid2">
-            <div><label for="q-title">Proposal title</label><input id="q-title" name="title" value="${esc(q.title)}"></div>
+            <div><label for="q-title">${inv ? 'Invoice title' : 'Proposal title'}</label><input id="q-title" name="title" value="${esc(q.title)}"></div>
             <div><label for="q-name">Name</label><input id="q-name" name="customer_name" value="${esc(q.customer_name)}"></div>
             <div><label for="q-phone">Phone</label><input id="q-phone" name="customer_phone" type="tel" value="${esc(q.customer_phone)}"></div>
             <div><label for="q-email">Email (for the receipt)</label><input id="q-email" name="customer_email" type="email" value="${esc(q.customer_email)}"></div>
@@ -435,8 +438,8 @@
           <p class="small muted" id="fee-note"></p>
         </section>
         <div class="sticky-actions row">
-          ${locked ? `<a class="btn primary" href="${esc(q.proposal_url)}" target="_blank" rel="noopener">Open proposal</a>` : '<button class="btn" type="submit">Save</button><button class="btn primary" type="button" id="q-show">Save and show proposal</button>'}
-          <a class="btn ghost" href="${smsHref(q.customer_phone, bizName() + ': here is your proposal to review and sign: ' + q.proposal_url)}">Text link</a>
+          ${locked ? `<a class="btn primary" href="${esc(q.proposal_url)}" target="_blank" rel="noopener">Open ${noun}</a>` : `<button class="btn" type="submit">Save</button><button class="btn primary" type="button" id="q-show">Save and show ${noun}</button>`}
+          <a class="btn ghost" href="${smsHref(q.customer_phone, bizName() + (inv ? ': here is your invoice: ' : ': here is your proposal to review and sign: ') + q.proposal_url)}">Text link</a>
           <button class="btn ghost" type="button" data-copy="${esc(q.proposal_url)}">Copy link</button>
         </div>
       </form>
@@ -513,7 +516,7 @@
     f.addEventListener('submit', async (e) => { e.preventDefault(); try { await save(); await quoteView(id); flash(document.getElementById('q-msg'), 'Saved.'); } catch (err) { flash(msg, err.message, 'err'); } });
     const show = document.getElementById('q-show');
     if (show) show.addEventListener('click', async () => {
-      if (items.some((it) => it.name.trim() && !it.unit_cents) && !confirm('Some lines are $0. Show the proposal anyway?')) return;
+      if (items.some((it) => it.name.trim() && !it.unit_cents) && !confirm(`Some lines are $0. Show the ${noun} anyway?`)) return;
       const w = window.open('', '_blank');
       try { const saved = await save(); if (w) w.location = saved.proposal_url; else location.href = saved.proposal_url; quoteView(id); }
       catch (err) { if (w) w.close(); flash(msg, err.message, 'err'); }
@@ -526,16 +529,16 @@
     pay.innerHTML = `
       <h2>Payment</h2>
       ${q.status === 'paid' ? `<p class="alert ok">Paid in full. ${paidList.map((p) => `${money(p.amount_cents)} by ${esc(p.method)}`).join(', ')}.</p>${paidList.filter((p) => p.method === 'card').map(payoutLine).join('')}` :
-        q.signed_at ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. ${q.online.card_payments ? 'The customer can pay online on the proposal page, or you can' : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
+        q.signed_at || (inv && q.status !== 'void') ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. ${q.online.card_payments ? `The customer can pay online on the ${noun} page, or you can` : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
         <div class="row"><button class="btn ghost" type="button" data-paid="cash">Got cash</button><button class="btn ghost" type="button" data-paid="check">Got a check</button></div>` :
         q.status === 'void' ? '<p class="muted">This quote is void.</p>' : '<p class="muted">The customer signs the proposal first, then pays.</p>'}
-      ${q.status !== 'paid' ? `<div class="row" style="border-top:1px solid var(--line);padding-top:12px">${q.status === 'void' ? (q.signed_at ? '' : '<button class="linkbtn" type="button" data-st="draft">Restore quote</button>') : '<button class="linkbtn" type="button" data-st="void">Void this quote</button>'}</div>` : ''}`;
+      ${q.status !== 'paid' ? `<div class="row" style="border-top:1px solid var(--line);padding-top:12px">${q.status === 'void' ? (q.signed_at ? '' : `<button class="linkbtn" type="button" data-st="draft">Restore ${inv ? 'invoice' : 'quote'}</button>`) : `<button class="linkbtn" type="button" data-st="void">Void this ${inv ? 'invoice' : 'quote'}</button>`}</div>` : ''}`;
     pay.querySelectorAll('[data-paid]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm(`Record ${money(q.totals.balance)} paid by ${b.dataset.paid}?`)) return;
       try { await api(`/api/quotes/${id}/payments`, { method: 'POST', body: { method: b.dataset.paid } }); quoteView(id); } catch (err) { flash(msg, err.message, 'err'); }
     }));
     pay.querySelectorAll('[data-st]').forEach((b) => b.addEventListener('click', async () => {
-      if (b.dataset.st === 'void' && !confirm('Void this quote? The customer link will stop working.')) return;
+      if (b.dataset.st === 'void' && !confirm(`Void this ${inv ? 'invoice' : 'quote'}? The customer link will stop working.`)) return;
       try { await api(`/api/quotes/${id}/status`, { method: 'POST', body: { status: b.dataset.st } }); quoteView(id); } catch (err) { flash(msg, err.message, 'err'); }
     }));
   }

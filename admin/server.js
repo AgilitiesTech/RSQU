@@ -583,7 +583,7 @@ export function createApp(env = process.env) {
     if (q.status === 'draft') db.prepare(`UPDATE quotes SET status = 'sent', updated_at = ? WHERE id = ?`).run(now(), q.id);
     const full = quoteFull({ ...q, status: q.status === 'draft' ? 'sent' : q.status });
     send(res, 200, {
-      id: full.id, title: full.title, status: full.status, customer_name: full.customer_name, location: full.location, rig: full.rig,
+      id: full.id, kind: full.kind || 'proposal', title: full.title, status: full.status, customer_name: full.customer_name, location: full.location, rig: full.rig,
       notes: full.notes, terms: full.terms, tax_rate_bp: full.tax_rate_bp, created_at: full.created_at,
       items: full.items.map(({ name, description, qty, unit_cents, taxable }) => ({ name, description, qty, unit_cents, taxable })),
       totals: full.totals, signer_name: full.signer_name, signature_png: full.signature_png, signed_at: full.signed_at, paid_at: full.paid_at,
@@ -808,7 +808,7 @@ export function createApp(env = process.env) {
   // Quotes
   route('GET', '/api/quotes', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, db.prepare('SELECT * FROM quotes WHERE tenant_id = ? ORDER BY id DESC LIMIT 300').all(t.id).map((q) => ({
-      id: q.id, title: q.title, status: q.status, customer_name: q.customer_name, created_at: q.created_at, request_id: q.request_id, totals: quoteTotals(q, getItems(q.id)),
+      id: q.id, kind: q.kind, title: q.title, status: q.status, customer_name: q.customer_name, created_at: q.created_at, request_id: q.request_id, totals: quoteTotals(q, getItems(q.id)),
     })));
   }, { auth: 'tenant' });
 
@@ -1339,6 +1339,47 @@ export function createApp(env = process.env) {
     res.writeHead(200, { 'Content-Type': 'text/calendar; charset=utf-8', 'Content-Disposition': 'inline; filename="schedule.ics"', 'Cache-Control': 'private, no-store', 'X-Robots-Tag': 'noindex', 'X-Content-Type-Options': 'nosniff' });
     res.end(ics);
   }
+
+  // ---------- owner features: invoices ----------
+  // A quick invoice is a quote with kind 'invoice': no signature. The customer accepts the business's
+  // Terms & Conditions by paying, like the deposit payment page.
+  route('POST', '/api/invoices', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    const r = b.request_id ? scoped('requests', b.request_id, t.id) : null;
+    const ins = db.prepare(`INSERT INTO quotes (tenant_id, token, request_id, kind, title, customer_name, customer_phone, customer_email, location, rig, terms, tax_rate_bp, deposit_credit_cents, created_at, updated_at) VALUES (?,?,?,'invoice',?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(t.id, randomToken(), r?.id ?? null, 'Invoice', r?.name || '', r?.phone || '', r?.email || '', r?.location || '', r?.rig || '', t.terms || '', t.tax_rate_bp, paidDeposits(r?.id), now(), now());
+    send(res, 201, quoteFull(scoped('quotes', Number(ins.lastInsertRowid), t.id)));
+  }, { auth: 'tenant' });
+
+  route('POST', '/api/public/invoices/:token/checkout', async (req, res, p) => {
+    const q = getQuoteByToken(p.token);
+    const t = q && getTenant(q.tenant_id);
+    if (!q || q.kind !== 'invoice' || q.status === 'void' || !t) throw new HttpError(404, 'This invoice isn’t available.');
+    if (q.status === 'paid') throw new HttpError(409, 'This invoice is already paid.');
+    const b = await json(req);
+    const latest = latestTerms(t.id);
+    if (latest && Number(b.terms_version) !== latest.version) throw new HttpError(409, 'The business updated its Terms & Conditions. Reload the page to review them, then pay.');
+    const phone = b.phone !== undefined ? noCtl(b.phone, 40) : (phoneKey(q.customer_phone) ? q.customer_phone : '');
+    const email = b.email !== undefined ? noCtl(b.email, 200).toLowerCase() : normEmail(q.customer_email);
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Check your email address.');
+    if (phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
+    if (b.subscribe_sms && !phoneKey(phone)) throw new HttpError(400, 'Add your mobile number to get texts, or uncheck that box.');
+    const { balance } = quoteTotals(q, getItems(q.id));
+    if (balance < 50) throw new HttpError(409, 'Nothing is due on this invoice.');
+    db.prepare('UPDATE quotes SET customer_phone = ?, customer_email = ?, updated_at = ? WHERE id = ?').run(phone || '', email || '', now(), q.id);
+    if (b.subscribe_email !== undefined || b.subscribe_sms) {
+      upsertCustomer(t, { name: q.customer_name, phone, email, emailOptIn: Boolean(b.subscribe_email), smsOptIn: Boolean(b.subscribe_sms), source: `Invoice #${q.id}`, ip: clientIp(req), ua: clean(req.headers['user-agent'], 400) });
+    }
+    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, balance);
+    if (!pay) {
+      const tok = randomToken();
+      db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, 'card')`)
+        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
+      pay = getPayment(tok);
+    }
+    const checkoutUrl = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email, termsVersion: latest?.version });
+    send(res, 200, { url: checkoutUrl });
+  });
 
   // Customers and who's subscribed
   route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
