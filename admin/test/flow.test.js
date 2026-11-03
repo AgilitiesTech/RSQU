@@ -1733,6 +1733,7 @@ test('static pages, legal pages and seed script', async () => {
   const apply = (...a) => execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-site.js', ...a], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
   assert.match(apply(), /Done\. 11 cities, 9 services \(7 with tile pictures\), 5 files/);
   assert.match(apply(), /Already applied on .*Nothing changed/);
+  assert.match(apply('--copy'), /Updated the headline, description, service area.*Nothing else changed/);
   assert.match(apply('--force'), /Done\. 11 cities/);
   const { handler: h2 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
   const srv2 = http.createServer(h2); await new Promise((r) => srv2.listen(0, r));
@@ -1740,6 +1741,18 @@ test('static pages, legal pages and seed script', async () => {
   const rsqu = await (await fetch(b2 + '/s/mike-stevens')).text();
   assert.match(rsqu, /<body class="bold">/);
   assert.match(rsqu, /RSQU Mobile RV Service/);
+  // Copy for local and AI search: Northern Utah by county, RVs and trailers, repair and maintenance.
+  assert.match(rsqu, /<title>RSQU Mobile RV Service \| Mobile RV and trailer repair in Northern Utah<\/title>/);
+  assert.match(rsqu, /<meta name="description" content="Mobile RV and trailer repair and maintenance in Northern Utah’s Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties\./);
+  assert.match(rsqu, /<h1>Mobile RV and trailer repair in Northern Utah<\/h1>/);
+  assert.match(rsqu, /<strong>Service area<\/strong>Northern Utah: Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties/);
+  assert.match(rsqu, /\.hl ul\{margin:0 auto;/, 'the highlights row is centered with the tiles');
+  // Every page has the home page's one-row header; only the marked item changes.
+  const headerOf = (h) => /<header class="([^"]*)">[\s\S]*?<\/header>/.exec(h);
+  const svcPage = await (await fetch(b2 + '/s/mike-stevens/services/onsite-rv-winterizing-package')).text();
+  assert.equal(headerOf(svcPage)[1], 'bhead');
+  assert.equal(headerOf(svcPage)[0].replace(/ aria-current="page"/g, ''), headerOf(rsqu)[0].replace(/ aria-current="page"/g, ''));
+  assert.match(headerOf(svcPage)[0], /aria-current="page">Services</);
   assert.equal([...rsqu.matchAll(/class="tile-grid"[\s\S]*?<\/ul>/g)][0][0].match(/<img /g).length, 7);
   const winter = await fetch(b2 + '/s/mike-stevens/services/onsite-rv-winterizing-package');
   assert.equal(winter.status, 200);

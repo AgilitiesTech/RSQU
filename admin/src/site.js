@@ -247,7 +247,6 @@ body.bold h1,body.bold section.s h2{text-transform:uppercase;letter-spacing:.01e
 .bnav a:hover{color:color-mix(in srgb,${p} 60%,#fff)}.bnav a[aria-current=page]{border-bottom-color:${p};color:color-mix(in srgb,${p} 70%,#fff)}
 .pill{display:inline-flex;align-items:center;gap:10px;min-height:48px;padding:0 24px;border-radius:999px;background:linear-gradient(180deg,color-mix(in srgb,${p} 82%,#fff),color-mix(in srgb,${p} 85%,#000));color:#fff;border:1px solid color-mix(in srgb,${p} 60%,#fff);box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 2px 0 color-mix(in srgb,${p} 45%,#000);font-family:var(--cond);font-weight:700;font-size:21px;letter-spacing:.02em;text-decoration:none;white-space:nowrap}
 .pill.ghost{background:transparent;border:2px solid #fff;box-shadow:none}
-.bhead.sub .brand{font-size:24px;font-weight:700}.bhead.sub .bnav{order:3;width:100%;border-top:1px solid #2E3034}.bhead.sub .bnav a:first-child{padding-left:0}
 @media (max-width:760px){.bhead .pill{order:-1;width:100%;justify-content:center}.bhead .wrap{justify-content:center}.bnav{width:100%;justify-content:center}.bnav a{font-size:16px;padding:10px 9px}.bnav a+a::before{display:none}}
 .banner{background:#0E0E10;line-height:0}.banner img{display:block;width:100%;max-width:1536px;height:auto;margin:0 auto}
 .tiles{background:radial-gradient(ellipse at 50% 0,#3A3C40 0,#1B1C1F 70%);padding:clamp(18px,3vw,32px) 0}
@@ -257,7 +256,7 @@ body.bold h1,body.bold section.s h2{text-transform:uppercase;letter-spacing:.01e
 .tile-grid img{width:100%;height:auto;aspect-ratio:1/1;object-fit:contain}
 @media (max-width:900px){.tile-grid li{flex-basis:calc((100% - 3 * var(--gap)) / 4)}}@media (max-width:520px){.tile-grid li{flex-basis:calc((100% - 2 * var(--gap)) / 3)}}
 .hl{background:#0E0E10;border-top:1px solid #2E3034;border-bottom:1px solid #2E3034;color:#D4D7DB}
-.hl ul{margin:0;padding-top:18px;padding-bottom:18px;list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:16px}
+.hl ul{margin:0 auto;padding-top:18px;padding-bottom:18px;list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:16px}
 .hl li{display:flex;align-items:center;gap:14px;min-width:0;font-size:15px;line-height:1.35;text-transform:uppercase;letter-spacing:.02em}
 .hl li+li{border-left:2px solid ${p};padding-left:16px}.hl strong{display:block;font-family:var(--cond);font-weight:600;font-size:19px;color:#fff}.hl svg{flex:none;color:#fff}
 @media (max-width:900px){.hl li+li{border-left:0;padding-left:0}}
@@ -277,9 +276,9 @@ function boldHeader(t, profile, u, { current = 'home', sections = {} } = {}) {
   const tel = telDigits(t.phone);
   const items = [['/', 'Home', 'home'], [sections.services && '/#services', 'Services', 'services'], [sections.about && '/#about', 'About', 'about'],
     [sections.areas && '/#areas', 'Service area', 'areas'], [sections.resources && '/#resources', 'Resources', 'resources'], ['/#request', 'Contact', 'contact']].filter(([h]) => h);
+  // Every page gets the same one-row header as the home page; only the marked menu item changes.
   return `<body class="bold">
-<header class="bhead${current !== 'home' ? ' sub' : ''}"><div class="wrap">
-  ${current !== 'home' ? `<a class="brand" href="${u.rel('/')}" style="color:#fff;text-decoration:none">${esc(t.name)}</a>` : ''}
+<header class="bhead"><div class="wrap">
   <nav class="bnav" aria-label="Main">${items.map(([h, l, k]) => `<a href="${h === '/' ? u.rel('/') : u.rel('/') + h.slice(1)}"${k === current ? ' aria-current="page"' : ''}>${l}</a>`).join('')}</nav>
   ${tel ? `<a class="pill" href="tel:${tel}">${icon('phone', 20)}<span>${esc(t.phone)}</span></a>` : ''}
 </div></header>`;
@@ -383,7 +382,9 @@ export function renderSite(t, products, profile, { platformBase, onDomain = fals
   const bookable = products.filter((p) => p.bookable);
   const phrase = servicePhrase(profile);
   const place = profile.base_city ? `${profile.base_city}, ${profile.base_state}` : '';
-  const title = `${t.name} | ${t.tagline || `${phrase}${place ? ' in ' + place : ''}`}`;
+  // Short: the headline, else the tagline's first sentence if it's short, else the service and place.
+  const firstSentence = String(t.tagline || '').split(/(?<=[.!?])\s/)[0].replace(/[.!?]$/, '').trim();
+  const title = `${t.name} | ${t.hero_headline || (firstSentence && firstSentence.length <= 70 ? firstSentence : `${phrase}${place ? ' in ' + place : ''}`)}`;
   const description = clip(`${t.tagline || phrase}${place ? ` based in ${place}` : ''}${t.service_area ? `. Serving ${t.service_area}` : ''}.`, 160);
   const L = profile.links;
   const bold = profile.theme === 'bold';
