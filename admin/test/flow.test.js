@@ -1254,6 +1254,72 @@ test('emails to subscribers: address required, opted-in only, unsubscribe link a
   assert.equal((await other('GET', '/api/campaigns')).json.campaigns.length, 0, 'each business sees only its own');
 });
 
+test('pay over time: Checkout uses each business’s own payment methods; the note shows at $50 or more once the owner turns it on', async () => {
+  // createCheckout never forces payment_method_types, so Affirm and Klarna appear when the business turns them on in Stripe.
+  const seen = [];
+  const cap = http.createServer((req, res) => {
+    let b = ''; req.on('data', (c) => (b += c));
+    req.on('end', () => { seen.push({ url: req.url, account: req.headers['stripe-account'], body: new URLSearchParams(b) }); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"id":"cs_cap","url":"https://checkout.stripe.test/cs_cap"}'); });
+  });
+  await new Promise((r) => cap.listen(0, r));
+  const { stripeClient } = await import('../src/stripe.js');
+  await stripeClient({ STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_API_BASE: `http://localhost:${cap.address().port}` })
+    .createCheckout({ account: 'acct_cap', name: 'Roof reseal', amountCents: 60000, applicationFeeCents: 1800, successUrl: 'https://x.test/s', cancelUrl: 'https://x.test/c', ref: 'tok_cap' });
+  cap.close();
+  assert.deepEqual([seen[0].url, seen[0].account, seen[0].body.get('mode')], ['/v1/checkout/sessions', 'acct_cap', 'payment']);
+  assert.ok(![...seen[0].body.keys()].some((k) => k.startsWith('payment_method_types')));
+
+  const invoice = async (cents) => {
+    const q = (await mike('POST', '/api/invoices', {})).json;
+    await mike('PUT', `/api/quotes/${q.id}`, { title: 'Roof reseal', customer_name: 'Rae Roof', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Reseal', qty: 1, unit_cents: cents }] });
+    return async () => (await anon('GET', `/api/public/proposals/${q.token}`)).json.pay_over_time;
+  };
+  const big = await invoice(60000), small = await invoice(4900);
+  assert.equal(await big(), false, 'off until the owner says Affirm or Klarna is on');
+  assert.equal((await tia('PUT', '/api/owner-settings', { pay_over_time: true })).status, 403);
+  assert.equal((await mike('PUT', '/api/owner-settings', { pay_over_time: true })).json.pay_over_time, true);
+  assert.equal(await big(), true);
+  assert.equal(await small(), false, 'under $50');
+  const olaQuote = (await other('POST', '/api/quotes', {})).json;
+  await other('PUT', '/api/owner-settings', { pay_over_time: true });
+  await other('PUT', `/api/quotes/${olaQuote.id}`, { title: 'Job', customer_name: 'X', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Job', qty: 1, unit_cents: 90000 }] });
+  assert.equal((await anon('GET', `/api/public/proposals/${olaQuote.token}`)).json.pay_over_time, false, 'never without card payments on');
+});
+
+test('QuickBooks download: paid payments for a date range, every cell quoted, formulas neutralized, owner only', async () => {
+  // A customer name and title that a spreadsheet would run as formulas.
+  const q = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${q.id}`, { title: '-2+3 cmd', customer_name: '=HYPERLINK("http://evil.test","Click")', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Part', qty: 1, unit_cents: 1234 }] });
+  await mike('POST', `/api/quotes/${q.id}/payments`, { method: 'check' });
+  const url = '/api/exports/quickbooks.csv?from=2020-01-01&to=2030-12-31';
+  assert.equal((await tia('GET', url)).status, 403, 'owners only');
+  const res = await mike('GET', url);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^text\/csv/);
+  assert.match(res.headers.get('content-disposition'), /attachment; filename="payments-2020-01-01-to-2030-12-31\.csv"/);
+  const lines = res.text.trim().split('\r\n');
+  assert.equal(lines[0], '"Date","Customer","Description","Amount","Method","Processing fees","Net","Reference"');
+  const cell = /"(?:[^"]|"")*"/.source;
+  assert.ok(lines.every((l) => new RegExp(`^${cell}(,${cell}){7}$`).test(l)), 'eight quoted cells on every line');
+  const paidCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid'`).get(mikeId).n;
+  assert.equal(lines.length, paidCount + 1);
+  const evil = lines.find((l) => l.includes('HYPERLINK'));
+  assert.match(evil, /^"\d{2}\/\d{2}\/\d{4}","'=HYPERLINK\(""http:\/\/evil\.test"",""Click""\)","'-2\+3 cmd \(#\d+\)","12\.34","Check","0\.00","12\.34","Receipt #\d+"$/);
+  assert.ok(!lines.some((l) => /(^|,)"[=+\-@]/.test(l)), 'no cell starts with a formula character');
+  // A card payment shows Stripe's fee plus the platform share, and what the business kept.
+  const card = appDb.prepare(`SELECT * FROM payments WHERE tenant_id = ? AND status = 'paid' AND method = 'card' AND transfer_status = 'direct' ORDER BY id DESC LIMIT 1`).get(mikeId);
+  const row = lines.find((l) => l.includes(`"Receipt #${card.id} ${card.charge_id}"`));
+  const fees = card.stripe_fee_cents + card.fee_cents - card.fee_refunded_cents;
+  assert.ok(row.includes(`"${(card.amount_cents / 100).toFixed(2)}","Card or bank (online)","${(fees / 100).toFixed(2)}","${((card.amount_cents - fees) / 100).toFixed(2)}"`), row);
+  // The date range uses the business's time zone: a payment at 01:30 Eastern on Nov 3 is in Nov 3, not Nov 2.
+  const late = appDb.prepare(`SELECT id FROM payments WHERE paid_at = '2026-11-03 06:30:00' AND tenant_id = ?`).get(mikeId);
+  assert.ok((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text.includes(`"11/03/2026"`));
+  assert.ok((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text.includes(`"Receipt #${late.id}`));
+  assert.ok(!(await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-04&to=2026-11-04')).text.includes(`"Receipt #${late.id}`));
+  assert.equal((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-05&to=2026-11-01')).status, 400);
+  assert.equal((await other('GET', url)).text.trim().split('\r\n').length, 1, 'only your own payments');
+});
+
 test('bold look: banner, service tiles, highlights, service pages', async () => {
   const st = (await mike('GET', '/api/website')).json;
   assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);

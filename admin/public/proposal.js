@@ -60,6 +60,7 @@
           ${t.credit ? `<dt>Deposit already paid</dt><dd>−${money(t.credit)}</dd>` : ''}
           <dt class="big">${paid ? 'Paid' : 'Balance due'}</dt><dd class="big">${money(t.balance)}</dd>
         </dl>
+        ${q.pay_over_time ? '<p class="small"><strong>Pay over time available at checkout.</strong></p>' : ''}
       </section>
       ${q.terms ? `<section class="card"><h2>Terms</h2><p class="small" style="white-space:pre-wrap">${esc(q.terms)}</p></section>` : ''}
       <section class="card stack" id="sign"></section>

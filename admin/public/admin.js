@@ -1430,6 +1430,8 @@
     let st;
     try { st = await api('/api/owner-settings'); } catch { return; }
     reviewCard(st);
+    payLaterCard(st, cfg);
+    exportCard();
   }
 
   // ---------- owner features: review requests ----------
@@ -1701,6 +1703,46 @@
       try { await api('/api/campaigns', { method: 'POST', body: body() }); await campaignsView(); flash(document.getElementById('cf-msg'), 'Sending now. It can take a few minutes to reach everyone.'); }
       catch (err) { flash(msg, err.message, 'err'); }
     });
+  }
+
+  // ---------- owner features: pay over time ----------
+  // Affirm and Klarna come from the business's own Stripe settings (Checkout shows what's turned on there).
+  function payLaterCard(st, cfg) {
+    const anchor = document.getElementById('st-msg');
+    if (!anchor || !cfg.stripe.platform_ready) return;
+    anchor.insertAdjacentHTML('beforebegin', `<div class="stack pot" id="pot">
+      <h3>Offer pay over time</h3>
+      <p class="small">Let customers split bigger jobs into payments with Affirm or Klarna. You get the full amount up front, and Affirm or Klarna collects from the customer.</p>
+      <ol class="small" style="margin:0;padding-left:22px"><li>Open your Stripe Dashboard.</li><li>Go to Settings, then Payment methods.</li><li>Turn on Affirm and Klarna.</li></ol>
+      <p class="small muted">Stripe charges a higher fee for these than for cards. Customers see them at checkout when the amount qualifies.</p>
+      <label class="check small"><input type="checkbox" id="pot-on" ${st.pay_over_time ? 'checked' : ''} ${isOwner() ? '' : 'disabled'}> <span>I turned these on. Show “Pay over time available at checkout” on proposals and invoices of $50 or more.</span></label>
+    </div>`);
+    document.getElementById('pot-on').addEventListener('change', async (e) => {
+      try { await api('/api/owner-settings', { method: 'PUT', body: { pay_over_time: e.target.checked } }); flash(document.getElementById('st-msg'), 'Saved.'); }
+      catch (err) { e.target.checked = !e.target.checked; flash(document.getElementById('st-msg'), err.message, 'err'); }
+    });
+  }
+
+  // ---------- owner features: accounting export ----------
+  function exportCard() {
+    const anchor = document.getElementById('rv') || document.getElementById('sf');
+    if (!anchor || !isOwner()) return;
+    const d = new Date(), pad = (n) => String(n).padStart(2, '0');
+    const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    anchor.insertAdjacentHTML('afterend', `<section class="card stack" id="qb">
+      <h2>Download for QuickBooks</h2>
+      <p class="small">A spreadsheet of the payments you received, ready to import into QuickBooks or send to your bookkeeper. It lists the date, customer, what it was for, the amount, how they paid, processing fees, what you kept, and the receipt number.</p>
+      <div class="grid2" style="max-width:520px">
+        <div><label for="qb-from">From</label><input id="qb-from" type="date" value="${today.slice(0, 8)}01"></div>
+        <div><label for="qb-to">To</label><input id="qb-to" type="date" value="${today}"></div>
+      </div>
+      <div><a class="btn" id="qb-go" href="#">Download for QuickBooks</a></div>
+      <p class="small muted">Dates follow your business time zone. Card payments that Stripe is still settling show their fees in the next download.</p>
+    </section>`);
+    const go = document.getElementById('qb-go');
+    const href = () => { go.href = `/api/exports/quickbooks.csv?from=${encodeURIComponent(document.getElementById('qb-from').value)}&to=${encodeURIComponent(document.getElementById('qb-to').value)}`; };
+    ['qb-from', 'qb-to'].forEach((id) => document.getElementById(id).addEventListener('change', href));
+    href();
   }
 
   // ---------- router ----------

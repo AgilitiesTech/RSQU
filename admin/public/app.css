@@ -163,3 +163,4 @@ fieldset.consent legend { padding: 0 6px; }
 .sched-time { display: flex; flex-direction: column; min-width: 88px; font-variant-numeric: tabular-nums; }
 .sched-item.done .item-title { text-decoration: line-through; color: var(--muted); }
 .sched-item.en_route { background: #FFF8E6; }
+.pot { border-top: 1px solid var(--line); padding-top: 12px; }

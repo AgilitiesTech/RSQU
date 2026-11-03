@@ -588,6 +588,8 @@ export function createApp(env = process.env) {
       items: full.items.map(({ name, description, qty, unit_cents, taxable }) => ({ name, description, qty, unit_cents, taxable })),
       totals: full.totals, signer_name: full.signer_name, signature_png: full.signature_png, signed_at: full.signed_at, paid_at: full.paid_at,
       online: onlineQuote(t, full.totals.balance),
+      // The owner turned on Affirm/Klarna in Stripe (Settings > Payments): shown for $50 or more.
+      pay_over_time: Boolean(t.pay_over_time) && onlineReady(t) && full.totals.balance >= 5000 && full.status !== 'paid',
       business: brand(t),
       // The business's customer Terms & Conditions: the version signed, or the current one to accept.
       customer_terms: publicTerms(t, full.customer_terms_version),
@@ -1428,6 +1430,33 @@ export function createApp(env = process.env) {
     const cid = Number(ins.lastInsertRowid);
     for (const c of list) queueMessage({ t, kind: 'campaign', channel: 'email', to: normEmail(c.email), refId: cid, customerId: c.id });
     send(res, 201, { id: cid, recipients: list.length });
+  }, { auth: 'owner' });
+
+  // ---------- owner features: accounting export ----------
+  // Paid payments for a date range (in the business's time zone), ready to import into QuickBooks.
+  route('GET', '/api/exports/quickbooks.csv', async (req, res, p, url, { tenant: t }) => {
+    const tz = owner.tzOf(t);
+    const today = owner.todayIn(tz);
+    const from = owner.validDate(url.searchParams.get('from')) ? url.searchParams.get('from') : today.slice(0, 8) + '01';
+    const to = owner.validDate(url.searchParams.get('to')) ? url.searchParams.get('to') : today;
+    if (to < from) throw new HttpError(400, 'The end date is before the start date.');
+    const lo = owner.utcString(owner.zonedTimeToUtc(from, '00:00', tz)), hi = owner.utcString(owner.zonedTimeToUtc(owner.addDays(to, 1), '00:00', tz));
+    const rows = db.prepare(`SELECT p.*, q.signer_name, q.customer_name AS q_name, r.name AS r_name FROM payments p LEFT JOIN quotes q ON q.id = p.quote_id LEFT JOIN requests r ON r.id = p.request_id
+      WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at >= ? AND p.paid_at < ? ORDER BY p.paid_at, p.id`).all(t.id, lo, hi);
+    const d = (c) => (c / 100).toFixed(2);
+    const METHOD = { card: 'Card or bank (online)', cash: 'Cash', check: 'Check', other: 'Other' };
+    const lines = [['Date', 'Customer', 'Description', 'Amount', 'Method', 'Processing fees', 'Net', 'Reference']];
+    for (const r of rows) {
+      const lp = owner.localParts(owner.parseUtc(r.paid_at), tz);
+      const card = r.method === 'card';
+      const settled = !card || ['direct', 'sent'].includes(r.transfer_status);
+      const fees = card ? r.stripe_fee_cents + r.fee_cents - (r.fee_refunded_cents || 0) : 0;
+      lines.push([`${String(lp.month).padStart(2, '0')}/${String(lp.day).padStart(2, '0')}/${lp.year}`, r.signer_name || r.q_name || r.r_name || '', r.description, d(r.amount_cents), METHOD[r.method] || r.method,
+        settled ? d(fees) : '', settled ? d(r.amount_cents - fees) : '', `Receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}${settled ? '' : ' (fees not settled yet)'}`]);
+    }
+    const name = `payments-${from}-to-${to}.csv`;
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    res.end(lines.map((l) => l.map(owner.csvCell).join(',')).join('\r\n') + '\r\n');
   }, { auth: 'owner' });
 
   // Customers and who's subscribed

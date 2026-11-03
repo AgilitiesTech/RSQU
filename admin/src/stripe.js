@@ -131,7 +131,8 @@ export function stripeClient(env) {
 
     // Direct charge: the Checkout Session is created ON the business's account (Stripe-Account),
     // so the business is the merchant of record and Checkout shows its branding. The platform's
-    // share is collected as an application fee.
+    // share is collected as an application fee. No payment_method_types: Checkout offers whatever
+    // the business turned on in its Stripe Dashboard (cards, ACH, Affirm, Klarna, ...).
     createCheckout({ account, name, amountCents, applicationFeeCents, successUrl, cancelUrl, ref, email, statementName, metadata = {} }) {
       return call('POST', '/v1/checkout/sessions', {
         mode: 'payment',
