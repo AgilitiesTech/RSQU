@@ -1731,10 +1731,10 @@ test('static pages, legal pages and seed script', async () => {
   assert.match(out, /https:\/\/dash\.test\/admin\/#\/reset\//);
   // Moving Mike's RSQU site onto HitchPoint: twice, to prove it's safe to re-run
   const apply = (...a) => execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-site.js', ...a], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
-  assert.match(apply(), /Done\. 11 cities, 9 services \(7 with tile pictures\), 5 files/);
+  assert.match(apply(), /Done\. 13 cities, 9 services \(7 with tile pictures\), 5 files/);
   assert.match(apply(), /Already applied on .*Nothing changed/);
-  assert.match(apply('--copy'), /Updated the headline, description, service area.*Nothing else changed/);
-  assert.match(apply('--force'), /Done\. 11 cities/);
+  assert.match(apply('--copy'), /Updated the headline, description, service area.*FAQs\. Nothing else changed/, 'every town already has its text');
+  assert.match(apply('--force'), /Done\. 13 cities/);
   const { handler: h2 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
   const srv2 = http.createServer(h2); await new Promise((r) => srv2.listen(0, r));
   const b2 = `http://localhost:${srv2.address().port}`;
@@ -1743,9 +1743,17 @@ test('static pages, legal pages and seed script', async () => {
   assert.match(rsqu, /RSQU Mobile RV Service/);
   // Copy for local and AI search: Northern Utah by county, RVs and trailers, repair and maintenance.
   assert.match(rsqu, /<title>RSQU Mobile RV Service \| Mobile RV and trailer repair in Northern Utah<\/title>/);
-  assert.match(rsqu, /<meta name="description" content="Mobile RV and trailer repair and maintenance in Northern Utah’s Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties\./);
+  assert.match(rsqu, /<meta name="description" content="Mobile RV and trailer repair and maintenance in Northern Utah’s Box Elder, Weber, Davis, Salt Lake, Morgan, Summit and Wasatch counties\./);
   assert.match(rsqu, /<h1>Mobile RV and trailer repair in Northern Utah<\/h1>/);
-  assert.match(rsqu, /<strong>Service area<\/strong>Northern Utah: Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties/);
+  assert.match(rsqu, /<strong>Service area<\/strong>Northern Utah: Box Elder, Weber, Davis, Salt Lake, Morgan, Summit and Wasatch counties/);
+  // Every town has its own page with its own text, so search engines are offered all 13.
+  const tremonton = await (await fetch(b2 + '/s/mike-stevens/areas/tremonton-ut')).text();
+  assert.match(tremonton, /<meta name="robots" content="index,follow">/);
+  assert.match(tremonton, /Aspen Grove RV Park/);
+  assert.match(tremonton, /<meta name="description" content="Mike covers Tremonton, Garland, Bear River City/);
+  assert.match(await (await fetch(b2 + '/s/mike-stevens/areas/brigham-city-ut')).text(), /Willard Bay State Park/);
+  const map = await (await fetch(b2 + '/sitemap.xml')).text();
+  assert.equal((map.match(/\/s\/mike-stevens\/areas\//g) || []).length, 13);
   assert.match(rsqu, /\.hl ul\{margin:0 auto;/, 'the highlights row is centered with the tiles');
   // Every page has the home page's one-row header; only the marked item changes.
   const headerOf = (h) => /<header class="([^"]*)">[\s\S]*?<\/header>/.exec(h);
@@ -1763,7 +1771,7 @@ test('static pages, legal pages and seed script', async () => {
   // package: the move adds it, and a re-run on a business moved before this fix adds only that.
   const sdb = new (await import('node:sqlite')).DatabaseSync(path.join(seedDir, 'rsqu.db'));
   const own = Number(sdb.prepare(`INSERT INTO tenants (slug, name, phone) VALUES ('rsqu-mobile-rv-service', 'RSQU Mobile RV Service', '801-555-0100')`).run().lastInsertRowid);
-  assert.match(apply(), /Done\. 11 cities, 9 services .*Open \/s\/rsqu-mobile-rv-service/, 'it picks Mike’s live business by default');
+  assert.match(apply(), /Done\. 13 cities, 9 services .*Open \/s\/rsqu-mobile-rv-service/, 'it picks Mike’s live business by default');
   const w = sdb.prepare(`SELECT * FROM products WHERE tenant_id = ? AND name = 'Onsite RV winterizing package'`).get(own);
   assert.deepEqual([w.price_cents, w.bookable, w.on_site, /12-step winterizing checklist/.test(w.details)], [49900, 1, 1, true]);
   const ownSite = JSON.parse(sdb.prepare('SELECT site_profile FROM tenants WHERE id = ?').get(own).site_profile);
@@ -1773,6 +1781,15 @@ test('static pages, legal pages and seed script', async () => {
   assert.equal(sdb.prepare('SELECT tagline FROM tenants WHERE id = ?').get(own).tagline, 'Mike changed this', 'nothing else is touched');
   assert.equal(sdb.prepare('SELECT site_profile FROM tenants WHERE id = ?').get(own).site_profile, JSON.stringify(ownSite));
   assert.match(apply(), /Already applied on .*Nothing changed/);
+  // A site moved before the Box Elder towns: --copy adds them and writes the empty town pages, but
+  // keeps a town page Mike wrote himself.
+  const older = { ...ownSite, cities: ownSite.cities.filter((c) => !['Brigham City', 'Tremonton'].includes(c.name)).map((c) => ({ ...c, intro: c.name === 'Ogden' ? 'Mike wrote this about Ogden himself: the storage lots he visits most, the RV parks off I-15 and the canyon roads he takes up to Ogden Valley.' : '' })) };
+  sdb.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(older), own);
+  assert.match(apply('--copy'), /Added Brigham City and Tremonton to his towns\. Wrote the page text for 12 towns \(text Mike wrote himself is kept\)\. Nothing else changed/);
+  const towns = JSON.parse(sdb.prepare('SELECT site_profile FROM tenants WHERE id = ?').get(own).site_profile).cities;
+  assert.equal(towns.length, 13);
+  assert.match(towns.find((c) => c.name === 'Ogden').intro, /^Mike wrote this/);
+  assert.ok(towns.every((c) => c.intro.length >= 120));
   sdb.close();
   const { handler: h3 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
   const srv3 = http.createServer(h3); await new Promise((r) => srv3.listen(0, r));
