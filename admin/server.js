@@ -13,6 +13,7 @@ import * as siteProfile from './src/site-profile.js';
 import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
 import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
+import * as owner from './src/owner-features.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -262,6 +263,7 @@ export function createApp(env = process.env) {
       notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
     }
     sendReceipt(payment.id).catch((e) => console.error('Receipt failed', e));
+    try { scheduleReviewRequest(payment.id); } catch (e) { console.error('Review request failed', e); } // owner features
   }
 
   function saveImage(dataUrl, prefix, maxBytes) {
@@ -962,6 +964,7 @@ export function createApp(env = process.env) {
     }
     const word = String(params.Body || '').trim().toUpperCase();
     const k = phoneKey(params.From);
+    recordSmsReply(k, word); // owner features: STOP blocks appointment texts too
     if (k && ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT', 'OPT OUT'].includes(word)) {
       for (const c of db.prepare('SELECT id, tenant_id, phone FROM customers WHERE phone_key = ? AND sms_opt_in = 1').all(k)) {
         db.prepare('UPDATE customers SET sms_opt_in = 0, updated_at = ? WHERE id = ?').run(now(), c.id);
@@ -971,6 +974,173 @@ export function createApp(env = process.env) {
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
   });
+
+  // ---------- owner features: time zone and settings ----------
+  // Time zone, review requests and "pay over time" settings. GET is for the whole team; changes are owner-only.
+  function ownerSettings(t) {
+    const rs = owner.reviewSettings(t);
+    return {
+      timezone: owner.tzOf(t), timezones: owner.US_TIMEZONES,
+      review: { link: rs.link, enabled: rs.enabled, active: rs.active, delay_hours: rs.delayHours, delays: owner.REVIEW_DELAYS, message: rs.message, default_message: owner.DEFAULT_REVIEW_MESSAGE, repeat_days: owner.REVIEW_REPEAT_DAYS },
+      pay_over_time: Boolean(t.pay_over_time),
+      email_enabled: notify.emailEnabled, sms_enabled: notify.smsEnabled,
+    };
+  }
+  route('GET', '/api/owner-settings', async (req, res, p, url, { tenant: t }) => send(res, 200, ownerSettings(t)), { auth: 'tenant' });
+  route('PUT', '/api/owner-settings', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    if (b.timezone !== undefined && !owner.validTimezone(b.timezone)) throw new HttpError(400, 'Choose your time zone from the list.');
+    if (b.review_delay_hours !== undefined && !owner.REVIEW_DELAYS.includes(Number(b.review_delay_hours))) throw new HttpError(400, 'Choose when to send the review request from the list.');
+    const msg = b.review_message !== undefined ? clean(b.review_message, 500) : undefined;
+    if (b.review_message !== undefined && msg.length < 10) throw new HttpError(400, 'Write a short message for the review request, or press “Use the suggested message”.');
+    db.prepare('UPDATE tenants SET timezone = ?, review_requests = ?, review_delay_hours = ?, review_message = ?, pay_over_time = ? WHERE id = ?').run(
+      b.timezone !== undefined ? b.timezone : owner.tzOf(t),
+      b.review_requests !== undefined ? (b.review_requests ? 1 : 0) : t.review_requests,
+      b.review_delay_hours !== undefined ? Number(b.review_delay_hours) : t.review_delay_hours,
+      msg !== undefined ? (msg === owner.DEFAULT_REVIEW_MESSAGE ? null : msg) : t.review_message,
+      b.pay_over_time !== undefined ? (b.pay_over_time ? 1 : 0) : t.pay_over_time, t.id);
+    send(res, 200, ownerSettings(getTenant(t.id)));
+  }, { auth: 'owner' });
+
+  // ---------- owner features: background sender ----------
+  // Customer texts and emails that go out later (confirmations, reminders, review requests, update
+  // emails). Each message is claimed with a single UPDATE … WHERE status = 'pending', so it goes out
+  // once even with several workers. Texts only go out 8am to 8pm in the business's time zone; outside
+  // that they wait for 8am. The wording is built at send time, so consent and changes are respected.
+  const STOP_WORDS = ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT', 'OPT OUT'];
+  const START_WORDS = ['START', 'UNSTOP', 'YES'];
+  // Called from the Twilio reply webhook. A STOP blocks every text to that number from the platform's
+  // number (Twilio enforces it too), including appointment texts.
+  function recordSmsReply(k, word) {
+    if (!k) return;
+    if (STOP_WORDS.includes(word)) db.prepare('INSERT OR REPLACE INTO sms_stops (phone_key, word, at) VALUES (?,?,?)').run(k, word, now());
+    else if (START_WORDS.includes(word)) db.prepare('DELETE FROM sms_stops WHERE phone_key = ?').run(k);
+  }
+  const smsStopped = (phone) => Boolean(phoneKey(phone) && db.prepare('SELECT 1 FROM sms_stops WHERE phone_key = ?').get(phoneKey(phone)));
+
+  function queueMessage({ t, kind, channel, to, refId = null, customerId = null, sendAfter = new Date(), meta = null }) {
+    db.prepare('INSERT INTO scheduled_messages (tenant_id, kind, channel, to_addr, ref_id, customer_id, meta, send_after, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(t.id, kind, channel, to, refId, customerId, meta ? JSON.stringify(meta) : null, owner.utcString(sendAfter), now());
+  }
+  const cancelMessages = (tid, kinds, refId) => db.prepare(`UPDATE scheduled_messages SET status = 'canceled' WHERE tenant_id = ? AND ref_id = ? AND status = 'pending' AND kind IN (${kinds.map(() => '?').join(',')})`).run(tid, refId, ...kinds);
+  const unsubHeaders = (u) => ({ 'List-Unsubscribe': `<${u}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' });
+
+  // What to send for one queued message right now, or { skip: reason }.
+  function buildMessage(m, t, at = new Date()) {
+    const tz = owner.tzOf(t);
+    const meta = jparse(m.meta, {});
+    const emailOpts = { fromName: t.name, replyTo: t.email || undefined };
+    if (m.kind === 'job_confirm' || m.kind === 'job_reminder') {
+      const job = scoped('jobs', m.ref_id, t.id);
+      if (!job || job.status === 'canceled' || job.status === 'done') return { skip: 'The appointment was canceled or finished.' };
+      if (owner.parseUtc(job.start_at) < at) return { skip: 'The appointment already started.' };
+      const to = m.channel === 'sms' ? toE164(job.customer_phone) : normEmail(job.customer_email);
+      if (!to || (m.channel === 'email' && !/^\S+@\S+\.\S+$/.test(to))) return { skip: 'No contact for this customer.' };
+      if (m.channel === 'sms' && smsStopped(to)) return { skip: 'This number replied STOP.' };
+      const w = owner.jobMessage(m.kind, m.channel, { t, job, tz, updated: Boolean(meta.updated) });
+      return { to, ...w, opts: emailOpts };
+    }
+    if (m.kind === 'review') {
+      const rs = owner.reviewSettings(t);
+      if (!rs.active) return { skip: 'Review requests are turned off.' };
+      const c = m.customer_id ? db.prepare('SELECT * FROM customers WHERE id = ? AND tenant_id = ?').get(m.customer_id, t.id) : null;
+      if (!c) return { skip: 'Customer not found.' };
+      const pay = db.prepare('SELECT * FROM payments WHERE id = ? AND tenant_id = ?').get(m.ref_id, t.id);
+      const q = pay?.quote_id ? db.prepare('SELECT signer_name, customer_name FROM quotes WHERE id = ?').get(pay.quote_id) : null;
+      const name = q?.signer_name || q?.customer_name || c.name;
+      if (m.channel === 'email') {
+        if (!c.email_opt_in || normEmail(c.email) !== m.to_addr) return { skip: 'The customer unsubscribed from emails.' };
+        const unsub = `${publicBase()}/u/${c.unsub_token}`;
+        return { to: m.to_addr, ...owner.reviewMessage('email', { t, name, link: rs.link, message: rs.message, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+      }
+      if (!c.sms_opt_in || phoneKey(c.phone) !== phoneKey(m.to_addr)) return { skip: 'The customer didn’t agree to texts.' };
+      if (smsStopped(m.to_addr)) return { skip: 'This number replied STOP.' };
+      return { to: toE164(m.to_addr), ...owner.reviewMessage('sms', { t, name, link: rs.link, message: rs.message }) };
+    }
+    if (m.kind === 'campaign') {
+      const cp = db.prepare('SELECT * FROM campaigns WHERE id = ? AND tenant_id = ?').get(m.ref_id, t.id);
+      const c = m.customer_id ? db.prepare('SELECT * FROM customers WHERE id = ? AND tenant_id = ?').get(m.customer_id, t.id) : null;
+      if (!cp || !c) return { skip: 'Not found.' };
+      if (!c.email_opt_in || normEmail(c.email) !== m.to_addr) return { skip: 'The customer unsubscribed.' };
+      const address = owner.postalAddress(t);
+      if (!address.ok) return { skip: 'The business mailing address is missing.' };
+      const unsub = `${publicBase()}/u/${c.unsub_token}`;
+      return { to: m.to_addr, ...owner.campaignEmail({ t, subject: cp.subject, body: cp.body, address, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+    }
+    return { skip: 'Unknown message.' };
+  }
+
+  function finishMessage(m, status, error, at) {
+    db.prepare('UPDATE scheduled_messages SET status = ?, error = ?, sent_at = ? WHERE id = ?').run(status, error || null, status === 'sent' ? owner.utcString(at) : null, m.id);
+    if (m.kind === 'campaign') {
+      const col = status === 'sent' ? 'sent' : status === 'skipped' ? 'skipped' : 'failed';
+      db.prepare(`UPDATE campaigns SET ${col} = ${col} + 1 WHERE id = ?`).run(m.ref_id);
+      const left = db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'campaign' AND ref_id = ? AND status IN ('pending','sending')`).get(m.ref_id).n;
+      if (!left) db.prepare(`UPDATE campaigns SET status = 'done', finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(now(), m.ref_id);
+    }
+  }
+
+  // Sends what's due at `nowOverride` (default: now), up to `limit` messages per run (update emails
+  // go out in batches this way). Returns counts. Tests call this directly instead of waiting for the timer.
+  async function runDueMessages(nowOverride, { limit = 50 } = {}) {
+    const at = nowOverride ? new Date(nowOverride) : new Date();
+    const out = { sent: 0, skipped: 0, deferred: 0, failed: 0 };
+    const due = db.prepare(`SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_after <= ? ORDER BY send_after, id LIMIT ?`).all(owner.utcString(at), limit);
+    for (const m of due) {
+      const t = getTenant(m.tenant_id);
+      if (!t) continue;
+      const tz = owner.tzOf(t);
+      if (m.channel === 'sms' && !owner.inTextHours(at, tz)) {
+        if (db.prepare(`UPDATE scheduled_messages SET send_after = ? WHERE id = ? AND status = 'pending'`).run(owner.utcString(owner.nextTextWindow(at, tz)), m.id).changes) out.deferred++;
+        continue;
+      }
+      // Claim it. Only the worker whose UPDATE changes the row sends it.
+      if (!db.prepare(`UPDATE scheduled_messages SET status = 'sending', attempts = attempts + 1 WHERE id = ? AND status = 'pending'`).run(m.id).changes) continue;
+      try {
+        if (m.channel === 'sms' ? !notify.smsEnabled : !notify.emailEnabled) { finishMessage(m, 'skipped', m.channel === 'sms' ? 'Texting isn’t set up.' : 'Email isn’t set up.', at); out.skipped++; continue; }
+        const msg = buildMessage(m, t, at);
+        if (msg.skip) { finishMessage(m, 'skipped', msg.skip, at); out.skipped++; continue; }
+        let ok = true;
+        if (m.channel === 'sms') await notify.sms(msg.to, msg.text);
+        else ok = await notify.email(msg.to, msg.subject, msg.text, msg.opts);
+        if (ok) { finishMessage(m, 'sent', null, at); out.sent++; }
+        else if (m.attempts + 1 < 3) { db.prepare(`UPDATE scheduled_messages SET status = 'pending', send_after = ?, error = 'Email failed; trying again' WHERE id = ?`).run(owner.utcString(at.getTime() + 10 * 60_000), m.id); out.failed++; }
+        else { finishMessage(m, 'failed', 'Email failed', at); out.failed++; }
+      } catch (e) {
+        console.error('Scheduled message failed', m.id, e);
+        finishMessage(m, 'failed', String(e.message).slice(0, 300), at); out.failed++;
+      }
+    }
+    return out;
+  }
+  if (!env.DISABLE_WORKER) {
+    let busy = false;
+    setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try { await runDueMessages(); } catch (e) { console.error('Background sender failed', e); } finally { busy = false; }
+    }, Number(env.WORKER_INTERVAL_MS) || 30_000).unref();
+  }
+
+  // ---------- owner features: review requests ----------
+  // After a job is paid, ask for a Google review: by email to customers who agreed to emails, and by
+  // text only to customers who agreed to texts. At most once per customer every 90 days.
+  function scheduleReviewRequest(paymentId) {
+    const pay = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+    if (!pay || pay.kind !== 'quote' || pay.status !== 'paid' || !pay.quote_id) return;
+    const t = getTenant(pay.tenant_id);
+    const rs = owner.reviewSettings(t);
+    if (!rs.active) return;
+    if (db.prepare(`SELECT 1 FROM scheduled_messages WHERE tenant_id = ? AND kind = 'review' AND ref_id = ?`).get(t.id, pay.id)) return;
+    const q = db.prepare('SELECT * FROM quotes WHERE id = ?').get(pay.quote_id);
+    const c = findCustomer(t.id, q.customer_phone, q.customer_email);
+    if (!c) return; // never signed up for anything: receipt only
+    const since = owner.utcString(Date.now() - owner.REVIEW_REPEAT_DAYS * 864e5);
+    if (db.prepare(`SELECT 1 FROM scheduled_messages WHERE tenant_id = ? AND kind = 'review' AND customer_id = ? AND status IN ('pending','sending','sent') AND created_at >= ?`).get(t.id, c.id, since)) return;
+    const at = new Date(owner.parseUtc(pay.paid_at).getTime() + rs.delayHours * 3600_000);
+    if (c.email && c.email_opt_in) queueMessage({ t, kind: 'review', channel: 'email', to: normEmail(c.email), refId: pay.id, customerId: c.id, sendAfter: at });
+    if (c.sms_opt_in && phoneKey(c.phone) && !smsStopped(c.phone)) queueMessage({ t, kind: 'review', channel: 'sms', to: c.phone, refId: pay.id, customerId: c.id, sendAfter: at });
+  }
 
   // Customers and who's subscribed
   route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
@@ -1537,7 +1707,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
     }
   }
 
-  return { handler, db, outbox: notify.outbox };
+  return { handler, db, outbox: notify.outbox, runDueMessages };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

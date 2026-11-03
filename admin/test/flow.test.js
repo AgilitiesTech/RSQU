@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createApp } from '../server.js';
+import * as owner from '../src/owner-features.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -172,13 +173,14 @@ before(async () => {
   await new Promise((r) => stripeMock.listen(0, r));
   await new Promise((r) => aiMock.listen(0, r));
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsqu-test-'));
-  const { handler, db, outbox: ob } = createApp({
+  const { handler, db, outbox: ob, runDueMessages: rd } = createApp({
     DATA_DIR: dataDir, SUPER_ADMIN_EMAIL: 'aaron@agilities.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw',
     STRIPE_SECRET_KEY: 'sk_test_platform', STRIPE_API_BASE: `http://localhost:${stripeMock.address().port}`, STRIPE_WEBHOOK_SECRET: WHSEC,
-    ANTHROPIC_API_KEY: 'sk-ant-test', ANTHROPIC_API_BASE: `http://localhost:${aiMock.address().port}`, NOTIFY_CAPTURE: '1',
+    ANTHROPIC_API_KEY: 'sk-ant-test', ANTHROPIC_API_BASE: `http://localhost:${aiMock.address().port}`, NOTIFY_CAPTURE: '1', DISABLE_WORKER: '1',
   });
   appDb = db;
   outbox = ob;
+  runDue = rd;
   server = http.createServer(handler);
   await new Promise((r) => server.listen(0, r));
   base = `http://localhost:${server.address().port}`;
@@ -187,7 +189,7 @@ after(() => { server.close(); stripeMock.close(); aiMock.close(); fs.rmSync(data
 
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 const SIG = 'data:image/png;base64,' + 'A'.repeat(400);
-let mikeId, mikeSlug, outbox;
+let mikeId, mikeSlug, outbox, runDue;
 
 test('super admin creates a business; owner sets password and must accept agreements', async () => {
   assert.equal((await superA('GET', '/api/super/overview')).status, 401);
@@ -812,6 +814,150 @@ test('service pages with the same name get their own addresses', async () => {
   assert.match((await anon('GET', `/s/${mikeSlug}/services/awning-repair-${two.id}`)).text, /<p>Second\.<\/p>/);
   await mike('PATCH', `/api/products/${one.id}`, { active: false });
   await mike('PATCH', `/api/products/${two.id}`, { active: false });
+});
+
+// ---------- owner features ----------
+// Local wall-clock time `hh:mm` on the first day at or after `after` (in the business's time zone).
+function localAt(after, hhmm, tz) {
+  const d = owner.localParts(after, tz).date;
+  const t = owner.zonedTimeToUtc(d, hhmm, tz);
+  return t >= after ? t : owner.zonedTimeToUtc(owner.addDays(d, 1), hhmm, tz);
+}
+const sentTo = (to, from = 0) => outbox.slice(from).filter((m) => m.to === to);
+// A signed and paid (cash) job for a customer, with the consent boxes they chose when signing.
+async function paidJob({ name, phone, email, subscribe_email = false, subscribe_sms = false, cents = 25000 }) {
+  const q = (await mike('POST', '/api/quotes', {})).json;
+  await mike('PUT', `/api/quotes/${q.id}`, { title: 'Water pump', customer_name: name, customer_phone: phone, customer_email: email, rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Water pump', qty: 1, unit_cents: cents }] });
+  const pub = (await anon('GET', `/api/public/proposals/${q.token}`)).json;
+  const s = await anon('POST', `/api/public/proposals/${q.token}/sign`, { name, agree: true, signature: SIG, terms_version: pub.customer_terms?.version, phone, email, subscribe_email, subscribe_sms });
+  assert.equal(s.status, 200, JSON.stringify(s.json));
+  assert.equal((await mike('POST', `/api/quotes/${q.id}/payments`, { method: 'cash' })).status, 200);
+  await new Promise((r) => setTimeout(r, 20));
+  return { q, pay: appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'paid'`).get(q.id) };
+}
+const reviewRows = (payId) => appDb.prepare(`SELECT * FROM scheduled_messages WHERE kind = 'review' AND ref_id = ? ORDER BY id`).all(payId);
+
+test('business time zone: each business picks its own; receipts show dates in it', async () => {
+  const st = (await mike('GET', '/api/owner-settings')).json;
+  assert.equal(st.timezone, 'America/Denver', 'Mountain time until the owner changes it');
+  assert.ok(st.timezones.some(([v]) => v === 'America/Phoenix'));
+  assert.equal((await mike('PUT', '/api/owner-settings', { timezone: 'Mars/Olympus' })).status, 400);
+  assert.equal((await other('PUT', '/api/owner-settings', { timezone: 'America/Los_Angeles' })).status, 200);
+  assert.equal((await mike('GET', '/api/owner-settings')).json.timezone, 'America/Denver', 'another business’s choice doesn’t touch Mike’s');
+
+  // Paid at 06:30 UTC on Nov 3: still Nov 2 in Mountain time, already Nov 3 in Eastern time.
+  const pay = appDb.prepare(`SELECT token FROM payments WHERE tenant_id = ? AND status = 'paid' ORDER BY id LIMIT 1`).get(mikeId);
+  appDb.prepare(`UPDATE payments SET paid_at = '2026-11-03 06:30:00' WHERE token = ?`).run(pay.token);
+  assert.match((await anon('GET', '/r/' + pay.token)).text, /<dt>Date<\/dt><dd>November 2, 2026<\/dd>/);
+  assert.equal((await mike('PUT', '/api/owner-settings', { timezone: 'America/New_York' })).json.timezone, 'America/New_York');
+  assert.match((await anon('GET', '/r/' + pay.token)).text, /<dt>Date<\/dt><dd>November 3, 2026<\/dd>/);
+
+  // Wall-clock times convert correctly, including daylight saving time and Arizona.
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-11-20', '09:00', 'America/New_York')), '2026-11-20 14:00:00');
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-07-01', '09:00', 'America/Denver')), '2026-07-01 15:00:00');
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-07-01', '09:00', 'America/Phoenix')), '2026-07-01 16:00:00');
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-03-08', '09:00', 'America/Chicago')), '2026-03-08 14:00:00', 'the day clocks spring forward');
+});
+
+test('review requests: on with a Google review link, consent respected, quiet hours, once only, 90-day limit', async () => {
+  const tz = 'America/New_York';
+  // Without a review link: nothing is scheduled and the receipt has no review button.
+  const site = (await mike('GET', '/api/website')).json;
+  assert.equal((await mike('PUT', '/api/website', { ...site.profile, links: { ...site.profile.links, google_review: '' } })).status, 200);
+  assert.equal((await mike('GET', '/api/owner-settings')).json.review.active, false);
+  const none = await paidJob({ name: 'Nora None', phone: '801-555-0150', email: 'nora@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(none.pay.id).length, 0);
+  assert.doesNotMatch((await anon('GET', '/r/' + none.pay.token)).text, /Google review/);
+
+  assert.equal((await mike('PUT', '/api/website', { ...site.profile, links: { ...site.profile.links, google_review: 'https://g.page/r/mike-rv/review' } })).status, 200);
+  const st = (await mike('GET', '/api/owner-settings')).json.review;
+  assert.deepEqual([st.enabled, st.active, st.delay_hours], [true, true, 24], 'on by default once the link exists');
+  assert.equal((await mike('PUT', '/api/owner-settings', { review_message: 'hi' })).status, 400);
+  assert.equal((await mike('PUT', '/api/owner-settings', { review_delay_hours: 5 })).status, 400);
+
+  // Rita agreed to emails and texts.
+  const rita = await paidJob({ name: 'Rita Reyes', phone: '801-555-0161', email: 'rita@example.test', subscribe_email: true, subscribe_sms: true });
+  const receipt = (await anon('GET', '/r/' + rita.pay.token)).text;
+  assert.match(receipt, /Happy with the work\? Leave us a Google review\./);
+  assert.match(receipt, /href="https:\/\/g\.page\/r\/mike-rv\/review"/);
+  const deposit = appDb.prepare(`SELECT token FROM payments WHERE tenant_id = ? AND kind = 'deposit' AND status = 'paid' LIMIT 1`).get(mikeId);
+  assert.doesNotMatch((await anon('GET', '/r/' + deposit.token)).text, /Google review/, 'not on deposit receipts: the work isn’t done yet');
+  let rows = reviewRows(rita.pay.id);
+  assert.deepEqual(rows.map((r) => r.channel), ['email', 'sms']);
+  const due = new Date(owner.parseUtc(rita.pay.paid_at).getTime() + 24 * 3600_000);
+  assert.ok(rows.every((r) => r.send_after === owner.utcString(due)), 'a day after payment');
+
+  let mark = outbox.length;
+  await runDue(new Date(due.getTime() - 60_000));
+  assert.equal(sentTo('rita@example.test', mark).length + sentTo('+18015550161', mark).length, 0, 'not before the delay');
+
+  // Due at 10pm local: the email goes, the text waits for 8am.
+  const late = localAt(due, '22:00', tz);
+  await runDue(late);
+  const mail = sentTo('rita@example.test', mark);
+  assert.equal(mail.length, 1);
+  assert.match(mail[0].subject, /How did we do\?/);
+  assert.match(mail[0].text, /Hi Rita,/);
+  assert.match(mail[0].text, /https:\/\/g\.page\/r\/mike-rv\/review/);
+  assert.match(mail[0].text, /801-232-4995/, 'business phone');
+  const unsub = /\/u\/([\w-]+)/.exec(mail[0].text)[0];
+  assert.match(mail[0].headers['List-Unsubscribe'], new RegExp(unsub));
+  assert.equal(sentTo('+18015550161', mark).length, 0, 'no texts after 8pm');
+  const sms = appDb.prepare(`SELECT * FROM scheduled_messages WHERE kind = 'review' AND ref_id = ? AND channel = 'sms'`).get(rita.pay.id);
+  const eight = owner.zonedTimeToUtc(owner.addDays(owner.localParts(late, tz).date, 1), '08:00', tz);
+  assert.deepEqual([sms.status, sms.send_after], ['pending', owner.utcString(eight)]);
+
+  // Two workers at 8:01am (a second app on the same database): the text goes out exactly once.
+  const second = createApp({ DATA_DIR: dataDir, NOTIFY_CAPTURE: '1', DISABLE_WORKER: '1' });
+  await Promise.all([runDue(new Date(eight.getTime() + 60_000)), second.runDueMessages(new Date(eight.getTime() + 60_000)), runDue(new Date(eight.getTime() + 60_000))]);
+  const texts = [...sentTo('+18015550161', mark), ...second.outbox.filter((m) => m.to === '+18015550161')];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0].body, /^Mike Stevens Emergency RV & Trailer Repair: /);
+  assert.match(texts[0].body, /g\.page\/r\/mike-rv\/review/);
+  assert.match(texts[0].body, /Reply STOP to opt out\./);
+  await runDue(new Date(eight.getTime() + 3 * 3600_000));
+  const all = [...outbox.slice(mark), ...second.outbox];
+  assert.equal(all.filter((m) => m.to === '+18015550161').length, 1, 'the text went once');
+  assert.equal(all.filter((m) => m.to === 'rita@example.test').length, 1, 'the email went once');
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'review' AND ref_id = ? AND status = 'sent'`).get(rita.pay.id).n, 2);
+
+  // Rita pays for another job: no second request within 90 days.
+  const again = await paidJob({ name: 'Rita Reyes', phone: '801-555-0161', email: 'rita@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(again.pay.id).length, 0);
+  appDb.prepare(`UPDATE scheduled_messages SET created_at = datetime('now', '-91 days') WHERE kind = 'review' AND ref_id = ?`).run(rita.pay.id);
+  const later = await paidJob({ name: 'Rita Reyes', phone: '801-555-0161', email: 'rita@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(later.pay.id).length, 2, 'after 90 days she can be asked again');
+
+  // Consent: emails only for people who agreed to emails, texts only for people who agreed to texts.
+  const emailOnly = await paidJob({ name: 'Ed Mail', phone: '801-555-0162', email: 'ed@example.test', subscribe_email: true });
+  assert.deepEqual(reviewRows(emailOnly.pay.id).map((r) => r.channel), ['email']);
+  const neither = await paidJob({ name: 'Nat Quiet', phone: '801-555-0163', email: 'nat@example.test' });
+  assert.equal(reviewRows(neither.pay.id).length, 0);
+  // Pat unsubscribed and her text consent was removed earlier.
+  const pat = await paidJob({ name: 'Pat Camper', phone: '801-555-0199', email: 'pat@example.test' });
+  assert.equal(reviewRows(pat.pay.id).length, 0);
+
+  // Changes of mind before the send time are respected: unsubscribe and STOP.
+  const sue = await paidJob({ name: 'Sue Change', phone: '801-555-0164', email: 'sue@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(sue.pay.id).length, 2);
+  const sueToken = appDb.prepare(`SELECT unsub_token FROM customers WHERE email = 'sue@example.test'`).get().unsub_token;
+  await anon('POST', '/u/' + sueToken, 'List-Unsubscribe=One-Click', { 'Content-Type': 'application/x-www-form-urlencoded' });
+  await anon('POST', '/api/twilio/inbound', 'From=%2B18015550164&Body=STOP', { 'Content-Type': 'application/x-www-form-urlencoded' });
+  mark = outbox.length;
+  await runDue(localAt(new Date(Date.now() + 2 * 864e5), '12:00', tz));
+  assert.equal(sentTo('sue@example.test', mark).length + sentTo('+18015550164', mark).length, 0);
+  assert.deepEqual(reviewRows(sue.pay.id).map((r) => r.status), ['skipped', 'skipped']);
+  assert.ok(appDb.prepare(`SELECT 1 FROM sms_stops WHERE phone_key = '8015550164'`).get());
+  assert.equal(sentTo('ed@example.test', mark).length, 1);
+
+  // The owner can turn it off.
+  assert.equal((await mike('PUT', '/api/owner-settings', { review_requests: false })).json.review.active, false);
+  const off = await paidJob({ name: 'Otto Off', phone: '801-555-0165', email: 'otto@example.test', subscribe_email: true });
+  assert.equal(reviewRows(off.pay.id).length, 0);
+  assert.doesNotMatch((await anon('GET', '/r/' + off.pay.token)).text, /Google review/);
+  const saved = (await mike('PUT', '/api/owner-settings', { review_requests: true, review_delay_hours: 2, review_message: 'Thanks from Mike! A quick review would mean a lot.' })).json.review;
+  assert.deepEqual([saved.active, saved.delay_hours, saved.message], [true, 2, 'Thanks from Mike! A quick review would mean a lot.']);
+  assert.equal((await other('GET', '/api/owner-settings')).json.review.link, '', 'settings are per business');
 });
 
 test('bold look: banner, service tiles, highlights, service pages', async () => {

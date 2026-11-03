@@ -775,6 +775,8 @@
       if (!confirm('Remove this team member?')) return;
       await api('/api/team/' + btn.dataset.rm, { method: 'DELETE' }); businessView();
     }));
+
+    ownerBusinessExtras();
   }
 
   // ---------- website sections and local search ----------
@@ -1076,6 +1078,8 @@
       catch (err) { flash(document.getElementById('pw-msg'), err.message, 'err'); }
     });
     document.getElementById('logout').addEventListener('click', logout);
+
+    ownerSettingsCards(cfg);
   }
 
   // ---------- customer Terms & Conditions (the business is the seller of record) ----------
@@ -1393,6 +1397,63 @@
           <div class="row">${l.phone ? `<a class="btn sm" href="${telHref(l.phone)}">Call ${esc(l.phone)}</a><a class="btn ghost sm" href="${smsHref(l.phone, `Hi ${l.name}, this is ${PLATFORM}. Thanks for reaching out! Here's the link to get started: ${location.origin}/signup`)}">Text</a>` : ''}${l.email ? `<a class="btn ghost sm" href="mailto:${esc(l.email)}?subject=${encodeURIComponent(PLATFORM + ': getting your RV repair business set up')}">Email</a>` : ''}</div>
         </div>`).join('') || '<p class="empty">No leads yet.</p>'}</div>`;
     view.querySelectorAll('[data-lead]').forEach((sel) => sel.addEventListener('change', () => api('/api/super/leads/' + sel.dataset.lead, { method: 'PATCH', body: { status: sel.value } })));
+  }
+
+  // ---------- owner features: time zone ----------
+  // Adds the time zone picker to the Business page. It saves with the page's Save button.
+  async function ownerBusinessExtras() {
+    const f = document.getElementById('bf');
+    const area = document.getElementById('b-area');
+    if (!f || !area) return;
+    let st;
+    try { st = await api('/api/owner-settings'); } catch { return; }
+    area.parentElement.insertAdjacentHTML('afterend', `<div style="max-width:420px"><label for="b-tz">Time zone</label>
+      <select id="b-tz">${st.timezones.map(([v, l]) => `<option value="${esc(v)}" ${st.timezone === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <p class="small muted">Used for receipts, reminders and texting hours.</p></div>`);
+    f.addEventListener('submit', async () => {
+      const tz = document.getElementById('b-tz').value;
+      if (tz === st.timezone || !isOwner()) return;
+      try { st = await api('/api/owner-settings', { method: 'PUT', body: { timezone: tz } }); }
+      catch (err) { flash(document.getElementById('b-msg'), err.message, 'err'); }
+    });
+  }
+
+  // ---------- owner features: settings cards ----------
+  async function ownerSettingsCards(cfg) {
+    let st;
+    try { st = await api('/api/owner-settings'); } catch { return; }
+    reviewCard(st);
+  }
+
+  // ---------- owner features: review requests ----------
+  const delayLabel = (h) => (h < 24 ? `${h} hours after they pay` : h === 24 ? '1 day after they pay' : `${h / 24} days after they pay`);
+  function reviewCard(st) {
+    const anchor = document.getElementById('sf');
+    if (!anchor) return;
+    const r = st.review, ro = isOwner() ? '' : 'disabled';
+    anchor.insertAdjacentHTML('afterend', `<section class="card stack" id="rv">
+      <h2>Google review requests</h2>
+      ${!r.link ? `<p>Add your Google review link first. Open <a href="#/website">Website sections</a> and paste it under “Google and social links”.</p>` : `
+      <fieldset ${ro} class="stack" style="border:0;padding:0;margin:0">
+        <label class="check"><input type="checkbox" id="rv-on" ${r.enabled ? 'checked' : ''}> <span>Ask customers for a Google review after they pay</span></label>
+        <div style="max-width:320px"><label for="rv-delay">When to ask</label><select id="rv-delay">${r.delays.map((h) => `<option value="${h}" ${r.delay_hours === h ? 'selected' : ''}>${delayLabel(h)}</option>`).join('')}</select></div>
+        <div><label for="rv-text">Your message</label><textarea id="rv-text" rows="3" maxlength="500">${esc(r.message)}</textarea>
+          <button class="linkbtn" type="button" id="rv-reset">Use the suggested message</button></div>
+        <p class="small muted">We add your review link and phone number. Customers who agreed to emails get an email. Customers who agreed to texts also get a text, between 8am and 8pm. Nobody gets more than one request every ${r.repeat_days} days. Your receipts also show a “Leave us a Google review” button.</p>
+        <p class="alert" id="rv-alert" hidden></p>
+        ${ro ? '' : '<div><button class="btn primary" type="button" id="rv-save">Save review settings</button></div>'}
+      </fieldset>`}
+    </section>`);
+    const save = document.getElementById('rv-save');
+    if (!save) return;
+    document.getElementById('rv-reset').addEventListener('click', () => { document.getElementById('rv-text').value = r.default_message; });
+    save.addEventListener('click', async () => {
+      const el = document.getElementById('rv-alert');
+      try {
+        await api('/api/owner-settings', { method: 'PUT', body: { review_requests: document.getElementById('rv-on').checked, review_delay_hours: Number(document.getElementById('rv-delay').value), review_message: document.getElementById('rv-text').value } });
+        flash(el, 'Saved.');
+      } catch (err) { flash(el, err.message, 'err'); }
+    });
   }
 
   // ---------- router ----------

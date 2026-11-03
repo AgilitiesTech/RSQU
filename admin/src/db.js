@@ -284,4 +284,87 @@ function migrate(db) {
       at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+  migrateOwnerFeatures(db);
+}
+
+// Owner features: time zone, background sender, review requests, scheduling, invoices, update emails.
+function migrateOwnerFeatures(db) {
+  // The business's time zone (IANA name). Receipts, reminders and quiet hours use it.
+  addColumn(db, 'tenants', 'timezone', "TEXT NOT NULL DEFAULT 'America/Denver'");
+  // Review requests after payment. review_requests NULL = on by default once there's a Google review link.
+  addColumn(db, 'tenants', 'review_requests', 'INTEGER');
+  addColumn(db, 'tenants', 'review_delay_hours', 'INTEGER NOT NULL DEFAULT 24');
+  addColumn(db, 'tenants', 'review_message', 'TEXT');
+  // The owner turned on Affirm/Klarna in Stripe: show "Pay over time available at checkout".
+  addColumn(db, 'tenants', 'pay_over_time', 'INTEGER NOT NULL DEFAULT 0');
+  // 'invoice' skips signing: the customer accepts the business's terms by paying.
+  addColumn(db, 'quotes', 'kind', "TEXT NOT NULL DEFAULT 'proposal'");
+  // Private calendar feed per user (/cal/<token>.ics).
+  addColumn(db, 'users', 'cal_token', 'TEXT');
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_cal_token ON users (cal_token) WHERE cal_token IS NOT NULL;
+
+    -- Appointments.
+    CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL,
+      quote_id INTEGER REFERENCES quotes(id) ON DELETE SET NULL,
+      customer_name TEXT, customer_phone TEXT, customer_email TEXT, address TEXT,
+      start_at TEXT NOT NULL,                       -- UTC 'YYYY-MM-DD HH:MM:SS'
+      duration_min INTEGER NOT NULL DEFAULT 60,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      notes TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','en_route','done','canceled')),
+      on_way_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS jobs_tenant_start ON jobs (tenant_id, start_at);
+
+    -- Messages the background sender delivers. The wording is built when it's sent, so a changed
+    -- appointment or a customer who unsubscribed in the meantime is always respected.
+    CREATE TABLE IF NOT EXISTS scheduled_messages (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,                           -- job_confirm | job_reminder | review | campaign
+      channel TEXT NOT NULL CHECK (channel IN ('sms','email')),
+      to_addr TEXT NOT NULL,
+      ref_id INTEGER,                               -- job, payment or campaign id
+      customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+      meta TEXT,                                    -- JSON
+      send_after TEXT NOT NULL,                     -- UTC
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sending','sent','skipped','failed','canceled')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      sent_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS sched_due ON scheduled_messages (status, send_after);
+    CREATE INDEX IF NOT EXISTS sched_ref ON scheduled_messages (tenant_id, kind, ref_id);
+
+    -- Numbers that replied STOP to the platform's text number (Twilio blocks them too).
+    CREATE TABLE IF NOT EXISTS sms_stops (
+      phone_key TEXT PRIMARY KEY,
+      word TEXT,
+      at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Update and offer emails a business sent to its subscribers.
+    CREATE TABLE IF NOT EXISTS campaigns (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      subject TEXT NOT NULL,
+      body TEXT NOT NULL,
+      recipients INTEGER NOT NULL DEFAULT 0,
+      sent INTEGER NOT NULL DEFAULT 0,
+      skipped INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'sending',      -- sending | done
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS campaigns_tenant ON campaigns (tenant_id, created_at);
+  `);
 }
