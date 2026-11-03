@@ -1193,6 +1193,23 @@
   }
 
   // Super admin: all affiliates, or one affiliate's settings, referrals, ledger and payouts.
+  // Shows what a share means in dollars as it's typed, so ".25" (0.25%) isn't mistaken for 25%.
+  function sharePreview(input) {
+    const out = document.createElement('p');
+    out.className = 'small muted';
+    out.setAttribute('aria-live', 'polite');
+    input.insertAdjacentElement('afterend', out);
+    const show = () => {
+      const v = input.value.trim();
+      const n = Number(v.replace(/[%\s]/g, ''));
+      if (!v) out.textContent = '';
+      else if (!Number.isFinite(n) || n < 0 || n > 100) out.textContent = 'Enter a percentage from 0 to 100, like 25.';
+      else out.textContent = `They earn $${n.toFixed(2)} of every $100 ${PLATFORM} keeps in fees.${n > 0 && n < 1 ? ' That’s under 1%. For 25%, type 25, not .25.' : ''}`;
+    };
+    input.addEventListener('input', show);
+    show();
+  }
+
   async function superAffiliatesView(id) {
     setNav('affiliates');
     if (id) return superAffiliateView(id);
@@ -1224,6 +1241,7 @@
     const yr = document.getElementById('aff-year');
     yr.addEventListener('change', () => { document.getElementById('aff-1099').href = '/api/super/affiliate-payouts.csv?year=' + encodeURIComponent(yr.value); });
     const f = document.getElementById('aff-new'), el = f.elements;
+    sharePreview(el.share);
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
       try {
@@ -1304,6 +1322,7 @@
     const msg = document.getElementById('ad-msg');
     const done = async (text) => { await superAffiliateView(id); flash(document.getElementById('ad-msg'), text); };
     const f = document.getElementById('ad-form'), el = f.elements;
+    sharePreview(el.share);
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
       try {
