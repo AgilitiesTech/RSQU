@@ -10,7 +10,7 @@
 <body>
 <main class="doc">
 <h1>Privacy Policy</h1>
-<p class="muted small">Version 2026-11-02.2 · Effective November 2, 2026</p>
+<p class="muted small">Version 2026-11-03.1 · Effective November 3, 2026</p>
 
 <section class="card">
 <p>This Privacy Policy explains how Agilities Tech, LLC d/b/a HitchPoint (“HitchPoint”, “we”, “us”) handles personal information on our field-service platform (the “Platform”) and on the HitchPoint marketing website. The Platform powers branded websites, request forms, proposals, and payment pages for mobile service businesses, such as mobile RV and trailer repair businesses and technicians. When you use one of those sites, you will mainly see the service business’s name and brand. Online payments are made directly to the service business through its own Stripe account, so your card or bank statement shows the business’s name.</p>
@@ -33,7 +33,10 @@
 <li><strong>Request details:</strong> name, phone number, location (including GPS coordinates if you choose to share them), vehicle or equipment details, a description of the problem, and any photo you upload.</li>
 <li><strong>Proposal and signature records:</strong> the proposal you viewed, your typed name, your finger-drawn signature image, the date and time you signed, your IP address, and your device and browser information (user agent).</li>
 <li><strong>Payment information:</strong> payment amount, status, refunds, and dispute records. The service business, as merchant of record, and Stripe receive payment information from you. Card and bank account numbers are entered into and stored by Stripe, not by HitchPoint or the service business. We receive limited details such as card brand and last four digits.</li>
-<li><strong>Messages:</strong> text message alerts and related delivery records, if the business uses them.</li>
+<li><strong>Messages:</strong> text message alerts, receipts sent by text or email, appointment confirmations and reminders, “on my way” texts, review requests, update emails, and related delivery records.</li>
+<li><strong>Appointments:</strong> the date, time, place and notes for work a business schedules with you.</li>
+<li><strong>Job photos:</strong> photos the business takes of your RV or equipment for a proposal. The business chooses which ones appear on your proposal.</li>
+<li><strong>Your contact choices:</strong> whether you asked to receive updates and offers from the business by email or text, the exact wording you agreed to, and when.</li>
 </ul>
 <h3>From business users</h3>
 <ul>
@@ -42,6 +45,14 @@
 <li>Records of payments, Processing Fees, platform fees, refunds, disputes, and any subscription charges.</li>
 <li>Usage and support information, such as actions taken in the dashboard and support conversations.</li>
 </ul>
+<h3>From affiliates (people, groups, and businesses in our referral program)</h3>
+<ul>
+<li>Contact and account details: name, email, phone, login credentials, your referral code, and where you told us you’d share your link.</li>
+<li>Tax information from your IRS Form W-9: legal and business name, federal tax classification, address, taxpayer identification number (Social Security number, ITIN, or EIN), exemption codes, backup withholding status, and your electronic signature with the date, time, IP address, and browser it was signed from.</li>
+<li>Payout details: whether you want direct deposit or a check, and for direct deposit the name on the account, routing number, account number, and account type.</li>
+<li>Your clicks, referrals, earnings, and payouts.</li>
+</ul>
+<p>We encrypt taxpayer ID numbers and bank account numbers when we store them, and show only the last four digits in the app. Only Agilities staff who need the full numbers to send payouts or file tax forms can see them, and each time they do is logged. We use this information only to run the referral program, pay you, and meet tax reporting and withholding obligations. We share it only with the IRS and state tax agencies, the bank that sends your payouts, and our accountant or tax-filing provider, or as the law requires.</p>
 <h3>From people who contact us on the HitchPoint marketing website</h3>
 <ul>
 <li>If you fill out the HitchPoint business inquiry form: your name, email, phone, business name, location, and message.</li>
@@ -50,6 +61,7 @@
 <ul>
 <li>Technical data such as IP address, browser type, device information, pages viewed, and timestamps, used for security, fraud prevention, and keeping the Platform working.</li>
 <li>We use cookies and similar storage only as needed to log in and keep sessions secure. We do not use analytics or advertising cookies.</li>
+<li>If you open a partner’s referral link, we set a cookie (hp_ref) that remembers the partner’s code for 90 days so they get credit if you sign up, and we count clicks on that link per day. To count each visitor once a day we use a scrambled (hashed) form of your IP address that we delete the next day; we never store your IP address with click counts.</li>
 </ul>
 </section>
 
@@ -59,7 +71,11 @@
 <li>To deliver requests to the right business and let it respond, quote, and schedule work.</li>
 <li>To present proposals, record e-signatures, and keep a reliable record of what was agreed.</li>
 <li>To enable online payments to each business’s own Stripe account, show businesses their payment and Processing Fee records, and collect HitchPoint’s platform fee.</li>
-<li>To send text alerts about a request when a business enables them.</li>
+<li>To send text alerts about a request when a business enables them, and to send you a receipt by text and email after you pay.</li>
+<li>To send you a confirmation and a reminder for an appointment you booked, and an “on my way” text when the technician heads out. These include the business’s phone number. Texts go out only between 8am and 8pm in the business’s time zone.</li>
+<li>To ask for a review after you pay, only if you agreed to emails or texts from the business, and at most once every 90 days.</li>
+<li>To help a business draft a proposal from the job photos it takes, using an AI service (see Subprocessors). The business reviews and edits every draft before you see it.</li>
+<li>To keep each business’s list of customers who asked to receive its updates and offers, so the business can contact them and honor unsubscribe and STOP requests.</li>
 <li>To respond to business inquiries submitted on the marketing website and contact those people about the Platform.</li>
 <li>To provide support, operate billing, secure the Platform, prevent fraud, and meet legal, tax, and compliance obligations, including issuing tax information forms where required.</li>
 <li>To improve the Platform and the marketing website using account and usage information. We do not use customer information to market to customers on our own behalf.</li>
@@ -86,7 +102,8 @@
 <tr><td>Stripe</td><td>Payment processing for each business’s own Stripe account, account onboarding (identity and bank verification), payouts to businesses, and HitchPoint’s platform fees</td></tr>
 <tr><td>Twilio</td><td>Optional text message alerts</td></tr>
 <tr><td>Render</td><td>Hosting, storage, and databases</td></tr>
-<tr><td>Resend</td><td>Account emails, such as password resets</td></tr>
+<tr><td>Resend</td><td>Emails, such as password resets and receipts</td></tr>
+<tr><td>Anthropic</td><td>Drafting proposals from job photos a business takes (photos and the business’s price list are sent to Anthropic’s API, which does not use them to train its models)</td></tr>
 <tr><td>Google Fonts</td><td>Web fonts on our pages. Your browser requests the fonts from Google, which receives your IP address.</td></tr>
 <tr><td>YouTube (Google)</td><td>Videos a business adds to its website. The video’s preview image loads from Google’s servers, which receive your IP address; the YouTube player (privacy-enhanced mode) loads only if you press play.</td></tr>
 </tbody>
@@ -96,17 +113,17 @@
 
 <section class="card">
 <h2>6. We do not sell personal data</h2>
-<p>HitchPoint does not sell personal information and does not share it for cross-context behavioral advertising. We do not use phone numbers from service requests for marketing. We use contact details from the business inquiry form only to contact people about the Platform, and you can ask us to stop at any time.</p>
+<p>HitchPoint does not sell personal information and does not share it for cross-context behavioral advertising. HitchPoint does not market to customers of service businesses on its own behalf. A business sends you updates or offers only if you agreed when signing a proposal: by email unless you unchecked that box, and by text only if you checked that box. Every update email has an unsubscribe link. We use contact details from the business inquiry form only to contact people about the Platform, and you can ask us to stop at any time.</p>
 </section>
 
 <section class="card">
 <h2>7. Text messages</h2>
-<p>When you submit a request, you agree that the service business may call or text you about that request. These are service messages, not marketing. Reply STOP to opt out of texts; message and data rates may apply. Text messages are sent through Twilio.</p>
+<p>When you submit a request, you agree that the service business may call or text you about that request, including a receipt after you pay, and confirmations, reminders, and “on my way” texts for appointments you booked. These are service messages, not marketing. A business texts you offers or review requests only if you checked the box to receive them; consent isn’t required to buy. Reply STOP to stop all texts to your number, including service messages, or HELP for help; message and data rates may apply. Text messages are sent through Twilio.</p>
 </section>
 
 <section class="card">
 <h2>8. How long we keep information</h2>
-<p>We keep information while a business’s account is active and as long as needed for the purposes above. Signed proposals, signature records, and payment, refund, and dispute records may be kept longer to resolve disputes, enforce agreements, and meet tax and legal obligations. Inquiry form submissions are kept as long as needed to follow up and then deleted on request or when no longer needed. When a business closes its account, it may request an export of its records; afterward we delete or de-identify information unless we must keep it.</p>
+<p>We keep information while a business’s account is active and as long as needed for the purposes above. Signed proposals, signature records, and payment, refund, and dispute records may be kept longer to resolve disputes, enforce agreements, and meet tax and legal obligations. Inquiry form submissions are kept as long as needed to follow up and then deleted on request or when no longer needed. Affiliates’ W-9s and payout records are kept for at least 4 years after our last payment to the affiliate, as tax rules require. When a business closes its account, it may request an export of its records; afterward we delete or de-identify information unless we must keep it.</p>
 </section>
 
 <section class="card">

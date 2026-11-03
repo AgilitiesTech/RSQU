@@ -2,7 +2,11 @@
 // the cities it serves, hours, credentials, FAQs, videos, links to its Google and social profiles,
 // and downloadable customer resources (PDFs). Stored as JSON in tenants.site_profile.
 
-export const LIMITS = { cities: 20, credentials: 20, faqs: 20, videos: 12, resources: 20, resourceBytes: 10_000_000 };
+export const LIMITS = { cities: 20, credentials: 20, faqs: 20, videos: 12, resources: 20, resourceBytes: 10_000_000, highlights: 4 };
+// Site looks. 'classic': light, the request form beside the headline. 'bold': dark header with a
+// menu, a full-width banner image, service tiles with pictures and a highlights bar.
+export const THEMES = ['classic', 'bold'];
+export const HIGHLIGHT_ICONS = ['tools', 'shield', 'gear', 'pin', 'clock', 'star', 'phone', 'truck'];
 export const DAYS = [['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'], ['thu', 'Thursday'], ['fri', 'Friday'], ['sat', 'Saturday'], ['sun', 'Sunday']];
 export const STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
 const LINK_KEYS = ['google_profile', 'google_review', 'youtube', 'facebook', 'instagram'];
@@ -53,6 +57,7 @@ export function defaultProfile() {
     service_phrase: '', base_city: '', base_state: '', radius_miles: null,
     cities: [], hours: { always_open: false, note: '', days: {} },
     credentials: [], faqs: [], videos: [], links: {}, search_console: '', resources: [],
+    theme: 'classic', banner: { desktop: '', mobile: '', alt: '' }, highlights: [],
   };
 }
 
@@ -64,7 +69,9 @@ export function parseProfile(raw) {
   out.hours = { ...d.hours, ...(out.hours || {}) };
   out.hours.days = out.hours.days && typeof out.hours.days === 'object' ? out.hours.days : {};
   out.links = out.links && typeof out.links === 'object' ? out.links : {};
-  for (const k of ['cities', 'credentials', 'faqs', 'videos', 'resources']) if (!Array.isArray(out[k])) out[k] = [];
+  for (const k of ['cities', 'credentials', 'faqs', 'videos', 'resources', 'highlights']) if (!Array.isArray(out[k])) out[k] = [];
+  if (!THEMES.includes(out.theme)) out.theme = 'classic';
+  out.banner = { ...d.banner, ...(out.banner && typeof out.banner === 'object' ? out.banner : {}) };
   return out;
 }
 
@@ -159,6 +166,18 @@ export function cleanProfile(input, current) {
     out.resources.push({ ...cur, title: str(r.title, 120) || cur.title, description: str(r.description, 300) });
   });
   for (const r of current.resources || []) if (!kept.has(r.file)) out.resources.push(r); // never drop files here
+
+  if (current.import) out.import = current.import; // set by a migration script, never edited here
+  out.theme = THEMES.includes(b.theme) ? b.theme : 'classic';
+  // Banner image files are managed by their own upload route; only the description changes here.
+  out.banner = { desktop: current.banner?.desktop || '', mobile: current.banner?.mobile || '', alt: str(b.banner && b.banner.alt, 200) };
+  list(b.highlights, LIMITS.highlights + 1).forEach((h, i) => {
+    const title = str(h && h.title, 40), text = str(h && h.text, 80);
+    if (!title && !text) return;
+    if (!title) { errors[`highlights.${i}.title`] = 'Add a short title.'; return; }
+    out.highlights.push({ icon: HIGHLIGHT_ICONS.includes(h.icon) ? h.icon : 'star', title, text });
+  });
+  if (out.highlights.length > LIMITS.highlights) errors.highlights = `Show up to ${LIMITS.highlights} highlights.`;
 
   if (Object.keys(errors).length) throw new ProfileError(errors);
   return out;
