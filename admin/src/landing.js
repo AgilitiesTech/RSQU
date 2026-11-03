@@ -10,10 +10,10 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':
 
 const FAQ = [
   ['What is HitchPoint?', 'HitchPoint is business software for mobile RV and trailer repair technicians. It gives you a branded website with a service request form, a job inbox with the customer’s GPS location and photos, onsite quotes customers sign on your phone, deposits, and card and bank payments that are deposited to your bank account.'],
-  ['How much does HitchPoint cost?', 'There is no monthly fee and no setup fee. When a customer pays online, a single Processing Fee is taken out before your payout: Stripe’s actual processing fee for that payment plus 3%. Cash and check payments you record yourself have no fee.'],
-  ['How do I get paid, and how fast?', 'Customers pay by card or bank on a secure Stripe checkout. After the payment clears, your share is sent to your bank account by direct deposit through Stripe, typically about two business days later. Your first payout can take longer while Stripe verifies your account.'],
+  ['How much does HitchPoint cost?', 'There is no monthly fee and no setup fee. When a customer pays online, a single Processing Fee applies: Stripe’s processing fee for that payment (billed to you by Stripe) plus HitchPoint’s 3%. Cash and check payments you record yourself have no fee.'],
+  ['How do I get paid, and how fast?', 'Customers pay your business directly by card or bank on a secure Stripe checkout, into your own Stripe account. Stripe pays out to your bank account by direct deposit, typically about two business days after a payment clears. Your first payout can take longer while Stripe verifies your account.'],
   ['What do I need to sign up?', 'About 15 minutes, your business name, and the details Stripe needs to verify you and pay you: your legal name or business name, EIN or SSN, address, a bank account for direct deposit, and a photo ID.'],
-  ['Do my customers see HitchPoint?', 'Your website, proposals and payment pages show your business name, logo and colors. Customers’ card statements show HITCHPOINT followed by a short form of your business name, because HitchPoint processes the payment for you.'],
+  ['Do my customers see HitchPoint?', 'Your website, proposals and payment pages show your business name, logo and colors, and customers’ card statements show your business name. Your business is the seller: customers pay you directly through your own Stripe account, under your own Terms and Conditions.'],
   ['Do I need my own website or domain?', 'No. Every business gets a hosted website with a request form. You can point your own domain at it, or connect the request form to a website you already have.'],
   ['Can I collect a deposit before I roll?', 'Yes. Set a diagnosis or trip deposit, send the customer a payment link or take it on your phone, and it is credited automatically on the job’s quote.'],
   ['Can customers book fixed-price packages like winterizing?', 'Yes. Mark any service as bookable, such as an onsite winterizing package, and customers can book it from your website with a preferred date.'],
@@ -270,7 +270,7 @@ ${ridge('#F4EBDD', true)}
   <div class="price" style="margin-top:28px">
     <div class="sign">
       <p class="big">$0<small> per month</small></p>
-      <p>No setup fee. When a customer pays online, one <strong>Processing Fee</strong> comes out before your payout: Stripe’s actual fee for that payment plus 3%. It covers card and bank processing, your website, the app and direct deposit.</p>
+      <p>No setup fee. When a customer pays online, one <strong>Processing Fee</strong> applies: Stripe’s fee for that payment (billed by Stripe) plus HitchPoint’s 3%. The 3% covers your website, the app, proposals and e-signatures.</p>
       <p style="margin-bottom:0"><strong>Cash and checks are free.</strong> Record them in a tap and nothing is deducted.</p>
     </div>
     <table>
@@ -378,11 +378,13 @@ Sitemap: ${origin}/sitemap.xml
 `;
 }
 
-export function sitemapXml(origin) {
-  const urls = ['/', '/signup', '/legal/terms', '/legal/privacy', '/legal/payment-terms'];
+// `extra` holds absolute URLs of business sites hosted on the platform domain.
+export function sitemapXml(origin, extra = []) {
+  const urls = ['/', '/signup', '/legal/terms', '/legal/privacy', '/legal/payment-terms'].map((u) => origin + u).concat(extra);
+  const x = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls.map((u) => `  <url><loc>${origin}${u}</loc></url>`).join('\n')}
+${urls.map((u) => `  <url><loc>${x(u)}</loc></url>`).join('\n')}
 </urlset>
 `;
 }
@@ -397,7 +399,7 @@ export function llmsTxt(origin, email) {
 - Price: no monthly fee and no setup fee. Online payments carry one Processing Fee, deducted before payout: Stripe's actual processing fee for that payment plus 3%. Cash and check payments have no fee.
 - Example: a $1,000 card payment pays out $940.70 (Stripe 2.9% + 30 cents = $29.30, plus 3% = $30.00), using Stripe's standard U.S. card pricing at the time of writing.
 - Payouts: by Stripe direct deposit, typically about two business days after a payment clears; first payouts can take longer.
-- Customers see the technician's brand. Card statements show HITCHPOINT plus the business name.
+- Customers see the technician's brand and pay the business directly; card statements show the business name. Each business is the seller and merchant of record.
 - The business owns its customer data; ${BRAND.name} is not a lead marketplace.
 - Sign-up takes about 15 minutes, including Stripe identity verification and a bank account for direct deposit.
 
