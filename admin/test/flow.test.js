@@ -207,9 +207,10 @@ test('super admin creates a business; owner sets password and must accept agreem
   assert.equal(me.needs_agreements, true);
   assert.equal((await mike('GET', '/api/requests')).status, 428);
   assert.equal((await mike('POST', '/api/agreements/accept', { agree: true })).status, 200);
-  // The business must connect its OWN Stripe account (it is the seller of record) before the dashboard opens.
+  // The business is the seller of record, so online payments wait until it connects its OWN Stripe
+  // account. The rest of the dashboard works meanwhile (requests, quotes, cash and check).
   assert.equal((await mike('GET', '/api/me')).json.needs_payout_setup, true);
-  assert.equal((await mike('GET', '/api/requests')).status, 428);
+  assert.equal((await mike('GET', '/api/requests')).status, 200);
   const c = await mike('POST', '/api/stripe/connect');
   assert.match(c.json.url, /connect\.stripe\.test\/setup\/acct_/);
   const acct = c.json.url.split('/').pop();
