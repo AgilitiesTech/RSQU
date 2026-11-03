@@ -2807,7 +2807,9 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
               if (!ctx.tenant) throw new HttpError(ctx.isSuper ? 409 : 403, ctx.isSuper ? 'Choose a business to view first.' : 'Forbidden');
               if (!ctx.isSuper && ctx.tenant.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact support.');
               if (!ctx.isSuper && needsAgreements(ctx.user)) throw new HttpError(428, 'Please accept the updated agreements.');
-              if (!ctx.isSuper && !r.onboarding && needsPayoutSetup(ctx.user, ctx.tenant)) throw new HttpError(428, 'Please connect your Stripe account first.');
+              // A business that hasn't connected its own Stripe account keeps its whole dashboard (requests,
+              // quotes, cash and check). Only online payments wait (onlineReady), and the dashboard shows a
+              // banner asking the owner to connect.
               if (r.auth === 'owner' && !ctx.isSuper && ctx.user.role !== 'owner') throw new HttpError(403, 'Only the business owner can change this.');
             }
           }
