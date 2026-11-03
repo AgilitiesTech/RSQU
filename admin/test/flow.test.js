@@ -1657,8 +1657,8 @@ test('affiliate program: links, sign-up credit, earnings, payouts and privacy', 
   // Yearly totals for 1099s.
   const year = new Date().toISOString().slice(0, 4);
   const y1099 = await superA('GET', `/api/super/affiliate-payouts.csv?year=${year}`);
-  assert.match(y1099.text, /^"Year","Business","Legal name","Address on file","Owner email","Affiliate code","W-9 on file","Payouts","Total paid"\n/);
-  assert.match(y1099.text, new RegExp(`"${year}","Mike Stevens Emergency RV & Trailer Repair","Mike Stevens RV Repair LLC","1 Main St, Ogden, UT 84401","mike@rv.test","mike-stevens","yes \\(${year}-\\d\\d-\\d\\d\\)","1","34.60"`));
+  assert.match(y1099.text, /^"Year","Affiliate","Legal name \(W-9 line 1\)","Business name \(line 2\)","Tax classification","Tax ID \(last 4\)","Address","Email","Affiliate code","W-9","Backup withholding","Payouts","Total paid","At or over \$2,000 \(1099 likely\)"\n/);
+  assert.match(y1099.text, new RegExp(`"${year}","Mike Stevens Emergency RV & Trailer Repair","Mike Stevens RV Repair LLC","","","","1 Main St, Ogden, UT 84401","mike@rv.test","mike-stevens","paper \\(${year}-\\d\\d-\\d\\d\\)","","1","34.60","no"`));
   assert.equal((await mike('GET', '/api/super/affiliate-payouts.csv')).status, 403);
 
   // Mike's page: names and his earnings only, never a referred business's payment volume.
