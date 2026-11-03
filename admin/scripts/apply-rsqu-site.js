@@ -7,6 +7,8 @@
 // Usage (Render shell): node scripts/apply-rsqu-site.js            (rsqu-mobile-rv-service, Mike's live
 //                                                                  business, else mike-stevens from seed-mike.js)
 //                       node scripts/apply-rsqu-site.js other-slug
+//                       node scripts/apply-rsqu-site.js --copy     (already moved: update only the
+//                                                                  service-area copy below)
 //                       node scripts/apply-rsqu-site.js --force
 import fs from 'node:fs';
 import path from 'node:path';
@@ -77,10 +79,41 @@ function ensureWinter(sort) {
   return true;
 }
 
+// What the site says about where Mike works and what he works on: Northern Utah, by county, RVs and
+// trailers, repair and maintenance (for local and AI search). --copy updates only these on a site
+// that has already moved, leaving everything else Mike changed alone.
+const COUNTIES = 'Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties';
+const COPY = {
+  hero_headline: 'Mobile RV and trailer repair in Northern Utah',
+  tagline: `Mobile RV and trailer repair and maintenance in Northern Utah’s ${COUNTIES}. Mike Stevens comes to your campsite, storage lot, driveway or roadside, with the calm of 30 years in the fire service.`,
+  service_area: `Northern Utah: ${COUNTIES}. South Salt Lake to North Ogden, plus Park City, Heber Valley, Morgan and Ogden Valley`,
+  about: 'RSQU Mobile RV Service is Mike Stevens’s mobile repair and maintenance service for RVs and trailers across Northern Utah: motorhomes, travel trailers, fifth wheels, toy haulers, and cargo, utility, horse and boat trailers, whether they’re parked at home, at a campsite or broken down on the road. Mike covers Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties.\n\nMike has served 30 years as a firefighter in Salt Lake City, Utah. He brings the same habits to every call: scene safety first, a size-up by phone before he rolls so he shows up ready, and straight answers. If it can be fixed on the spot, he fixes it. If it can’t, he tells you and helps you plan the next move.',
+  highlights: {
+    'All RV types': { icon: 'gear', title: 'RVs and trailers', text: 'Motorhomes · travel trailers · 5th wheels · toy haulers · utility trailers' },
+    'RVs and trailers': { icon: 'gear', title: 'RVs and trailers', text: 'Motorhomes · travel trailers · 5th wheels · toy haulers · utility trailers' },
+    'Service area': { icon: 'pin', title: 'Service area', text: `Northern Utah: ${COUNTIES}` },
+  },
+  faqs: {
+    'Does Mike come to me?': 'Yes. Mike is fully mobile for RV and trailer repair and maintenance. He works on highway shoulders, at campgrounds and RV parks, in storage lots and in driveways across Northern Utah.',
+    'What area does Mike cover?': `Northern Utah: ${COUNTIES}. That’s South Salt Lake north to North Ogden (Salt Lake City, Bountiful, Farmington, Layton, Ogden), plus the back side of the Wasatch: Park City, Heber Valley, Morgan and Ogden Valley. That includes breakdowns on I-15, I-80 and I-84.`,
+  },
+};
+
 const before = parseProfile(t.site_profile);
 if (before.import && before.import.by === 'rsqu' && !force) {
-  // Already moved: the only thing a re-run adds is a missing winterizing page. Nothing else changes.
-  if (!findProduct(WINTER_NAME)) { ensureWinter(10); console.log('Added the winterizing package and its page ($499, as on the old site). Nothing else changed.'); process.exit(0); }
+  // Already moved: a re-run adds a missing winterizing page, and with --copy updates the copy above.
+  // Nothing else changes.
+  const notes = [];
+  if (!findProduct(WINTER_NAME)) { ensureWinter(10); notes.push('Added the winterizing package and its page ($499, as on the old site).'); }
+  if (args.includes('--copy')) {
+    db.prepare('UPDATE tenants SET tagline = ?, hero_headline = ?, about = ?, service_area = ? WHERE id = ?').run(COPY.tagline, COPY.hero_headline, COPY.about, COPY.service_area, t.id);
+    const site = parseProfile(t.site_profile);
+    site.highlights = site.highlights.map((h) => COPY.highlights[h.title] || h);
+    site.faqs = site.faqs.map((f) => (COPY.faqs[f.q] ? { ...f, a: COPY.faqs[f.q] } : f));
+    db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(site), t.id);
+    notes.push('Updated the headline, description, service area, About text, the “RVs and trailers” and “Service area” highlights and the two service-area FAQs.');
+  }
+  if (notes.length) { console.log(`${notes.join(' ')} Nothing else changed.`); process.exit(0); }
   console.log(`Already applied on ${before.import.at}. Nothing changed. Run with --force to apply it again (that replaces Mike's edits to these sections).`);
   process.exit(0);
 }
@@ -97,12 +130,8 @@ const copy = (file, prefix) => {
 const remove = (name) => { if (name && ownFiles.has(name)) try { fs.unlinkSync(path.join(uploads, path.basename(name))); } catch { /* gone */ } };
 
 // ---- business details ----
-db.prepare(`UPDATE tenants SET name = ?, tagline = ?, hero_headline = ?, about = ?, primary_color = ?, accent_color = ? WHERE id = ?`).run(
-  'RSQU Mobile RV Service',
-  'Mobile RV maintenance and repair. Mike Stevens comes to your campsite, storage lot, driveway or the side of the road, with the calm of 30 years in the fire service.',
-  'Mobile RV repair that comes to you',
-  'RSQU Mobile RV Service is Mike Stevens’s mobile maintenance and repair service for motorhomes, travel trailers, fifth wheels, toy haulers and utility trailers, whether they’re parked at home, at a campsite or broken down on the road.\n\nMike has served 30 years as a firefighter in Salt Lake City, Utah. He brings the same habits to every call: scene safety first, a size-up by phone before he rolls so he shows up ready, and straight answers. If it can be fixed on the spot, he fixes it. If it can’t, he tells you and helps you plan the next move.',
-  '#C8101A', '#F0242E', t.id);
+db.prepare(`UPDATE tenants SET name = ?, tagline = ?, hero_headline = ?, about = ?, service_area = ?, primary_color = ?, accent_color = ? WHERE id = ?`).run(
+  'RSQU Mobile RV Service', COPY.tagline, COPY.hero_headline, COPY.about, COPY.service_area, '#C8101A', '#F0242E', t.id);
 
 // ---- services (price list + website) ----
 const SERVICES = [
@@ -145,16 +174,16 @@ const next = {
   highlights: [
     { icon: 'tools', title: 'On-site service', text: 'At your location' },
     { icon: 'shield', title: 'Reliable repairs', text: 'Get back on the road' },
-    { icon: 'gear', title: 'All RV types', text: 'Travel trailers · 5th wheels · motorhomes · toy haulers' },
-    { icon: 'pin', title: 'Service area', text: 'Salt Lake to Ogden, Park City and Heber' },
+    COPY.highlights['All RV types'],
+    COPY.highlights['Service area'],
   ],
   credentials: [
     { title: 'RV systems certificate training', detail: 'National RV Training Academy (NRVTA), Athens, Texas' },
     { title: '30 years in the fire service', detail: 'Salt Lake City Fire: recognizing hazards, communicating clearly and working safety-first' },
   ],
   faqs: [
-    { q: 'Does Mike come to me?', a: 'Yes. Mike is fully mobile. He works on highway shoulders, at campgrounds and RV parks, in storage lots and in driveways.' },
-    { q: 'What area does Mike cover?', a: 'From South Salt Lake north to North Ogden, including Salt Lake, Davis and Weber counties, plus the back side of the Wasatch: Park City, Heber Valley, Morgan and Ogden Valley. That includes breakdowns on I-15, I-80 and I-84.' },
+    { q: 'Does Mike come to me?', a: COPY.faqs['Does Mike come to me?'] },
+    { q: 'What area does Mike cover?', a: COPY.faqs['What area does Mike cover?'] },
     { q: 'Can I text instead of calling?', a: `Yes. Text ${t.phone || 'Mike'} with your location, your RV or trailer’s year, make and model, and a photo of the problem.` },
     { q: 'What kinds of RVs and trailers does Mike repair?', a: 'Class A, B and C motorhomes, travel trailers, fifth wheels, toy haulers, pop-up campers, and cargo, utility, horse and boat trailers.' },
     { q: 'How much does a repair cost?', a: 'Mike’s diagnosis and onsite review is $129, paid up front. He finds the problem and gives you a written quote to approve and sign on the spot. If you go ahead with the repair, the $129 is credited toward the job.' },
