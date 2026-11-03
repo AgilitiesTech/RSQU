@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { openDb, platformSettings, platformFee, quoteTotals, slugify, AGREEMENT_VERSION, BUSINESS_AGREEMENTS } from './src/db.js';
 import { hashPassword, verifyPassword, sessions, randomToken, sha256 } from './src/auth.js';
-import { stripeClient, verifyStripeSignature } from './src/stripe.js';
+import { stripeClient, verifyStripeSignature, cleanSecret, stripeSettingProblem } from './src/stripe.js';
 import * as customerTerms from './src/customer-terms.js';
 import { notifier } from './src/notify.js';
 import { renderSite, renderCityPage, renderServicePage, serviceSlug, hasPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
@@ -784,7 +784,7 @@ export function createApp(env = process.env) {
   // Stripe webhooks: platform endpoint and Connect endpoint can share this URL.
   route('POST', '/api/stripe/webhook', async (req, res) => {
     const raw = await readBody(req, 1_000_000);
-    if (!verifyStripeSignature(raw, req.headers['stripe-signature'], [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_CONNECT_WEBHOOK_SECRET])) throw new HttpError(400, 'Bad signature');
+    if (!verifyStripeSignature(raw, req.headers['stripe-signature'], [cleanSecret(env.STRIPE_WEBHOOK_SECRET), cleanSecret(env.STRIPE_CONNECT_WEBHOOK_SECRET)].filter(Boolean))) throw new HttpError(400, 'Bad signature');
     const evt = JSON.parse(raw);
     const o = evt.data?.object;
     if (['checkout.session.completed', 'checkout.session.async_payment_succeeded'].includes(evt.type) && o?.payment_status === 'paid') {
@@ -2579,15 +2579,24 @@ export function createApp(env = process.env) {
     });
   }, { auth: 'super' });
 
+  // Checks the Stripe settings in Render (never showing them) and asks Stripe to confirm the key.
   route('POST', '/api/super/stripe-check', async (req, res) => {
-    if (!stripe.enabled) return send(res, 200, { ok: false, error: 'No STRIPE_SECRET_KEY is set on the server.' });
-    const key = String(env.STRIPE_SECRET_KEY);
-    if (!/^(sk|rk)_(test|live)_[A-Za-z0-9]{20,}$/.test(key)) return send(res, 200, { ok: false, error: 'STRIPE_SECRET_KEY doesn’t look like a Stripe key. It should start with sk_test_ (or rk_test_) followed by a long string of letters and numbers, with no spaces.' });
+    const checks = [];
+    const keyProblem = env.STRIPE_SECRET_KEY ? stripeSettingProblem('STRIPE_SECRET_KEY', env.STRIPE_SECRET_KEY) : 'No STRIPE_SECRET_KEY is set on the server.';
+    // Payments on businesses' own accounts only reach HitchPoint through the Connected-accounts webhook.
+    const connect = env.STRIPE_CONNECT_WEBHOOK_SECRET ? stripeSettingProblem('STRIPE_CONNECT_WEBHOOK_SECRET', env.STRIPE_CONNECT_WEBHOOK_SECRET, 'webhook') : 'No STRIPE_CONNECT_WEBHOOK_SECRET is set, so HitchPoint won’t hear when customers pay a business. Add the signing secret of your Connected-accounts webhook in Render.';
+    const legacy = env.STRIPE_WEBHOOK_SECRET ? stripeSettingProblem('STRIPE_WEBHOOK_SECRET', env.STRIPE_WEBHOOK_SECRET, 'webhook') : '';
+    checks.push({ name: 'Webhook signing secret (connected accounts)', ok: !connect, message: connect || 'Looks right (starts with whsec_).' });
+    if (env.STRIPE_WEBHOOK_SECRET) checks.push({ name: 'Webhook signing secret (your account)', ok: !legacy, message: legacy || 'Looks right (starts with whsec_).' });
+    const mode = cleanSecret(env.STRIPE_SECRET_KEY).includes('_live_') ? 'live' : 'test';
+    if (keyProblem) return send(res, 200, { ok: false, error: keyProblem, checks });
+    const onLiveSite = /gethitchpoint\.com/i.test(env.PLATFORM_URL || env.BASE_URL || '');
+    const modeNote = onLiveSite && mode === 'test' ? ' Warning: this is a TEST key on the live site, so real customers can’t pay. Use your sk_live_ key here.' : '';
     try {
       const a = await stripe.platformAccount();
-      send(res, 200, { ok: true, test_mode: stripe.testMode, account_id: a.id, name: a.settings?.dashboard?.display_name || a.business_profile?.name || '', charges_enabled: Boolean(a.charges_enabled), details_submitted: Boolean(a.details_submitted) });
+      send(res, 200, { ok: true, test_mode: stripe.testMode, mode_note: modeNote, account_id: a.id, name: a.settings?.dashboard?.display_name || a.business_profile?.name || '', charges_enabled: Boolean(a.charges_enabled), details_submitted: Boolean(a.details_submitted), checks });
     } catch (e) {
-      send(res, 200, { ok: false, error: `Stripe rejected the key: ${e.message}` });
+      send(res, 200, { ok: false, error: `The key looks right, but Stripe turned it down: ${e.message} If you rolled (replaced) the key in Stripe, paste the new one into Render.`, checks });
     }
   }, { auth: 'super' });
 
