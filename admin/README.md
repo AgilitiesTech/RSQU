@@ -2,7 +2,7 @@
 
 **HitchPoint** (a d/b/a of Agilities) is a white-label back office for mobile RV and trailer repair businesses. The marketing site for recruiting owners is served at `/` (point the HitchPoint domain at this app). The first business on it is Mike Stevens Emergency RV & Trailer Repair.
 
-**Each business gets:** sign-up and log-in, its own brand (name, colors, logo, photo), a hosted website with a request form (`/s/<business>` or its own domain), a request inbox with photo, GPS, call/text/map, an optional up-front deposit (Mike: $129, credited toward the job), onsite quotes from its products list, a branded proposal the customer signs with a finger, its own customer Terms & Conditions (generated from a template, approved by the owner), online card and bank payments straight into **its own Stripe account** (the business is the seller and merchant of record), cash/check recording, team members, and text alerts.
+**Each business gets:** sign-up and log-in, its own brand (name, colors, logo, photo), a hosted website with a request form (`/s/<business>` or its own domain), a request inbox with photo, GPS, call/text/map, an optional up-front deposit (Mike: $129, credited toward the job), onsite quotes from its products list, a branded proposal the customer signs with a finger, its own customer Terms & Conditions (generated from a template, approved by the owner), online card and bank payments straight into **its own Stripe account** (the business is the seller and merchant of record), cash/check recording, team members, and text alerts. Also a schedule with appointment confirmations, reminders and “On my way” texts, quick invoices without a signature, Google review requests, update emails to subscribers, a QuickBooks download, and a dashboard that installs on a phone.
 
 **Agilities gets:** the HitchPoint landing page with lead capture, a super admin dashboard over every business, and a **3% platform fee** on every online payment, collected by Stripe as an application fee. Stripe bills its own processing fee to the business directly; owners see the two together as one “Processing Fee” (Stripe’s fee + 3%, same as before). Also per-business overrides of the 3%, suspend/restore, “open their dashboard” access, password reset links, agreement records, customer-terms approval records, and a CSV of all Processing Fees.
 
@@ -36,7 +36,7 @@ Online payments for a business turn on only when **both** are true: Stripe has e
 3. Developers → **Webhooks**, both to `https://<BASE_URL>/api/stripe/webhook`:
    - **Connected accounts** events `account.updated`, `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded` → secret into `STRIPE_CONNECT_WEBHOOK_SECRET`. (Payments now happen on businesses’ accounts, so checkout and refund events arrive here.)
    - **Your account** events `checkout.session.completed`, `checkout.session.async_payment_succeeded` → secret into `STRIPE_WEBHOOK_SECRET`. Only needed while payments taken under the old model are still settling.
-4. Connect → Settings → **Payment methods**: allow **ACH Direct Debit** for connected accounts (new business accounts request it; set `STRIPE_ACH_PAYMENTS=off` to stop).
+4. Connect → Settings → **Payment methods**: allow **ACH Direct Debit** for connected accounts (new business accounts request it; set `STRIPE_ACH_PAYMENTS=off` to stop). Also allow **Affirm** and **Klarna**, so businesses can offer pay over time. Checkout never sets `payment_method_types`, so each business’s own Stripe settings decide what customers see.
 5. **Refunds and the 3%:** businesses refund customers from their own Stripe Dashboard. When the `charge.refunded` event arrives, the app automatically returns the matching share of HitchPoint’s 3% (refunds the application fee proportionally, safe to replay), as the Payment Terms promise. You can see returned fees under Connect → **Collected fees**.
 
 Your 3% builds up in the HitchPoint Stripe balance and pays out to the Agilities bank account on your normal schedule.
@@ -63,8 +63,18 @@ Owners see the Stripe fee + 3% together as **Processing Fee**. Customers pay no 
 
 ### 4. Optional services
 
-- **Text alerts** (Twilio): `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`. Each business enters the number to alert on its Business page.
-- **Password reset emails** (Resend): `RESEND_API_KEY`, `EMAIL_FROM`. Without it, send reset links by hand from the business page.
+- **Texts** (Twilio): `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`. Used for owner alerts and customer texts (receipts, appointment confirmations and reminders, “On my way”, review requests for customers who agreed to texts). Each business enters the number to alert on its Business page. Point the Twilio number’s “A message comes in” webhook at `https://<BASE_URL>/api/twilio/inbound`: STOP replies are recorded for every number (no more texts of any kind to it) and START or UNSTOP lifts that.
+- **Email** (Resend): `RESEND_API_KEY`, `EMAIL_FROM`. Password resets, receipts, appointment emails, review requests and update emails. Without it, send reset links by hand from the business page.
+
+### 4a. Background sender
+
+Messages that go out later (appointment confirmations and reminders, review requests, update emails) sit in the `scheduled_messages` table. A timer inside the app sends what’s due every 30 seconds (`WORKER_INTERVAL_MS` changes that; `DISABLE_WORKER=1` turns it off, which the tests do and drive it with `runDueMessages(now)` instead).
+
+- Each message is claimed with one `UPDATE … WHERE status = 'pending'`, so it goes out once, even with more than one copy of the app running.
+- Texts only go out 8am to 8pm in the business’s time zone (Business page). Outside those hours they wait for 8am.
+- The wording, the appointment and the customer’s consent are checked when the message is sent, so a moved appointment, an unsubscribe or a STOP always wins.
+- Update emails go out in batches of 50 per run.
+- A message that was being sent when the app stopped stays marked “sending” and isn’t retried, so nobody gets it twice.
 
 ### 5. Custom domains
 
@@ -99,8 +109,19 @@ A business can serve its hosted site from its own domain: it adds a CNAME pointi
   - The exact wording, time, IP and proposal are stored with each consent.
   - After any payment (card, cash or check), the customer gets a receipt link (`/r/<token>`) by text and email, once.
   - Quotes → Customers lists everyone and what they agreed to, with a CSV download. Email unsubscribe is at `/u/<token>`: GET asks, POST unsubscribes, including mail apps' one-click.
-- **Products:** prices for quotes; “Show on website” lists one on the site; “Customers can book it” makes a fixed-price package bookable from the form.
-- **Settings:** customer Terms & Conditions status, their own Stripe account (opens the Stripe Dashboard for refunds, disputes and payouts), recent online payments with the Processing Fee on each, the deposit name and amount, default tax and job notes, change password.
+- **Products:** prices for quotes; “Show on website” lists one on the site; “Customers can book it” makes a fixed-price package bookable from the form. On phones the menu has five items (Requests, Schedule, Quotes, Business, Settings), so Products is a card on the Business page.
+- **Time zone** (Business page; Mountain by default): receipt dates, reminders, texting hours and the QuickBooks download use it.
+- **Schedule** (`#/schedule`): day and week lists with today highlighted. Book from scratch or with “Schedule this job” on a request or quote. Pick who’s going.
+  - The customer gets a confirmation email and text right away and a reminder the day before at 9am. If the time changes, they get the new time and the old reminder is dropped. These are appointment messages for a job the customer asked for, so they don’t need the offers opt-in, but they never go to a number that replied STOP. Every message has the business phone. The owner can uncheck the box to book without messaging.
+  - “On my way” texts the customer “{business} is on the way, about N minutes” right away, only between 8am and 8pm.
+  - Each person gets a private calendar link (`/cal/<token>.ics`) for Google or Apple Calendar: owners see every appointment, team members see theirs. “Make a new link” turns the old one off.
+- **Quick invoices** (Quotes → New invoice): bill for work without a proposal to sign. The customer page says “Invoice” with a Pay button; paying accepts the business’s current Terms & Conditions, recorded on the payment and in Stripe like the deposit page. Cash, check, tax, deposits and receipts work the same.
+- **Google review requests** (Settings): with a Google review link on the Website page, receipts for paid work show “Happy with the work? Leave us a Google review.” A follow-up goes out a set time after payment (1 day by default): by email to customers who agreed to emails, by text only to customers who agreed to texts, never after an unsubscribe or STOP, and at most once per customer every 90 days. The owner can turn it off and edit the message.
+- **Email subscribers** (Quotes → Customers → Email subscribers, owners only): a subject and plain-text message to customers who agreed to email updates, with a test to yourself first. Every email has the business name, its mailing address from Customer Terms details (required before sending), and a one-click unsubscribe link with `List-Unsubscribe` headers. One per business per 24 hours; the `campaigns` table keeps the log and counts. Texts to subscribers aren’t offered: state texting laws and carrier registration come first.
+- **Pay over time** (Settings → Payments): steps to turn on Affirm and Klarna in the business’s Stripe Dashboard. Once the owner checks “I turned these on”, proposals and invoices of $50 or more say “Pay over time available at checkout”.
+- **Download for QuickBooks** (Settings, owners only): a CSV of paid payments for a date range with Date, Customer, Description, Amount, Method, Processing fees, Net and Reference. Every cell is quoted and formula characters are neutralized. A live QuickBooks connection needs Intuit app approval, so it isn’t built.
+- **Install on a phone:** the dashboard has a web app manifest and a service worker (`/admin/sw.js`) that keeps the app shell and shows an offline page. It never stores `/api/` responses. Phones see a dismissible “Add HitchPoint to your home screen” tip on Requests.
+- **Settings:** customer Terms & Conditions status, their own Stripe account (opens the Stripe Dashboard for refunds, disputes and payouts), pay over time, recent online payments with the Processing Fee on each, the deposit name and amount, default tax and job notes, review requests, the QuickBooks download, change password.
 - **Customer Terms & Conditions** (Settings → Review your terms): one-time business details, the generated draft, edits, and the owner’s final approval. Online payments turn on after approval.
 - **Sign-up:** create the account, accept the agreements, then connect their own Stripe account (required before the dashboard opens).
 

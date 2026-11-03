@@ -594,7 +594,7 @@ export function createApp(env = process.env) {
       // The business's customer Terms & Conditions: the version signed, or the current one to accept.
       customer_terms: publicTerms(t, full.customer_terms_version),
       photos: full.photos.filter((ph) => ph.show).map((ph) => ({ url: `/api/public/proposals/${encodeURIComponent(q.token)}/photos/${encodeURIComponent(ph.file)}` })),
-      customer_phone: full.signed_at || !phoneKey(full.customer_phone) ? undefined : full.customer_phone, customer_email: full.signed_at ? undefined : full.customer_email,
+      customer_phone: full.signed_at || full.status === 'paid' || !phoneKey(full.customer_phone) ? undefined : full.customer_phone, customer_email: full.signed_at || full.status === 'paid' ? undefined : full.customer_email,
       // Unchecked for anyone who unsubscribed before, so re-subscribing takes a deliberate check.
       subscribe_email_default: (() => { const c = findCustomer(t.id, full.customer_phone, full.customer_email); return !(c && c.email_unsubscribed_at && !c.email_opt_in); })(),
       consent: { email: consentText.email(t.name), sms: consentText.sms(t.name) },

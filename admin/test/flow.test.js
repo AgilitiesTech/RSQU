@@ -1172,6 +1172,8 @@ test('quick invoices: no signature, the customer accepts the terms by paying, re
   assert.match(receipt, /View the invoice/);
   assert.equal(reviewRows(row.id).length, 1, 'review request by email: Ivy agreed to emails, not texts');
   assert.equal((await pay({ terms_version: 1 })).status, 409, 'already paid');
+  const after = (await anon('GET', `/api/public/proposals/${inv.token}`)).json;
+  assert.deepEqual([after.status, after.customer_phone, after.customer_email], ['paid', undefined, undefined], 'contact details hidden once paid');
 
   // Cash or check works the same, without a signature.
   const cash = (await mike('POST', '/api/invoices', {})).json;
