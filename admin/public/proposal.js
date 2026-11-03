@@ -58,6 +58,7 @@
           ${t.tax ? `<dt>Sales tax (${q.tax_rate_bp / 100}%)</dt><dd>${money(t.tax)}</dd>` : ''}
           <dt>Total</dt><dd>${money(t.total)}</dd>
           ${t.credit ? `<dt>Deposit already paid</dt><dd>−${money(t.credit)}</dd>` : ''}
+          ${t.paid && !paid ? `<dt>Already paid</dt><dd>−${money(t.paid)}</dd>` : ''}
           <dt class="big">${paid ? 'Paid' : 'Balance due'}</dt><dd class="big">${money(t.balance)}</dd>
         </dl>
         ${q.pay_over_time ? '<p class="small"><strong>Pay over time available at checkout.</strong></p>' : ''}

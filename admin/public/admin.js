@@ -531,15 +531,19 @@
 
     const pay = document.getElementById('q-pay');
     const paidList = q.payments.filter((p) => p.status === 'paid');
+    // Payments that don't match what was owed (paid after a void, paid twice, too much or too little).
+    const attention = paidList.filter((p) => p.note).map((p) => `<p class="alert err"><strong>Needs your attention:</strong> ${money(p.amount_cents)} ${p.method === 'card' ? 'paid online' : `paid by ${esc(p.method)}`} ${esc(when(p.paid_at))}. ${esc(p.note)}</p>`).join('');
     pay.innerHTML = `
       <h2>Payment</h2>
+      ${attention}
       ${q.status === 'paid' ? `<p class="alert ok">Paid in full. ${paidList.map((p) => `${money(p.amount_cents)} by ${esc(p.method)}`).join(', ')}.</p>${paidList.filter((p) => p.method === 'card').map(payoutLine).join('')}` :
-        q.signed_at || (inv && q.status !== 'void') ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. ${q.online.card_payments ? `The customer can pay online on the ${noun} page, or you can` : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
+        q.status === 'void' ? `<p class="muted">This ${inv ? 'invoice' : 'quote'} is void.</p>` :
+        q.signed_at || inv ? `<p>${q.paid_cents ? `Already paid: ${money(q.paid_cents)}. ` : ''}Balance due: <strong>${money(q.due_cents)}</strong>. ${q.online.card_payments ? `The customer can pay online on the ${noun} page, or you can` : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
         <div class="row"><button class="btn ghost" type="button" data-paid="cash">Got cash</button><button class="btn ghost" type="button" data-paid="check">Got a check</button></div>` :
-        q.status === 'void' ? '<p class="muted">This quote is void.</p>' : '<p class="muted">The customer signs the proposal first, then pays.</p>'}
+        '<p class="muted">The customer signs the proposal first, then pays.</p>'}
       ${q.status !== 'paid' ? `<div class="row" style="border-top:1px solid var(--line);padding-top:12px">${q.status === 'void' ? (q.signed_at ? '' : `<button class="linkbtn" type="button" data-st="draft">Restore ${inv ? 'invoice' : 'quote'}</button>`) : `<button class="linkbtn" type="button" data-st="void">Void this ${inv ? 'invoice' : 'quote'}</button>`}</div>` : ''}`;
     pay.querySelectorAll('[data-paid]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm(`Record ${money(q.totals.balance)} paid by ${b.dataset.paid}?`)) return;
+      if (!confirm(`Record ${money(q.due_cents)} paid by ${b.dataset.paid}?`)) return;
       try { await api(`/api/quotes/${id}/payments`, { method: 'POST', body: { method: b.dataset.paid } }); quoteView(id); } catch (err) { flash(msg, err.message, 'err'); }
     }));
     pay.querySelectorAll('[data-st]').forEach((b) => b.addEventListener('click', async () => {
@@ -1019,7 +1023,6 @@
   }
 
   // ---------- affiliates (referral revenue share) ----------
-  ICON.share = '<circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>';
   // Dates are kept in UTC on the server (holds and click days count in UTC), so they're shown in UTC too.
   const affDate = (s) => (s ? new Date(String(s).replace(' ', 'T') + (/Z$/.test(s) ? '' : 'Z')).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : '');
   const todayIso = () => new Date().toISOString().slice(0, 10);
@@ -1034,6 +1037,7 @@
   const REF_STATE = { taking_payments: '<span class="tag paid">Taking payments</span>', setting_up: '<span class="tag">Setting up</span>', inactive: '<span class="tag void">Not active</span>' };
   const PAY_METHOD = { ach: 'ACH', check: 'check', stripe: 'Stripe', other: 'other' };
   const ledgerWhat = (l) => ({
+    earnings: `Your share of ${PLATFORM}’s fees`,
     earning: `Your share of ${PLATFORM}’s fee`,
     reversal: `Taken back: ${(l.note || 'correction').toLowerCase()}`,
     adjustment: `Adjustment${l.note ? ': ' + l.note : ''}`,
@@ -1041,8 +1045,11 @@
   }[l.type] || l.type);
   const ledgerStatus = (l) => (l.type === 'payout' ? '<span class="tag">Paid out</span>'
     : l.status === 'paid' ? '<span class="tag">Paid</span>'
-      : l.status === 'available' ? '<span class="tag paid">Available</span>'
-        : `<span class="tag">Pending</span><div class="small muted">until ${esc(affDate(l.available_at))}</div>`);
+      : l.status === 'partly_paid' ? '<span class="tag">Partly paid</span>'
+        : l.status === 'available' ? '<span class="tag paid">Available</span>'
+          : l.status === 'partly_available' ? '<span class="tag paid">Partly available</span>'
+            : `<span class="tag">Pending</span>${l.available_at ? `<div class="small muted">until ${esc(affDate(l.available_at))}</div>` : ''}`);
+  const monthLabel = (m) => new Date(m + '-01T00:00:00Z').toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
 
   // Sign-up form: fill in the referral code from the link cookie or ?ref.
   async function prefillReferral() {
@@ -1102,8 +1109,7 @@
     const A = d.affiliate;
     if (!A) { view.innerHTML = `${back}<h1>Refer businesses, earn a share</h1><section class="card stack"><p>Your business isn’t in the referral program yet. To ask about joining, email <a href="mailto:support@gethitchpoint.com">support@gethitchpoint.com</a>.</p></section>`; return; }
     if (!A.link) { view.innerHTML = `${back}<h1>Refer businesses, earn a share</h1>${affTermsCard(A, true)}`; return wireTermsCard(); }
-    const fee = Math.round((50000 * A.platform_fee_bp) / 10000), cut = Math.floor((fee * A.share_bp) / 10000);
-    const line = `I use ${PLATFORM} to run my business. If you sign up with my link, I earn a share of ${PLATFORM}’s fee. It costs you nothing extra.`;
+    const line =`I use ${PLATFORM} to run my business. If you sign up with my link, I earn a share of ${PLATFORM}’s fee. It costs you nothing extra.`;
     const T = d.totals;
     view.innerHTML = `
       ${back}
@@ -1114,7 +1120,7 @@
         <h2>Your referral link</h2>
         <div class="aff-link"><input readonly id="aff-url" value="${esc(A.link)}" aria-label="Your referral link"><button class="btn primary" type="button" id="aff-copy">Copy link</button></div>
         <p>${esc(shareLine(A))}</p>
-        <p class="small muted">For example, on a $500.00 card payment ${PLATFORM} keeps ${money(fee)} and you earn ${money(cut)}. Businesses can also type your code, <code>${esc(A.code)}</code>, when they sign up.</p>
+        <p class="small muted">Businesses can also type your code, <code>${esc(A.code)}</code>, when they sign up.</p>
       </section>
       <section class="card stack">
         <h2>Tell people you earn a share</h2>
@@ -1139,8 +1145,9 @@
       </section>
       <section class="card stack">
         <div class="row between"><h2>Earnings and payouts</h2>${d.ledger.length ? '<a class="btn ghost sm" href="/api/affiliate/ledger.csv">Download CSV</a>' : ''}</div>
-        ${affTable([['Date', 'nowrap'], ['Business'], ['What it is'], ['Amount', 'num'], ['Status']],
-          d.ledger.map((l) => [esc(affDate(l.date)), esc(l.business || ''), esc(ledgerWhat(l)), smoney(l.amount_cents), ledgerStatus(l)]),
+        <p class="small muted">Your earnings from each business are added up by month. You don’t see their individual payments.</p>
+        ${affTable([['When', 'nowrap'], ['Business'], ['What it is'], ['Amount', 'num'], ['Status']],
+          d.ledger.map((l) => [esc(l.month ? monthLabel(l.month) : affDate(l.date)), esc(l.business || ''), esc(ledgerWhat(l)), smoney(l.amount_cents), ledgerStatus(l)]),
           'Nothing yet. You earn a share when a business you referred takes a card payment.')}
       </section>`;
     wireTermsCard();
@@ -1308,7 +1315,8 @@
     pf.addEventListener('submit', async (e) => {
       e.preventDefault();
       if (!confirm(`Record a payout of ${smoney(a.available_cents)} to ${a.name}? Only do this after you’ve sent the money.`)) return;
-      try { await api(`/api/super/affiliates/${id}/payouts`, { method: 'POST', body: { method: pf.elements.method.value, reference: pf.elements.reference.value, paid_on: pf.elements.paid_on.value } }); await done('Payout recorded.'); }
+      // The amount shown on this page: if the balance changed since, the server refuses and asks for a reload.
+      try { await api(`/api/super/affiliates/${id}/payouts`, { method: 'POST', body: { amount_cents: a.available_cents, method: pf.elements.method.value, reference: pf.elements.reference.value, paid_on: pf.elements.paid_on.value } }); await done('Payout recorded.'); }
       catch (err) { flash(msg, err.message, 'err'); }
     });
     const af = document.getElementById('ad-adj');
@@ -1752,6 +1760,7 @@
     anchor.insertAdjacentHTML('afterend', `<section class="card stack" id="rv">
       <h2>Google review requests</h2>
       ${!r.link ? `<p>Add your Google review link first. Open <a href="#/website">Website sections</a> and paste it under “Google and social links”.</p>` : `
+      ${r.address_ok ? '' : '<p class="alert err">Add your mailing address in <a href="#/terms">Customer Terms details</a> to send review emails.</p>'}
       <fieldset ${ro} class="stack" style="border:0;padding:0;margin:0">
         <label class="check"><input type="checkbox" id="rv-on" ${r.enabled ? 'checked' : ''}> <span>Ask customers for a Google review after they pay</span></label>
         <div style="max-width:320px"><label for="rv-delay">When to ask</label><select id="rv-delay">${r.delays.map((h) => `<option value="${h}" ${r.delay_hours === h ? 'selected' : ''}>${delayLabel(h)}</option>`).join('')}</select></div>
@@ -1775,7 +1784,6 @@
   }
 
   // ---------- owner features: scheduling ----------
-  ICON.calendar = '<rect x="3" y="4" width="18" height="18" rx="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line>';
   const JSTATUS = { scheduled: 'Scheduled', en_route: 'On the way', done: 'Done', canceled: 'Canceled' };
   const DURATIONS = [[30, '30 minutes'], [60, '1 hour'], [90, '1½ hours'], [120, '2 hours'], [180, '3 hours'], [240, '4 hours'], [360, '6 hours'], [480, 'All day (8 hours)']];
   const dayAdd = (d, n) => { const [y, m, dd] = d.split('-').map(Number); return new Date(Date.UTC(y, m - 1, dd + n)).toISOString().slice(0, 10); };
@@ -1909,7 +1917,7 @@
     const open = j.status === 'scheduled' || j.status === 'en_route';
     const KIND = { job_confirm: 'Confirmation', job_reminder: 'Reminder', job_on_way: '“On my way”' };
     const CH = { email: 'email', sms: 'text' };
-    const mstate = (m) => (m.status === 'sent' ? `Sent ${esc(m.when_label)}` : m.status === 'pending' ? (m.soon ? 'Going out now' : `Goes out ${esc(m.when_label)}`) : m.status === 'canceled' ? 'Not sent: the time changed' : m.status === 'skipped' ? `Not sent: ${esc(m.error || '')}` : m.status === 'failed' ? 'Didn’t go through' : 'Sending');
+    const mstate = (m) => (m.status === 'sent' ? `Sent ${esc(m.when_label)}` : m.status === 'pending' ? (m.soon ? 'Going out now' : `Goes out ${esc(m.when_label)}`) : m.status === 'canceled' ? (m.error === 'business suspended' ? 'Not sent: your account was suspended' : 'Not sent: the time changed') : m.status === 'skipped' ? `Not sent: ${esc(m.error || '')}` : m.status === 'failed' ? 'Didn’t go through' : 'Sending');
     const canText = j.customer_phone && !j.stopped;
     view.innerHTML = `
       <a href="#/schedule/day/${esc(j.date)}" class="small">← Schedule</a>

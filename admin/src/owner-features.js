@@ -127,12 +127,14 @@ export function jobMessage(kind, channel, { t, job, tz, updated = false, minutes
   };
 }
 
-export function reviewMessage(channel, { t, name, link, message, unsubUrl }) {
+// Emails carry the business's name and mailing address (`address` from postalAddress()), like update emails.
+export function reviewMessage(channel, { t, name, link, message, unsubUrl, address }) {
   const hi = first(name);
   if (channel === 'sms') return { text: `${t.name}: ${message} ${link}${t.phone ? ` Questions? Call ${t.phone}.` : ''} Reply STOP to opt out.` };
-  const lines = [`Hi${hi ? ' ' + hi : ''},`, '', message, '', `Leave a review: ${link}`, '', phoneLine(t) || '', t.name];
+  const lines = [`Hi${hi ? ' ' + hi : ''},`, '', message, '', `Leave a review: ${link}`, '', '--', t.name,
+    address.name && address.name !== t.name ? address.name : null, address.line || null, phoneLine(t) || null];
   if (unsubUrl) lines.push('', `You’re getting this because you agreed to emails from ${t.name}. Unsubscribe: ${unsubUrl}`);
-  return { subject: `How did we do? ${t.name}`, text: lines.filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n') };
+  return { subject: `How did we do? ${t.name}`, text: lines.filter((l) => l !== null).join('\n') };
 }
 
 export function campaignEmail({ t, subject, body, address, unsubUrl }) {
@@ -166,7 +168,9 @@ export function icsCalendar({ name, tz, host, events, now = new Date() }) {
 
 // ---------- CSV ----------
 // Every cell quoted; anything a spreadsheet could read as a formula gets a leading apostrophe.
+// Money is passed as { usd: cents }, so a refund's minus sign stays a plain number.
 export function csvCell(v) {
+  if (v && typeof v === 'object' && 'usd' in v) return `"${(Math.round(Number(v.usd) || 0) / 100).toFixed(2)}"`;
   let x = String(v ?? '').replace(/[\u0000-\u001F\u007F]/g, ' ');
   if (/^[=+\-@\t\r]/.test(x) || /^\s+[=+\-@]/.test(x)) x = "'" + x;
   return '"' + x.replace(/"/g, '""') + '"';

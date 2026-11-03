@@ -4,7 +4,8 @@ import path from 'node:path';
 
 // Bump when the platform legal documents change: every owner is asked to accept again.
 // 2026-11-02.2: businesses become the merchant of record (direct charges on their own Stripe account).
-export const AGREEMENT_VERSION = '2026-11-02.2';
+// 2026-11-02.3: Terms of Service say a referring business may get a share of HitchPoint's fees.
+export const AGREEMENT_VERSION = '2026-11-02.3';
 export const BUSINESS_AGREEMENTS = ['terms', 'privacy', 'payment-terms'];
 
 export function openDb(dataDir) {
@@ -356,6 +357,16 @@ function migrateAffiliates(db) {
       BEGIN SELECT RAISE(ABORT, 'affiliate_ledger is append-only'); END;
     CREATE TRIGGER IF NOT EXISTS affiliate_ledger_fixed BEFORE UPDATE OF affiliate_id, type, amount_cents ON affiliate_ledger
       BEGIN SELECT RAISE(ABORT, 'affiliate_ledger amounts never change'); END;
+    -- Status only moves forward: pending -> available, available -> paid (with a payout), or pending ->
+    -- paid (with a payout) once the hold has passed. A payout, once set, is never cleared or changed.
+    -- Its own name, so databases created before it get it too.
+    CREATE TRIGGER IF NOT EXISTS affiliate_ledger_moves BEFORE UPDATE OF status, payout_id ON affiliate_ledger
+      WHEN NOT ((OLD.payout_id IS NULL OR NEW.payout_id IS OLD.payout_id) AND (
+        NEW.status = OLD.status
+        OR (OLD.status = 'pending' AND NEW.status = 'available')
+        OR (OLD.status = 'available' AND NEW.status = 'paid' AND NEW.payout_id IS NOT NULL)
+        OR (OLD.status = 'pending' AND NEW.status = 'paid' AND NEW.payout_id IS NOT NULL AND OLD.available_at <= datetime('now'))))
+      BEGIN SELECT RAISE(ABORT, 'affiliate_ledger status only moves forward'); END;
   `);
   // Who referred a business, when (payments before this earn nothing), and how: link | code | admin.
   addColumn(db, 'tenants', 'referred_by_affiliate_id', 'INTEGER REFERENCES affiliates(id)');
@@ -376,6 +387,11 @@ function migrateOwnerFeatures(db) {
   addColumn(db, 'tenants', 'pay_over_time', 'INTEGER NOT NULL DEFAULT 0');
   // 'invoice' skips signing: the customer accepts the business's terms by paying.
   addColumn(db, 'quotes', 'kind', "TEXT NOT NULL DEFAULT 'proposal'");
+  // Why a payment needs the owner's attention (paid after a void, paid twice, more or less than was due).
+  addColumn(db, 'payments', 'note', 'TEXT');
+  // Refunds the business made from its Stripe Dashboard (charge.refunded), for the QuickBooks download.
+  addColumn(db, 'payments', 'refunded_cents', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn(db, 'payments', 'refunded_at', 'TEXT');
   // Private calendar feed per user (/cal/<token>.ics).
   addColumn(db, 'users', 'cal_token', 'TEXT');
   db.exec(`
@@ -444,4 +460,15 @@ function migrateOwnerFeatures(db) {
     );
     CREATE INDEX IF NOT EXISTS campaigns_tenant ON campaigns (tenant_id, created_at);
   `);
+  // STOP replies from before sms_stops existed were only written to consent_log ("Replied STOP").
+  // Copy them over once. Once only, so a later START reply isn't undone on the next restart.
+  if (!db.prepare(`SELECT 1 FROM platform_settings WHERE key = 'sms_stops_backfilled'`).get()) {
+    const ins = db.prepare('INSERT OR IGNORE INTO sms_stops (phone_key, word, at) VALUES (?,?,?)');
+    const rows = db.prepare(`SELECT address, text, at FROM consent_log WHERE channel = 'sms' AND action = 'opt_out' AND substr(text, 1, 8) = 'Replied ' ORDER BY id DESC`).all();
+    for (const r of rows) {
+      const digits = String(r.address || '').replace(/\D/g, '');
+      if (digits.length >= 10) ins.run(digits.slice(-10), r.text.slice(8).trim().toUpperCase(), r.at);
+    }
+    db.prepare(`INSERT OR IGNORE INTO platform_settings (key, value) VALUES ('sms_stops_backfilled', datetime('now'))`).run();
+  }
 }

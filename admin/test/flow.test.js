@@ -24,6 +24,11 @@ const v2Requests = [];
 const appFees = new Map(); // application fees (platform account) for refund tests
 const appFeeRefunds = [];
 const stripeFee = (amt) => Math.round(amt * 0.029) + 30;
+// A Checkout Session is open until it's paid (tests set payment_status = 'paid') or expired.
+const sessionStatus = (s) => (s.expired ? 'expired' : s.payment_status === 'paid' ? 'complete' : 'open');
+const expired = []; // sessions the app expired: [id, Stripe-Account]
+// The charge.refunded event Stripe sends from a business's account after a refund in its Dashboard.
+const chargeRefunded = (sess, amountRefunded, applicationFee) => ({ type: 'charge.refunded', account: sess.account, data: { object: { id: 'ch_' + sess.id, object: 'charge', amount: sess.amount_total, amount_refunded: amountRefunded, refunded: amountRefunded >= sess.amount_total, application_fee: applicationFee } } });
 const stripeMock = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -90,7 +95,16 @@ const stripeMock = http.createServer((req, res) => {
         terms_version: p.get('metadata[customer_terms_version]'), pi_terms_version: p.get('payment_intent_data[metadata][customer_terms_version]'), payment_status: 'unpaid',
       };
       sessions.set(id, s);
-      return ok(s);
+      return ok({ ...s, status: 'open' });
+    }
+    // Only an open session can be expired, and only on the account it belongs to.
+    if (req.method === 'POST' && (m = /^\/v1\/checkout\/sessions\/([^/]+)\/expire$/.exec(req.url))) {
+      const s = sessions.get(m[1]);
+      if (!s || (s.account || null) !== onAccount) return bad('No such checkout.session');
+      if (sessionStatus(s) !== 'open') return bad(`Only Checkout Sessions with a status in ["open"] can be expired. This one is ${sessionStatus(s)}.`);
+      s.expired = true;
+      expired.push([s.id, onAccount]);
+      return ok({ ...s, status: 'expired', url: null });
     }
     if (req.method === 'GET' && (m = /^\/v1\/checkout\/sessions\/([^?]+)\?expand\[\]=payment_intent\.latest_charge\.balance_transaction$/.exec(req.url)) && sessions.has(m[1])) {
       const s = sessions.get(m[1]);
@@ -101,7 +115,7 @@ const stripeMock = http.createServer((req, res) => {
       const bt = s.account
         ? { id: 'txn_' + s.id, fee: sf + app, net: s.amount_total - sf - app, fee_details: [{ type: 'stripe_fee', amount: sf }, { type: 'application_fee', amount: app }] }
         : { id: 'txn_' + s.id, fee: sf };
-      return ok({ ...s, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, latest_charge: { id: 'ch_' + s.id, balance_transaction: bt } } : null });
+      return ok({ ...s, status: sessionStatus(s), url: sessionStatus(s) === 'open' ? s.url : null, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, status: 'succeeded', latest_charge: { id: 'ch_' + s.id, amount_refunded: s.amount_refunded || 0, balance_transaction: bt } } : null });
     }
     if (req.method === 'POST' && req.url === '/v1/transfers') {
       const dest = accounts.get(p.get('destination'));
@@ -1256,6 +1270,44 @@ test('emails to subscribers: address required, opted-in only, unsubscribe link a
   assert.equal((await other('GET', '/api/campaigns')).json.campaigns.length, 0, 'each business sees only its own');
 });
 
+test('review fixes: invoice edits close open checkouts, voided invoices can’t be paid quietly, On my way only for live jobs', async () => {
+  const inv = (await mike('POST', '/api/invoices', {})).json;
+  const body = (cents) => ({ title: 'Water pump', customer_name: 'Rae Cole', customer_phone: '801-555-0166', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Water pump', qty: 1, unit_cents: cents, taxable: 0 }] });
+  await mike('PUT', `/api/quotes/${inv.id}`, body(10000));
+  const pay = () => anon('POST', `/api/public/invoices/${inv.token}/checkout`, { terms_version: 1, phone: '801-555-0166', email: 'rae@example.test', subscribe_email: false });
+  assert.equal((await pay()).status, 200);
+  const first = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  // Editing the amount closes the customer's open checkout and cancels that payment
+  const ex = expired.length;
+  assert.equal((await mike('PUT', `/api/quotes/${inv.id}`, body(30000))).status, 200);
+  assert.ok(expired.slice(ex).some(([id]) => id === first.stripe_session_id), 'old checkout expired');
+  assert.equal(appDb.prepare('SELECT status FROM payments WHERE id = ?').get(first.id).status, 'canceled');
+  // The same amount in a second tab gets the same checkout back
+  const a = (await pay()).json.url, b = (await pay()).json.url;
+  assert.equal(a, b);
+  // Paid while the owner tries to edit: refused, not silently changed
+  const live = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  sessions.get(live.stripe_session_id).payment_status = 'paid';
+  assert.equal((await mike('PUT', `/api/quotes/${inv.id}`, body(5000))).status, 409);
+  // A payment that lands on a voided invoice is recorded with a note for the owner, and the invoice stays void
+  const inv2 = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${inv2.id}`, body(7000));
+  await anon('POST', `/api/public/invoices/${inv2.token}/checkout`, { terms_version: 1, phone: '801-555-0166', email: 'rae@example.test' });
+  const p2 = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv2.id);
+  appDb.prepare(`UPDATE quotes SET status = 'void' WHERE id = ?`).run(inv2.id); // voided while the customer was in checkout
+  sessions.get(p2.stripe_session_id).payment_status = 'paid';
+  await anon('POST', `/api/public/payments/${p2.token}/confirm`, { session_id: p2.stripe_session_id });
+  assert.equal(appDb.prepare('SELECT status FROM quotes WHERE id = ?').get(inv2.id).status, 'void');
+  assert.match(appDb.prepare('SELECT note FROM payments WHERE id = ?').get(p2.id).note, /after you voided/);
+
+  // On my way: refused for a canceled appointment
+  const date = new Date(Date.now() + 3 * 864e5).toISOString().slice(0, 10);
+  const job = await mike('POST', '/api/jobs', { customer_name: 'Rae Cole', customer_phone: '801-555-0166', address: 'Ogden', date, time: '10:00', duration_min: 60, notify: false });
+  assert.equal(job.status, 201, JSON.stringify(job.json));
+  assert.equal((await mike('POST', `/api/jobs/${job.json.id}/status`, { status: 'canceled' })).status, 200);
+  assert.equal((await mike('POST', `/api/jobs/${job.json.id}/on-my-way`, { minutes: 20 })).status, 409);
+});
+
 test('pay over time: Checkout uses each business’s own payment methods; the note shows at $50 or more once the owner turns it on', async () => {
   // createCheckout never forces payment_method_types, so Affirm and Klarna appear when the business turns them on in Stripe.
   const seen = [];
@@ -1304,10 +1356,11 @@ test('QuickBooks download: paid payments for a date range, every cell quoted, fo
   const cell = /"(?:[^"]|"")*"/.source;
   assert.ok(lines.every((l) => new RegExp(`^${cell}(,${cell}){7}$`).test(l)), 'eight quoted cells on every line');
   const paidCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid'`).get(mikeId).n;
-  assert.equal(lines.length, paidCount + 1);
+  const refundCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid' AND refunded_cents > 0`).get(mikeId).n;
+  assert.equal(lines.length, paidCount + refundCount + 1, 'a row per payment, and one per refund');
   const evil = lines.find((l) => l.includes('HYPERLINK'));
   assert.match(evil, /^"\d{2}\/\d{2}\/\d{4}","'=HYPERLINK\(""http:\/\/evil\.test"",""Click""\)","'-2\+3 cmd \(#\d+\)","12\.34","Check","0\.00","12\.34","Receipt #\d+"$/);
-  assert.ok(!lines.some((l) => /(^|,)"[=+\-@]/.test(l)), 'no cell starts with a formula character');
+  assert.ok(!lines.some((l) => /(^|,)"(?!-\d+\.\d\d")[=+\-@]/.test(l)), 'no cell starts with a formula character (a refund amount is a plain negative number)');
   // A card payment shows Stripe's fee plus the platform share, and what the business kept.
   const card = appDb.prepare(`SELECT * FROM payments WHERE tenant_id = ? AND status = 'paid' AND method = 'card' AND transfer_status = 'direct' ORDER BY id DESC LIMIT 1`).get(mikeId);
   const row = lines.find((l) => l.includes(`"Receipt #${card.id} ${card.charge_id}"`));
@@ -1580,7 +1633,8 @@ test('affiliate program: links, sign-up credit, earnings, payouts and privacy', 
   assert.equal((await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId, from: '2999-01-01' })).status, 400);
 
   // Payouts: blocked without a W-9 and under $25.00; then the whole available balance is paid and marked.
-  const payout = (body = {}) => superA('POST', `/api/super/affiliates/${affId}/payouts`, { method: 'ach', reference: 'ACH-1001', ...body });
+  const shown = async () => (await superA('GET', `/api/super/affiliates/${affId}`)).json.affiliate.available_cents;
+  const payout = async (body = {}) => superA('POST', `/api/super/affiliates/${affId}/payouts`, { method: 'ach', reference: 'ACH-1001', amount_cents: await shown(), ...body });
   let po = await payout();
   assert.equal(po.status, 409);
   assert.match(po.json.error, /W-9/);
@@ -1615,7 +1669,11 @@ test('affiliate program: links, sign-up credit, earnings, payouts and privacy', 
   const one = page.referrals.find((x) => x.name === 'Referred RV One');
   assert.deepEqual([one.earned_cents, one.state], [2400, 'taking_payments']);
   assert.equal(page.referrals.find((x) => x.name === 'Group Shop').state, 'setting_up');
-  for (const x of page.ledger) assert.deepEqual(Object.keys(x).sort(), ['amount_cents', 'available_at', 'business', 'date', 'method', 'note', 'reference', 'status', 'type']);
+  for (const x of page.ledger) assert.deepEqual(Object.keys(x).sort(), ['amount_cents', 'business', 'date', 'method', 'month', 'note', 'reference', 'status', 'type']);
+  // Earnings come as one line per business per month, never single payments.
+  assert.ok(page.ledger.filter((x) => x.type === 'earnings').every((x) => /^\d{4}-\d\d$/.test(x.month) && x.date === null));
+  assert.equal(page.ledger.some((x) => x.type === 'earning' || x.type === 'reversal'), false);
+  assert.equal('platform_fee_bp' in page.affiliate, false);
   assert.doesNotMatch(JSON.stringify(page), /500000|15000|13500|amount_refunded|fee_cents|payment_id|description|"Cam"/);
 
   // Staff, other businesses, referred businesses and visitors can't see Mike's referral data.
@@ -1634,11 +1692,12 @@ test('affiliate program: links, sign-up credit, earnings, payouts and privacy', 
 
   // CSV: every cell quoted, formula-looking text neutralized.
   const csv = (await mike('GET', '/api/affiliate/ledger.csv')).text;
-  assert.match(csv, /^"Date","Business","What it is","Amount","Status","Available on"\n/);
-  assert.match(csv, /"'=Referred Two","Your share of HitchPoint’s fee","0.60","paid"/);
+  assert.match(csv, /^"Month or date","Business","What it is","Amount","Status"\n/);
+  assert.match(csv, /"\d{4}-\d\d","'=Referred Two","Your share of HitchPoint’s fees","0.60","paid"/);
+  assert.match(csv, /"\d{4}-\d\d","Referred RV One","Your share of HitchPoint’s fees","24.00","paid"/); // net of the refund taken back
   assert.doesNotMatch(csv, /(^|,)"=/m);
   assert.match(csv, /"Paid to you by ACH \(ACH-1001\)","-34.60","paid"/);
-  assert.match(csv, /"Taken back: customer refund","-3.00","paid"/);
+  assert.doesNotMatch(csv, /Taken back/);
 
   // Super admin detail: how each business was credited, payouts and share history.
   const det = (await superA('GET', `/api/super/affiliates/${affId}`)).json;

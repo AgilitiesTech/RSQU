@@ -158,7 +158,8 @@ export function createApp(env = process.env) {
   function quoteFull(q) {
     const items = getItems(q.id);
     const payments = db.prepare('SELECT * FROM payments WHERE quote_id = ? ORDER BY id').all(q.id);
-    return { ...q, photos: jparse(q.photos, []), ai_draft: jparse(q.ai_draft, null), items, totals: quoteTotals(q, items), payments };
+    const { totals, paid, due } = quoteDue(q, items);
+    return { ...q, photos: jparse(q.photos, []), ai_draft: jparse(q.ai_draft, null), items, totals, payments, paid_cents: paid, due_cents: due };
   }
 
   // ---------- customers, consent and receipts ----------
@@ -234,7 +235,7 @@ export function createApp(env = process.env) {
     const url = `${publicBase()}/r/${pay.token}`;
     const amount = receiptMoney(pay.amount_cents);
     const sms = toE164(phone);
-    if (sms) await notify.sms(sms, `${t.name}: Thanks${first ? ', ' + first : ''}! We received your payment of ${amount}. Your receipt: ${url}`);
+    if (sms && !smsStopped(sms)) await notify.sms(sms, `${t.name}: Thanks${first ? ', ' + first : ''}! We received your payment of ${amount}. Your receipt: ${url}`);
     if (/^\S+@\S+\.\S+$/.test(email)) {
       const c = findCustomer(t.id, phone, email);
       const unsub = c && c.email_opt_in && normEmail(c.email) === email ? `${publicBase()}/u/${c.unsub_token}` : '';
@@ -248,23 +249,60 @@ export function createApp(env = process.env) {
     }
   }
 
+  // What's still owed on a quote: the balance less quote payments already made (one can cover only
+  // part of it, for example a payment for an older amount).
+  function quoteDue(q, items = getItems(q.id)) {
+    const totals = quoteTotals(q, items);
+    const paid = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS s FROM payments WHERE quote_id = ? AND kind = 'quote' AND status = 'paid'`).get(q.id).s;
+    return { totals, paid, due: Math.max(0, totals.balance - paid) };
+  }
+  const ownerEmail = (t) => db.prepare(`SELECT email FROM users WHERE tenant_id = ? AND role = 'owner' ORDER BY id LIMIT 1`).get(t.id)?.email || t.email || '';
+
+  // Records a payment as paid. A quote is marked paid only once what's owed is covered. A payment on a
+  // voided quote, a second payment, or one for more or less than was due is kept with a note, and the
+  // owner gets a text and an email (they may need to refund it).
   function markPaid(payment, method, sessionId) {
-    if (payment.status === 'paid') return;
     const offline = method !== 'card';
-    db.prepare(`UPDATE payments SET status = 'paid', paid_at = ?, method = ?, stripe_session_id = COALESCE(?, stripe_session_id), fee_cents = CASE WHEN ? THEN 0 ELSE fee_cents END WHERE id = ?`)
+    const claimed = db.prepare(`UPDATE payments SET status = 'paid', paid_at = ?, method = ?, stripe_session_id = COALESCE(?, stripe_session_id), fee_cents = CASE WHEN ? THEN 0 ELSE fee_cents END WHERE id = ? AND status != 'paid'`)
       .run(now(), method, sessionId || null, offline ? 1 : 0, payment.id);
+    if (!claimed.changes) return;
     const t = getTenant(payment.tenant_id);
+    let note = '';
     if (payment.kind === 'deposit') {
       refreshCredits(payment.request_id);
       notify.sms(t?.notify_phone, `${money(payment.amount_cents)} deposit paid (request #${payment.request_id}).`);
     } else if (payment.quote_id) {
-      db.prepare(`UPDATE quotes SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), payment.quote_id);
       const q = db.prepare('SELECT * FROM quotes WHERE id = ?').get(payment.quote_id);
-      setRequestStatus(q?.request_id, 'paid');
-      notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
+      const { totals, paid } = quoteDue(q);
+      const before = paid - payment.amount_cents, what = q.kind === 'invoice' ? 'invoice' : 'proposal';
+      if (q.status === 'void') note = `This payment came in after you voided the ${what}. You may need to refund it.`;
+      else if (q.status === 'paid' || (before > 0 && before >= totals.balance)) note = `The ${what} was already paid, so the customer paid twice. You may need to refund ${money(payment.amount_cents)}.`;
+      else if (paid > totals.balance) note = `The customer paid ${money(paid - totals.balance)} more than was due. You may need to refund the difference.`;
+      else if (paid < totals.balance) note = `The customer paid less than the balance. ${money(totals.balance - paid)} is still due.`;
+      if (q.status !== 'void' && q.status !== 'paid' && paid >= totals.balance) {
+        db.prepare(`UPDATE quotes SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), q.id);
+        setRequestStatus(q.request_id, 'paid');
+      }
+      if (note) {
+        db.prepare('UPDATE payments SET note = ? WHERE id = ?').run(note, payment.id);
+        paymentNeedsAttention(t, q, { ...payment, method }, note);
+      } else notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
     }
     sendReceipt(payment.id).catch((e) => console.error('Receipt failed', e));
-    try { scheduleReviewRequest(payment.id); } catch (e) { console.error('Review request failed', e); } // owner features
+    if (!note) try { scheduleReviewRequest(payment.id); } catch (e) { console.error('Review request failed', e); } // owner features
+  }
+  function paymentNeedsAttention(t, q, pay, note) {
+    const what = q.kind === 'invoice' ? 'invoice' : 'proposal';
+    const link = `${publicBase()}/admin/#/quotes/${q.id}`;
+    const who = q.signer_name || q.customer_name || 'customer';
+    notify.sms(t.notify_phone, `A payment needs your attention: ${money(pay.amount_cents)} for ${what} #${q.id} (${who}). ${note} ${link}`);
+    const to = ownerEmail(t);
+    if (!to) return;
+    notify.email(to, `A payment needs your attention: ${what} #${q.id}`, [
+      'Hi,', '', `A payment of ${money(pay.amount_cents)} ${pay.method === 'card' ? 'was made online' : `was recorded (${pay.method})`} for ${what} #${q.id}, ${q.title} (${who}).`, '', note, '',
+      ...(pay.method === 'card' ? ['You refund card payments from your Stripe Dashboard.', ''] : []),
+      `Open the ${what}: ${link}`, '', platformName,
+    ].join('\n')).catch(() => {});
   }
 
   function saveImage(dataUrl, prefix, maxBytes) {
@@ -316,8 +354,17 @@ export function createApp(env = process.env) {
 
   // `termsVersion`: the customer terms version the customer accepted (signed on the proposal, or
   // shown on the payment page). Recorded on the payment and in Stripe metadata.
+  // One Checkout per payment: a reload or a second tab gets the customer's open Checkout back.
   async function startCheckout(req, t, payment, { successPath, cancelPath, email, termsVersion }) {
     if (!onlineReady(t)) throw new HttpError(503, 'Online payments aren’t set up yet for this business. Please pay directly.');
+    if (payment.stripe_session_id) {
+      const st = await checkoutState(payment);
+      if (st.state === 'paying') throw new HttpError(409, PAYING_NOW);
+      if (st.state === 'open') {
+        if (st.session.amount_total === payment.amount_cents && payment.charge_type === 'direct' && payment.stripe_account === t.stripe_account_id && st.session.url) return st.session.url;
+        await expireCheckout(payment, PAYING_NOW);
+      }
+    }
     const base = baseUrl(req);
     const sep = successPath.includes('?') ? '&' : '?';
     const terms = (termsVersion && db.prepare('SELECT * FROM customer_terms WHERE tenant_id = ? AND version = ?').get(t.id, termsVersion)) || latestTerms(t.id);
@@ -337,6 +384,45 @@ export function createApp(env = process.env) {
     db.prepare(`UPDATE payments SET stripe_session_id = ?, charge_type = 'direct', stripe_account = ?, customer_terms_version = ? WHERE id = ?`)
       .run(session.id, t.stripe_account_id, terms.version, payment.id);
     return session.url;
+  }
+
+  const PAYING_NOW = 'Your payment is going through. Refresh this page in a minute.';
+  const OWNER_PAYING_NOW = 'The customer is paying right now. Refresh in a minute.';
+  const checkoutAccount = (pay) => (pay.charge_type === 'direct' ? pay.stripe_account : undefined);
+  // Where a payment's Checkout stands at Stripe: 'open', 'paying' (finished, or a bank payment still
+  // clearing) or 'gone' (expired, failed or not found), with the session when there is one.
+  async function checkoutState(pay) {
+    if (!pay.stripe_session_id || !stripe.enabled) return { state: 'gone' };
+    let s;
+    try { s = await stripe.retrieveCheckout(pay.stripe_session_id, checkoutAccount(pay)); }
+    catch (e) {
+      if (e.status === 404 || /^No such/i.test(e.message)) return { state: 'gone' };
+      throw new HttpError(502, 'We couldn’t reach Stripe. Try again in a minute.');
+    }
+    if (s.status === 'open') return { state: 'open', session: s };
+    if (s.status === 'complete') {
+      const pi = s.payment_intent && typeof s.payment_intent === 'object' ? s.payment_intent : null;
+      const failed = s.payment_status !== 'paid' && pi && ['requires_payment_method', 'canceled'].includes(pi.status);
+      return { state: failed ? 'gone' : 'paying', session: s };
+    }
+    return { state: 'gone', session: s };
+  }
+  // Closes a payment's open Checkout so it can't be paid. If Stripe won't close it because the customer
+  // already paid, refuses with `busy`.
+  async function expireCheckout(pay, busy) {
+    if (!pay.stripe_session_id || !stripe.enabled) return;
+    try { await stripe.expireCheckout(pay.stripe_session_id, checkoutAccount(pay)); return; } catch { /* not open: find out why */ }
+    const st = await checkoutState(pay);
+    if (st.state === 'paying') throw new HttpError(409, busy);
+    if (st.state === 'open') throw new HttpError(502, 'We couldn’t reach Stripe. Try again in a minute.');
+  }
+  // Expires and cancels every unpaid card payment on a quote (all of them, or all but `keepAmount`).
+  async function closeQuoteCheckouts(quoteId, busy, keepAmount = null) {
+    const open = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND method = 'card'`).all(quoteId).filter((p) => p.amount_cents !== keepAmount);
+    for (const pay of open) {
+      await expireCheckout(pay, busy);
+      db.prepare(`UPDATE payments SET status = 'canceled' WHERE id = ? AND status = 'pending'`).run(pay.id);
+    }
   }
 
   // After an online payment succeeds, record the Processing Fee (Stripe's fee + platform share).
@@ -587,6 +673,8 @@ export function createApp(env = process.env) {
     if (!q || q.status === 'void' || !t) throw new HttpError(404, 'This proposal isn’t available.');
     if (q.status === 'draft') db.prepare(`UPDATE quotes SET status = 'sent', updated_at = ? WHERE id = ?`).run(now(), q.id);
     const full = quoteFull({ ...q, status: q.status === 'draft' ? 'sent' : q.status });
+    // Until it's paid, the balance shown is what's still owed (after any part already paid).
+    if (full.status !== 'paid') full.totals = { ...full.totals, paid: full.paid_cents, balance: full.due_cents };
     send(res, 200, {
       id: full.id, kind: full.kind || 'proposal', title: full.title, status: full.status, customer_name: full.customer_name, location: full.location, rig: full.rig,
       notes: full.notes, terms: full.terms, tax_rate_bp: full.tax_rate_bp, created_at: full.created_at,
@@ -646,13 +734,14 @@ export function createApp(env = process.env) {
     if (!q || q.status === 'void' || !t) throw new HttpError(404, 'This proposal isn’t available.');
     if (!q.signed_at) throw new HttpError(409, 'Please sign the proposal first.');
     if (q.status === 'paid') throw new HttpError(409, 'This proposal is already paid.');
-    const { balance } = quoteTotals(q, getItems(q.id));
-    if (balance < 50) throw new HttpError(409, 'Nothing is due on this proposal.');
-    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? ORDER BY id DESC`).get(q.id, balance);
+    const { due } = quoteDue(q);
+    if (due < 50) throw new HttpError(409, 'Nothing is due on this proposal.');
+    await closeQuoteCheckouts(q.id, PAYING_NOW, due); // an open Checkout for another amount can't be paid
+    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, due);
     if (!pay) {
       const tok = randomToken();
       db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, 'card')`)
-        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
+        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, due);
       pay = getPayment(tok);
     }
     const url = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email: q.customer_email, termsVersion: q.customer_terms_version });
@@ -699,6 +788,10 @@ export function createApp(env = process.env) {
       const rightAccount = pay && (pay.charge_type === 'direct' ? evt.account === pay.stripe_account : !evt.account);
       if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); syncAffiliateLedger(pay.id); }
     } else if (evt.type === 'charge.refunded' && evt.account && o?.id) {
+      // How much the business has refunded so far (for the QuickBooks download).
+      const refunded = Math.round(Number(o.amount_refunded) || 0);
+      const at = evt.created ? owner.utcString(new Date(evt.created * 1000)) : now();
+      db.prepare(`UPDATE payments SET refunded_cents = ?, refunded_at = ? WHERE charge_id = ? AND stripe_account = ? AND charge_type = 'direct' AND refunded_cents < ?`).run(refunded, at, o.id, evt.account, refunded);
       await returnPlatformFee(evt.account, o);
     } else if (evt.type === 'account.updated' && o?.id) {
       const t = db.prepare('SELECT * FROM tenants WHERE stripe_account_id = ? OR legacy_stripe_account_id = ?').get(o.id, o.id);
@@ -874,13 +967,18 @@ export function createApp(env = process.env) {
 
   route('GET', '/api/quotes/:id', async (req, res, p, url, { tenant: t }) => {
     const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
-    send(res, 200, { ...quoteFull(q), proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, quoteTotals(q, getItems(q.id)).balance) });
+    const full = quoteFull(q);
+    send(res, 200, { ...full, proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, full.due_cents) });
   }, { auth: 'tenant' });
 
   route('PUT', '/api/quotes/:id', async (req, res, p, url, { tenant: t }) => {
-    const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
-    if (q.signed_at || q.status === 'paid') throw new HttpError(409, 'This quote is signed, so it can’t be changed. Make a new quote instead.');
+    let q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
+    const locked = (x) => { if (x.signed_at || x.status === 'paid') throw new HttpError(409, 'This quote is signed, so it can’t be changed. Make a new quote instead.'); };
+    locked(q);
     const b = await json(req);
+    // A Checkout the customer still has open would charge the old amount: close it first.
+    await closeQuoteCheckouts(q.id, OWNER_PAYING_NOW);
+    q = scoped('quotes', q.id, t.id); locked(q);
     db.prepare(`UPDATE quotes SET title = ?, customer_name = ?, customer_phone = ?, customer_email = ?, location = ?, rig = ?, notes = ?, terms = ?, tax_rate_bp = ?, updated_at = ? WHERE id = ?`).run(
       clean(b.title, 200) || 'Repair proposal', clean(b.customer_name, 120), clean(b.customer_phone, 40), clean(b.customer_email, 200),
       clean(b.location, 1000), clean(b.rig, 200), clean(b.notes, 4000), clean(b.terms, 4000), Math.min(3000, cents(b.tax_rate_bp)), now(), q.id);
@@ -896,27 +994,33 @@ export function createApp(env = process.env) {
       db.prepare('UPDATE quotes SET photos = ? WHERE id = ?').run(JSON.stringify(jparse(q.photos, []).map((ph) => ({ file: ph.file, show: show.has(ph.file) ? show.get(ph.file) : ph.show }))), q.id);
     }
     refreshCredits(q.request_id);
-    const fresh = scoped('quotes', q.id, t.id);
-    send(res, 200, { ...quoteFull(fresh), proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, quoteTotals(fresh, getItems(q.id)).balance) });
+    const fresh = quoteFull(scoped('quotes', q.id, t.id));
+    send(res, 200, { ...fresh, proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, fresh.due_cents) });
   }, { auth: 'tenant' });
 
   route('POST', '/api/quotes/:id/status', async (req, res, p, url, { tenant: t }) => {
     const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
     const b = await json(req);
-    if (b.status === 'void' && q.status !== 'paid') db.prepare(`UPDATE quotes SET status = 'void', updated_at = ? WHERE id = ?`).run(now(), q.id);
-    else if (b.status === 'draft' && q.status === 'void' && !q.signed_at) db.prepare(`UPDATE quotes SET status = 'draft', updated_at = ? WHERE id = ?`).run(now(), q.id);
+    if (b.status === 'void' && q.status !== 'paid') {
+      await closeQuoteCheckouts(q.id, OWNER_PAYING_NOW); // so a voided quote can't be paid
+      db.prepare(`UPDATE quotes SET status = 'void', updated_at = ? WHERE id = ? AND status != 'paid'`).run(now(), q.id);
+    } else if (b.status === 'draft' && q.status === 'void' && !q.signed_at) db.prepare(`UPDATE quotes SET status = 'draft', updated_at = ? WHERE id = ?`).run(now(), q.id);
     send(res, 200, quoteFull(scoped('quotes', q.id, t.id)));
   }, { auth: 'tenant' });
 
   route('POST', '/api/quotes/:id/payments', async (req, res, p, url, { tenant: t }) => {
-    const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
+    let q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
     if (q.status === 'paid') throw new HttpError(409, 'Already paid.');
+    if (q.status === 'void') throw new HttpError(409, `This ${q.kind === 'invoice' ? 'invoice' : 'quote'} is void. Restore it first.`);
     const b = await json(req);
     const method = ['cash', 'check', 'other'].includes(b.method) ? b.method : 'cash';
-    const { balance } = quoteTotals(q, getItems(q.id));
+    await closeQuoteCheckouts(q.id, OWNER_PAYING_NOW); // so the customer can't pay online as well
+    q = scoped('quotes', q.id, t.id);
+    if (q.status === 'paid') throw new HttpError(409, 'Already paid.');
+    const { due } = quoteDue(q);
     const tok = randomToken();
     db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, ?)`)
-      .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance, method);
+      .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, due, method);
     markPaid(getPayment(tok), method);
     send(res, 200, quoteFull(scoped('quotes', q.id, t.id)));
   }, { auth: 'tenant' });
@@ -988,7 +1092,7 @@ export function createApp(env = process.env) {
     const rs = owner.reviewSettings(t);
     return {
       timezone: owner.tzOf(t), timezones: owner.US_TIMEZONES,
-      review: { link: rs.link, enabled: rs.enabled, active: rs.active, delay_hours: rs.delayHours, delays: owner.REVIEW_DELAYS, message: rs.message, default_message: owner.DEFAULT_REVIEW_MESSAGE, repeat_days: owner.REVIEW_REPEAT_DAYS },
+      review: { link: rs.link, enabled: rs.enabled, active: rs.active, delay_hours: rs.delayHours, delays: owner.REVIEW_DELAYS, message: rs.message, default_message: owner.DEFAULT_REVIEW_MESSAGE, repeat_days: owner.REVIEW_REPEAT_DAYS, address_ok: owner.postalAddress(t).ok },
       pay_over_time: Boolean(t.pay_over_time),
       email_enabled: notify.emailEnabled, sms_enabled: notify.smsEnabled,
     };
@@ -1057,8 +1161,10 @@ export function createApp(env = process.env) {
       const name = q?.signer_name || q?.customer_name || c.name;
       if (m.channel === 'email') {
         if (!c.email_opt_in || normEmail(c.email) !== m.to_addr) return { skip: 'The customer unsubscribed from emails.' };
+        const address = owner.postalAddress(t);
+        if (!address.ok) return { skip: 'The business mailing address is missing.' };
         const unsub = `${publicBase()}/u/${c.unsub_token}`;
-        return { to: m.to_addr, ...owner.reviewMessage('email', { t, name, link: rs.link, message: rs.message, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+        return { to: m.to_addr, ...owner.reviewMessage('email', { t, name, link: rs.link, message: rs.message, unsubUrl: unsub, address }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
       }
       if (!c.sms_opt_in || phoneKey(c.phone) !== phoneKey(m.to_addr)) return { skip: 'The customer didn’t agree to texts.' };
       if (smsStopped(m.to_addr)) return { skip: 'This number replied STOP.' };
@@ -1079,23 +1185,36 @@ export function createApp(env = process.env) {
 
   function finishMessage(m, status, error, at) {
     db.prepare('UPDATE scheduled_messages SET status = ?, error = ?, sent_at = ? WHERE id = ?').run(status, error || null, status === 'sent' ? owner.utcString(at) : null, m.id);
-    if (m.kind === 'campaign') {
-      const col = status === 'sent' ? 'sent' : status === 'skipped' ? 'skipped' : 'failed';
-      db.prepare(`UPDATE campaigns SET ${col} = ${col} + 1 WHERE id = ?`).run(m.ref_id);
-      const left = db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'campaign' AND ref_id = ? AND status IN ('pending','sending')`).get(m.ref_id).n;
-      if (!left) db.prepare(`UPDATE campaigns SET status = 'done', finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(now(), m.ref_id);
+    if (m.kind === 'campaign') campaignTally(m.ref_id, status);
+  }
+  function campaignTally(campaignId, status) {
+    const col = status === 'sent' ? 'sent' : status === 'skipped' || status === 'canceled' ? 'skipped' : 'failed';
+    db.prepare(`UPDATE campaigns SET ${col} = ${col} + 1 WHERE id = ?`).run(campaignId);
+    const left = db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'campaign' AND ref_id = ? AND status IN ('pending','sending')`).get(campaignId).n;
+    if (!left) db.prepare(`UPDATE campaigns SET status = 'done', finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(now(), campaignId);
+  }
+  // A business that isn't active sends nothing: its queued messages are canceled.
+  function cancelMessagesOfInactive() {
+    const rows = db.prepare(`SELECT m.id, m.kind, m.ref_id FROM scheduled_messages m JOIN tenants t ON t.id = m.tenant_id WHERE m.status = 'pending' AND t.status != 'active'`).all();
+    for (const m of rows) {
+      if (db.prepare(`UPDATE scheduled_messages SET status = 'canceled', error = 'business suspended' WHERE id = ? AND status = 'pending'`).run(m.id).changes && m.kind === 'campaign') campaignTally(m.ref_id, 'canceled');
     }
+    return rows.length;
   }
 
   // Sends what's due at `nowOverride` (default: now), up to `limit` messages per run (update emails
-  // go out in batches this way). Returns counts. Tests call this directly instead of waiting for the timer.
+  // go out in batches this way). Returns counts. Tests call this directly instead of waiting for the timer;
+  // they can pass a function as `nowOverride` to make the clock move during a run.
   async function runDueMessages(nowOverride, { limit = 50 } = {}) {
-    const at = nowOverride ? new Date(nowOverride) : new Date();
-    const out = { sent: 0, skipped: 0, deferred: 0, failed: 0 };
-    const due = db.prepare(`SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_after <= ? ORDER BY send_after, id LIMIT ?`).all(owner.utcString(at), limit);
+    // The time is read again for every message, so texting hours are checked right before each text.
+    const clock = typeof nowOverride === 'function' ? () => new Date(nowOverride()) : () => (nowOverride ? new Date(nowOverride) : new Date());
+    const out = { sent: 0, skipped: 0, deferred: 0, failed: 0, canceled: cancelMessagesOfInactive() };
+    const due = db.prepare(`SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_after <= ? ORDER BY send_after, id LIMIT ?`).all(owner.utcString(clock()), limit);
     for (const m of due) {
       const t = getTenant(m.tenant_id);
       if (!t) continue;
+      if (t.status !== 'active') { out.canceled += cancelMessagesOfInactive(); continue; }
+      const at = clock();
       const tz = owner.tzOf(t);
       if (m.channel === 'sms' && !owner.inTextHours(at, tz)) {
         if (db.prepare(`UPDATE scheduled_messages SET send_after = ? WHERE id = ? AND status = 'pending'`).run(owner.utcString(owner.nextTextWindow(at, tz)), m.id).changes) out.deferred++;
@@ -1282,6 +1401,7 @@ export function createApp(env = process.env) {
   // "On my way": a text right now, with the ETA the technician picked.
   route('POST', '/api/jobs/:id/on-my-way', async (req, res, p, url, { tenant: t }) => {
     const job = scoped('jobs', p.id, t.id); if (!job) throw new HttpError(404, 'Not found');
+    if (!['scheduled', 'en_route'].includes(job.status)) throw new HttpError(409, 'This appointment is done or canceled, so we didn’t text the customer.');
     const b = await json(req);
     const minutes = Math.trunc(Number(b.minutes));
     if (!(minutes >= 1 && minutes <= 240)) throw new HttpError(400, 'Enter about how many minutes away you are, from 1 to 240.');
@@ -1371,17 +1491,18 @@ export function createApp(env = process.env) {
     if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Check your email address.');
     if (phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
     if (b.subscribe_sms && !phoneKey(phone)) throw new HttpError(400, 'Add your mobile number to get texts, or uncheck that box.');
-    const { balance } = quoteTotals(q, getItems(q.id));
-    if (balance < 50) throw new HttpError(409, 'Nothing is due on this invoice.');
+    const { due } = quoteDue(q);
+    if (due < 50) throw new HttpError(409, 'Nothing is due on this invoice.');
     db.prepare('UPDATE quotes SET customer_phone = ?, customer_email = ?, updated_at = ? WHERE id = ?').run(phone || '', email || '', now(), q.id);
     if (b.subscribe_email !== undefined || b.subscribe_sms) {
       upsertCustomer(t, { name: q.customer_name, phone, email, emailOptIn: Boolean(b.subscribe_email), smsOptIn: Boolean(b.subscribe_sms), source: `Invoice #${q.id}`, ip: clientIp(req), ua: clean(req.headers['user-agent'], 400) });
     }
-    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, balance);
+    await closeQuoteCheckouts(q.id, PAYING_NOW, due); // an open Checkout for another amount can't be paid
+    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, due);
     if (!pay) {
       const tok = randomToken();
       db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, 'card')`)
-        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
+        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, due);
       pay = getPayment(tok);
     }
     const checkoutUrl = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email, termsVersion: latest?.version });
@@ -1438,7 +1559,7 @@ export function createApp(env = process.env) {
   }, { auth: 'owner' });
 
   // ---------- owner features: accounting export ----------
-  // Paid payments for a date range (in the business's time zone), ready to import into QuickBooks.
+  // Paid payments and refunds for a date range (in the business's time zone), ready to import into QuickBooks.
   route('GET', '/api/exports/quickbooks.csv', async (req, res, p, url, { tenant: t }) => {
     const tz = owner.tzOf(t);
     const today = owner.todayIn(tz);
@@ -1446,18 +1567,28 @@ export function createApp(env = process.env) {
     const to = owner.validDate(url.searchParams.get('to')) ? url.searchParams.get('to') : today;
     if (to < from) throw new HttpError(400, 'The end date is before the start date.');
     const lo = owner.utcString(owner.zonedTimeToUtc(from, '00:00', tz)), hi = owner.utcString(owner.zonedTimeToUtc(owner.addDays(to, 1), '00:00', tz));
-    const rows = db.prepare(`SELECT p.*, q.signer_name, q.customer_name AS q_name, r.name AS r_name FROM payments p LEFT JOIN quotes q ON q.id = p.quote_id LEFT JOIN requests r ON r.id = p.request_id
-      WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at >= ? AND p.paid_at < ? ORDER BY p.paid_at, p.id`).all(t.id, lo, hi);
-    const d = (c) => (c / 100).toFixed(2);
+    // Payments made in the range, and refunds made in the range (their own negative rows).
+    const pick = `SELECT p.*, q.signer_name, q.customer_name AS q_name, r.name AS r_name FROM payments p LEFT JOIN quotes q ON q.id = p.quote_id LEFT JOIN requests r ON r.id = p.request_id WHERE p.tenant_id = ? AND p.status = 'paid'`;
+    const paidRows = db.prepare(`${pick} AND p.paid_at >= ? AND p.paid_at < ?`).all(t.id, lo, hi).map((r) => ({ r, at: r.paid_at, refund: 0 }));
+    const refundRows = db.prepare(`${pick} AND p.refunded_cents > 0 AND p.refunded_at >= ? AND p.refunded_at < ?`).all(t.id, lo, hi).map((r) => ({ r, at: r.refunded_at, refund: 1 }));
+    const rows = [...paidRows, ...refundRows].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.r.id - b.r.id || a.refund - b.refund));
+    const amt = (c) => ({ usd: c }); // money cell
     const METHOD = { card: 'Card or bank (online)', cash: 'Cash', check: 'Check', other: 'Other' };
     const lines = [['Date', 'Customer', 'Description', 'Amount', 'Method', 'Processing fees', 'Net', 'Reference']];
-    for (const r of rows) {
-      const lp = owner.localParts(owner.parseUtc(r.paid_at), tz);
+    for (const { r, at, refund } of rows) {
+      const lp = owner.localParts(owner.parseUtc(at), tz);
+      const date = `${String(lp.month).padStart(2, '0')}/${String(lp.day).padStart(2, '0')}/${lp.year}`;
+      const who = r.signer_name || r.q_name || r.r_name || '', method = METHOD[r.method] || r.method;
+      if (refund) {
+        lines.push([date, who, `Refund: ${r.description}`, amt(-r.refunded_cents), method, amt(0), amt(-r.refunded_cents), `Refund of receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}`]);
+        continue;
+      }
       const card = r.method === 'card';
       const settled = !card || ['direct', 'sent'].includes(r.transfer_status);
+      // Net = amount − Stripe's fee − (platform fee − the part of it returned on refunds).
       const fees = card ? r.stripe_fee_cents + r.fee_cents - (r.fee_refunded_cents || 0) : 0;
-      lines.push([`${String(lp.month).padStart(2, '0')}/${String(lp.day).padStart(2, '0')}/${lp.year}`, r.signer_name || r.q_name || r.r_name || '', r.description, d(r.amount_cents), METHOD[r.method] || r.method,
-        settled ? d(fees) : '', settled ? d(r.amount_cents - fees) : '', `Receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}${settled ? '' : ' (fees not settled yet)'}`]);
+      lines.push([date, who, r.description, amt(r.amount_cents), method,
+        settled ? amt(fees) : '', settled ? amt(r.amount_cents - fees) : '', `Receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}${settled ? '' : ' (fees not settled yet)'}`]);
     }
     const name = `payments-${from}-to-${to}.csv`;
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
@@ -1660,12 +1791,31 @@ export function createApp(env = process.env) {
       CASE WHEN l.type = 'payout' THEN COALESCE(p.paid_at, l.created_at) WHEN l.type = 'earning' THEN COALESCE(pm.paid_at, l.created_at) ELSE l.created_at END AS shown_at
     FROM affiliate_ledger l LEFT JOIN tenants t ON t.id = l.tenant_id LEFT JOIN affiliate_payouts p ON p.id = l.payout_id AND l.type = 'payout' LEFT JOIN payments pm ON pm.id = l.payment_id
     WHERE l.affiliate_id = ? ORDER BY shown_at DESC, l.id DESC LIMIT 2000`).all(affId);
-  // What the affiliate sees for a ledger row: its own amounts only, never the payment behind it.
-  const ownerLedgerRow = (l) => ({
-    date: l.shown_at, business: l.business || '', type: l.type,
-    note: ['reversal', 'adjustment'].includes(l.type) ? l.note || '' : '', method: l.payout_method || '', reference: l.payout_reference || '',
-    amount_cents: l.amount_cents, status: l.status, available_at: l.type === 'payout' ? null : l.available_at,
-  });
+  // What the affiliate sees: earnings from each business added up by calendar month (UTC), net of
+  // anything taken back that month, plus payouts and adjustments. Never a single payment or its date,
+  // so a referred business's payments can't be worked out. Status: pending | available | paid |
+  // partly_paid (some paid, some not) | partly_available (some available, some still pending).
+  function ownerLedger(affId) {
+    const months = new Map(), lines = [];
+    for (const l of ledgerOf(affId)) {
+      if (l.type === 'earning' || l.type === 'reversal') {
+        const month = String(l.shown_at).slice(0, 7), key = `${month}|${l.tenant_id ?? ''}`;
+        let g = months.get(key);
+        if (!g) months.set(key, (g = { sort: l.shown_at, line: { date: null, month, business: l.business || '', type: 'earnings', note: '', method: '', reference: '', amount_cents: 0, status: '' }, statuses: new Set() }));
+        g.line.amount_cents += l.amount_cents;
+        g.statuses.add(l.status);
+        if (l.shown_at > g.sort) g.sort = l.shown_at;
+      } else {
+        lines.push({ sort: l.shown_at, line: { date: String(l.shown_at).slice(0, 10), month: null, business: '', type: l.type, note: l.type === 'adjustment' ? l.note || '' : '', method: l.payout_method || '', reference: l.payout_reference || '', amount_cents: l.amount_cents, status: l.status } });
+      }
+    }
+    for (const g of months.values()) {
+      const s = g.statuses;
+      g.line.status = s.size === 1 ? [...s][0] : s.has('paid') ? 'partly_paid' : 'partly_available';
+      lines.push(g);
+    }
+    return lines.sort((a, b) => (a.sort < b.sort ? 1 : a.sort > b.sort ? -1 : 0)).map((x) => x.line);
+  }
 
   function ownerAffiliate(req, a) {
     sweepAffiliateLedger();
@@ -1673,7 +1823,7 @@ export function createApp(env = process.env) {
     const affiliate = {
       code: a.code, status: a.status, share_bp: a.share_bp, months: a.months, w9_on_file: Boolean(a.w9_on_file), link: accepted ? affiliateLink(req, a) : null,
       terms: { url: '/legal/affiliate-terms', version: AFF.AFFILIATE_TERMS_VERSION, accepted_at: a.terms_accepted_at, accepted_version: a.terms_version, needs_accept: a.terms_version !== AFF.AFFILIATE_TERMS_VERSION },
-      hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS, platform_fee_bp: platformSettings(db).fee_bp,
+      hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS,
     };
     if (!accepted) return { affiliate };
     const c = clickStats(a.id);
@@ -1683,7 +1833,7 @@ export function createApp(env = process.env) {
       totals: affiliateTotals(a.id),
       // Names and earnings only: never a referred business's payment volume or revenue.
       referrals: referralsOf(a).map(({ name, joined, state, earned_cents, share_ends }) => ({ name, joined, state, earned_cents, share_ends })),
-      ledger: ledgerOf(a.id).map(ownerLedgerRow),
+      ledger: ownerLedger(a.id),
     };
   }
   function superAffiliateRow(a) {
@@ -1840,12 +1990,12 @@ export function createApp(env = process.env) {
     sweepAffiliateLedger();
     const method = { ach: 'ACH', check: 'check', stripe: 'Stripe', other: 'other' };
     const what = (l) => ({
-      earning: `Your share of ${platformName}’s fee`, reversal: `Taken back: ${(l.note || 'correction').toLowerCase()}`, adjustment: `Adjustment${l.note ? ': ' + l.note : ''}`,
+      earnings: `Your share of ${platformName}’s fees`, adjustment: `Adjustment${l.note ? ': ' + l.note : ''}`,
       payout: `Paid to you by ${method[l.method] || 'payout'}${l.reference ? ` (${l.reference})` : ''}`,
     }[l.type] || l.type);
-    const rows = ledgerOf(a.id).map(ownerLedgerRow).map((l) => AFF.csvLine([(l.date || '').slice(0, 10), l.business, what(l), { usd: l.amount_cents }, l.status, (l.available_at || '').slice(0, 10)]));
+    const rows = ownerLedger(a.id).map((l) => AFF.csvLine([l.month || l.date, l.business, what(l), { usd: l.amount_cents }, l.status.replace('_', ' ')]));
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="referral-earnings.csv"', 'Cache-Control': 'no-store' });
-    res.end([AFF.csvLine(['Date', 'Business', 'What it is', 'Amount', 'Status', 'Available on']), ...rows].join('\n') + '\n');
+    res.end([AFF.csvLine(['Month or date', 'Business', 'What it is', 'Amount', 'Status']), ...rows].join('\n') + '\n');
   }, { auth: 'tenant' });
 
   // Super admin: affiliates, referrals, payouts.
@@ -1903,6 +2053,8 @@ export function createApp(env = process.env) {
     send(res, 200, superAffiliateDetail(req, getAffiliate(a.id)));
   }, { auth: 'super' });
   // Record a payout of the whole available balance (paid outside the app: ACH, check, Stripe or other).
+  // The form sends the amount the admin saw (and paid); if the balance has changed since, it's refused.
+  const BALANCE_CHANGED = 'The available balance changed. Reload and check the amount.';
   route('POST', '/api/super/affiliates/:id/payouts', async (req, res, p, url, ctx) => {
     const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
     const b = await json(req);
@@ -1913,12 +2065,14 @@ export function createApp(env = process.env) {
     const available = affiliateTotals(a.id).available_cents;
     const blocked = payoutBlock(a, available);
     if (blocked) throw new HttpError(409, blocked);
+    if (!Number.isInteger(b.amount_cents)) throw new HttpError(400, 'Reload the page and check the amount, then record the payout again.');
+    if (b.amount_cents !== available) throw new HttpError(409, BALANCE_CHANGED);
     // Synchronous from here: nothing else can touch the ledger between the total and the update.
     db.exec('BEGIN IMMEDIATE');
     try {
       const pid = Number(db.prepare('INSERT INTO affiliate_payouts (affiliate_id, amount_cents, method, reference, paid_at, created_by) VALUES (?,?,?,?,?,?)').run(a.id, available, b.method, clean(b.reference, 120) || null, paidAt, ctx.user.id).lastInsertRowid);
       const marked = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS s FROM affiliate_ledger WHERE affiliate_id = ? AND status = 'available' AND type != 'payout'`).get(a.id).s;
-      if (marked !== available) throw new Error('Affiliate balance changed while recording the payout');
+      if (marked !== available) throw new HttpError(409, BALANCE_CHANGED);
       db.prepare(`UPDATE affiliate_ledger SET status = 'paid', payout_id = ? WHERE affiliate_id = ? AND status = 'available' AND type != 'payout'`).run(pid, a.id);
       db.prepare(`INSERT INTO affiliate_ledger (affiliate_id, type, amount_cents, status, available_at, payout_id, note, created_at) VALUES (?, 'payout', ?, 'paid', ?, ?, ?, ?)`).run(a.id, -available, paidAt, pid, clean(b.reference, 120) || null, now());
       db.exec('COMMIT');
