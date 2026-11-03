@@ -1462,7 +1462,8 @@ test('bold look: banner, service tiles, highlights, service pages', async () => 
   assert.match(page.text, /<h2>What’s included<\/h2>/);
   assert.match(page.text, /<li>Antifreeze<\/li>/);
   assert.match(page.text, /"@type":"Service"/);
-  assert.equal((await anon('GET', `/s/${mikeSlug}/services/not-a-service`)).status, 404);
+  const gone = await anon('GET', `/s/${mikeSlug}/services/not-a-service`);
+  assert.deepEqual([gone.status, gone.headers.get('location')], [302, `/s/${mikeSlug}#services`], 'an old service link goes to the services');
   assert.match((await viaHost('www.mikesrv.test', '/sitemap.xml')).text, new RegExp(`/services/${slug}`));
   // Removing the picture stops serving it
   await mike('POST', `/api/products/${svc.id}/image`, { image: null });
@@ -1745,5 +1746,26 @@ test('static pages, legal pages and seed script', async () => {
   assert.match(await winter.text(), /The 12-step winterizing checklist/);
   assert.equal(fs.readdirSync(path.join(seedDir, 'uploads')).length, 15); // photo, 2 banners, 7 tiles, 5 PDFs: nothing left over
   srv2.close();
+  // Mike's live business signed up on its own (rsqu-mobile-rv-service), so it has no winterizing
+  // package: the move adds it, and a re-run on a business moved before this fix adds only that.
+  const sdb = new (await import('node:sqlite')).DatabaseSync(path.join(seedDir, 'rsqu.db'));
+  const own = Number(sdb.prepare(`INSERT INTO tenants (slug, name, phone) VALUES ('rsqu-mobile-rv-service', 'RSQU Mobile RV Service', '801-555-0100')`).run().lastInsertRowid);
+  assert.match(apply(), /Done\. 11 cities, 9 services .*Open \/s\/rsqu-mobile-rv-service/, 'it picks Mike’s live business by default');
+  const w = sdb.prepare(`SELECT * FROM products WHERE tenant_id = ? AND name = 'Onsite RV winterizing package'`).get(own);
+  assert.deepEqual([w.price_cents, w.bookable, w.on_site, /12-step winterizing checklist/.test(w.details)], [49900, 1, 1, true]);
+  const ownSite = JSON.parse(sdb.prepare('SELECT site_profile FROM tenants WHERE id = ?').get(own).site_profile);
+  sdb.prepare('DELETE FROM products WHERE id = ?').run(w.id); // as if it had been moved before this fix
+  sdb.prepare(`UPDATE tenants SET tagline = 'Mike changed this' WHERE id = ?`).run(own);
+  assert.match(apply(), /Added the winterizing package and its page/);
+  assert.equal(sdb.prepare('SELECT tagline FROM tenants WHERE id = ?').get(own).tagline, 'Mike changed this', 'nothing else is touched');
+  assert.equal(sdb.prepare('SELECT site_profile FROM tenants WHERE id = ?').get(own).site_profile, JSON.stringify(ownSite));
+  assert.match(apply(), /Already applied on .*Nothing changed/);
+  sdb.close();
+  const { handler: h3 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
+  const srv3 = http.createServer(h3); await new Promise((r) => srv3.listen(0, r));
+  const winter2 = await fetch(`http://localhost:${srv3.address().port}/s/rsqu-mobile-rv-service/services/onsite-rv-winterizing-package`);
+  srv3.close();
+  assert.equal(winter2.status, 200);
+  assert.match(await winter2.text(), /class="price"[^>]*>\$499(\.00)?</);
   fs.rmSync(seedDir, { recursive: true, force: true });
 });

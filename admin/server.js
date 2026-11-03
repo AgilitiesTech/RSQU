@@ -2757,7 +2757,8 @@ export function createApp(env = process.env) {
     liveTenant(t);
     const products = activeProducts(t);
     const product = products.find((x) => hasPage(x) && serviceSlug(x, products) === slug);
-    if (!product) throw new HttpError(404, 'Not found');
+    // An old or mistyped service link goes to the business's services instead of an error page.
+    if (!product) { res.writeHead(302, { Location: `${onDomain ? '/' : `/s/${t.slug}`}#services`, 'Cache-Control': 'no-store' }); return res.end(); }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
     res.end(renderServicePage(t, products, siteProfile.parseProfile(t.site_profile), product, { platformBase: baseUrl(req), onDomain }));
   }

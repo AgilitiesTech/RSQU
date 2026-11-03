@@ -4,7 +4,8 @@
 // Runs once. After that it stops, because Mike may have edited his site; add --force to apply it
 // again, which replaces those sections and the pictures and files this script added (never his own).
 //
-// Usage (Render shell): node scripts/apply-rsqu-site.js            (business slug mike-stevens)
+// Usage (Render shell): node scripts/apply-rsqu-site.js            (rsqu-mobile-rv-service, Mike's live
+//                                                                  business, else mike-stevens from seed-mike.js)
 //                       node scripts/apply-rsqu-site.js other-slug
 //                       node scripts/apply-rsqu-site.js --force
 import fs from 'node:fs';
@@ -18,57 +19,15 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SRC = path.join(ROOT, 'seed', 'rsqu');
 const args = process.argv.slice(2);
 const force = args.includes('--force');
-const slug = args.find((a) => !a.startsWith('--')) || 'mike-stevens';
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
 const db = openDb(dataDir);
+const slug = args.find((a) => !a.startsWith('--'))
+  || (db.prepare(`SELECT 1 FROM tenants WHERE slug = 'rsqu-mobile-rv-service'`).get() ? 'rsqu-mobile-rv-service' : 'mike-stevens');
 const uploads = path.join(dataDir, 'uploads');
 const t = db.prepare('SELECT * FROM tenants WHERE slug = ?').get(slug);
 if (!t) { console.error(`No business with the address "${slug}". Run scripts/seed-mike.js first, or pass the right slug.`); process.exit(1); }
 
-const before = parseProfile(t.site_profile);
-if (before.import && before.import.by === 'rsqu' && !force) {
-  console.log(`Already applied on ${before.import.at}. Nothing changed. Run with --force to apply it again (that replaces Mike's edits to these sections).`);
-  process.exit(0);
-}
-// Only files this script added before are ever deleted.
-const ownFiles = new Set(before.import?.files || []);
-const added = [];
-const copy = (file, prefix) => {
-  const ext = path.extname(file);
-  const name = `t${t.id}-${prefix}-${randomToken(8)}${ext}`;
-  fs.copyFileSync(path.join(SRC, file), path.join(uploads, name));
-  added.push(name);
-  return name;
-};
-const remove = (name) => { if (name && ownFiles.has(name)) try { fs.unlinkSync(path.join(uploads, path.basename(name))); } catch { /* gone */ } };
-
-// ---- business details ----
-db.prepare(`UPDATE tenants SET name = ?, tagline = ?, hero_headline = ?, about = ?, primary_color = ?, accent_color = ? WHERE id = ?`).run(
-  'RSQU Mobile RV Service',
-  'Mobile RV maintenance and repair. Mike Stevens comes to your campsite, storage lot, driveway or the side of the road, with the calm of 30 years in the fire service.',
-  'Mobile RV repair that comes to you',
-  'RSQU Mobile RV Service is Mike Stevens’s mobile maintenance and repair service for motorhomes, travel trailers, fifth wheels, toy haulers and utility trailers, whether they’re parked at home, at a campsite or broken down on the road.\n\nMike has served 30 years as a firefighter in Salt Lake City, Utah. He brings the same habits to every call: scene safety first, a size-up by phone before he rolls so he shows up ready, and straight answers. If it can be fixed on the spot, he fixes it. If it can’t, he tells you and helps you plan the next move.',
-  '#C8101A', '#F0242E', t.id);
-
-// ---- services (price list + website) ----
-const SERVICES = [
-  ['Slides', 'Slide-outs stuck open or closed, or moving slowly or unevenly.', 'service-slides.webp'],
-  ['Awnings', 'Awnings that won’t extend or retract, including when you need to pack up and leave.', 'service-awnings.webp'],
-  ['Leveling systems', 'Leveling jacks stuck down and systems that won’t level the coach.', 'service-leveling-systems.webp'],
-  ['Black and grey tanks', 'Slow drains, backups, odors and tank monitors that read wrong.', 'service-black-grey-tanks.webp'],
-  ['Plumbing', 'Leaks, burst lines and loose fittings, from freeze damage to worn connections, plus odors and slow drains.', 'service-plumbing.webp'],
-  ['Air conditioning and heating', 'AC units, furnaces and heat pumps that won’t turn on, cool or heat.', 'service-air-conditioning-heating.webp'],
-  ['Electrical', 'Dead house batteries, blown fuses and converters that quit, plus running lights, turn signals and 7-pin plugs.', 'service-electrical.webp'],
-  ['Roadside breakdowns', 'Flat tires and blowouts, hot wheel bearings and hubs, electric brakes and breakaway switches, couplers, tongue jacks and safety chains.', null],
-  ['Roof and storm damage', 'Wind and hail damage sealed up so you can get home dry.', null],
-];
 const findProduct = (name) => db.prepare('SELECT * FROM products WHERE tenant_id = ? AND lower(name) = lower(?)').get(t.id, name);
-SERVICES.forEach(([name, description, image], i) => {
-  let p = findProduct(name);
-  if (!p) p = db.prepare('SELECT * FROM products WHERE id = ?').get(db.prepare('INSERT INTO products (tenant_id, name, description, price_cents, on_site) VALUES (?,?,?,0,1)').run(t.id, name, description).lastInsertRowid);
-  if (image && (!p.image || ownFiles.has(p.image))) { remove(p.image); db.prepare('UPDATE products SET image = ? WHERE id = ?').run(copy(image, 'prod'), p.id); }
-  db.prepare('UPDATE products SET description = ?, on_site = 1, active = 1, sort = ? WHERE id = ?').run(description, i + 1, p.id);
-});
 const WINTER = `## Why winterizing matters
 Any water left in an RV’s plumbing when the temperature drops below freezing can do real damage.
 - Water expands when it freezes. Water that freezes inside a pipe, fitting, pump or water heater pushes outward hard enough to crack it.
@@ -107,8 +66,63 @@ Not if Mike can get into the rig and reach it with his truck. Just arrange acces
 
 ## Can Mike de-winterize in the spring?
 Yes. Call or text to set up a spring visit to flush the antifreeze and check for leaks before your first trip.`;
-const winter = findProduct('Onsite RV winterizing package');
-if (winter) db.prepare('UPDATE products SET on_site = 1, bookable = 1, sort = ?, details = ? WHERE id = ?').run(SERVICES.length + 1, WINTER, winter.id);
+// The winterizing package and its page. A business that signed up on its own doesn't have the
+// package yet, so it's added at $499, the price on Mike's old site.
+const WINTER_NAME = 'Onsite RV winterizing package';
+function ensureWinter(sort) {
+  const w = findProduct(WINTER_NAME);
+  if (w) { db.prepare('UPDATE products SET on_site = 1, bookable = 1, active = 1, sort = ?, details = ? WHERE id = ?').run(sort, WINTER, w.id); return false; }
+  db.prepare('INSERT INTO products (tenant_id, name, description, price_cents, on_site, bookable, details, sort) VALUES (?,?,?,?,1,1,?,?)')
+    .run(t.id, WINTER_NAME, 'All 12 winterizing steps, RV antifreeze, labor and travel within the service area.', 49900, WINTER, sort);
+  return true;
+}
+
+const before = parseProfile(t.site_profile);
+if (before.import && before.import.by === 'rsqu' && !force) {
+  // Already moved: the only thing a re-run adds is a missing winterizing page. Nothing else changes.
+  if (!findProduct(WINTER_NAME)) { ensureWinter(10); console.log('Added the winterizing package and its page ($499, as on the old site). Nothing else changed.'); process.exit(0); }
+  console.log(`Already applied on ${before.import.at}. Nothing changed. Run with --force to apply it again (that replaces Mike's edits to these sections).`);
+  process.exit(0);
+}
+// Only files this script added before are ever deleted.
+const ownFiles = new Set(before.import?.files || []);
+const added = [];
+const copy = (file, prefix) => {
+  const ext = path.extname(file);
+  const name = `t${t.id}-${prefix}-${randomToken(8)}${ext}`;
+  fs.copyFileSync(path.join(SRC, file), path.join(uploads, name));
+  added.push(name);
+  return name;
+};
+const remove = (name) => { if (name && ownFiles.has(name)) try { fs.unlinkSync(path.join(uploads, path.basename(name))); } catch { /* gone */ } };
+
+// ---- business details ----
+db.prepare(`UPDATE tenants SET name = ?, tagline = ?, hero_headline = ?, about = ?, primary_color = ?, accent_color = ? WHERE id = ?`).run(
+  'RSQU Mobile RV Service',
+  'Mobile RV maintenance and repair. Mike Stevens comes to your campsite, storage lot, driveway or the side of the road, with the calm of 30 years in the fire service.',
+  'Mobile RV repair that comes to you',
+  'RSQU Mobile RV Service is Mike Stevens’s mobile maintenance and repair service for motorhomes, travel trailers, fifth wheels, toy haulers and utility trailers, whether they’re parked at home, at a campsite or broken down on the road.\n\nMike has served 30 years as a firefighter in Salt Lake City, Utah. He brings the same habits to every call: scene safety first, a size-up by phone before he rolls so he shows up ready, and straight answers. If it can be fixed on the spot, he fixes it. If it can’t, he tells you and helps you plan the next move.',
+  '#C8101A', '#F0242E', t.id);
+
+// ---- services (price list + website) ----
+const SERVICES = [
+  ['Slides', 'Slide-outs stuck open or closed, or moving slowly or unevenly.', 'service-slides.webp'],
+  ['Awnings', 'Awnings that won’t extend or retract, including when you need to pack up and leave.', 'service-awnings.webp'],
+  ['Leveling systems', 'Leveling jacks stuck down and systems that won’t level the coach.', 'service-leveling-systems.webp'],
+  ['Black and grey tanks', 'Slow drains, backups, odors and tank monitors that read wrong.', 'service-black-grey-tanks.webp'],
+  ['Plumbing', 'Leaks, burst lines and loose fittings, from freeze damage to worn connections, plus odors and slow drains.', 'service-plumbing.webp'],
+  ['Air conditioning and heating', 'AC units, furnaces and heat pumps that won’t turn on, cool or heat.', 'service-air-conditioning-heating.webp'],
+  ['Electrical', 'Dead house batteries, blown fuses and converters that quit, plus running lights, turn signals and 7-pin plugs.', 'service-electrical.webp'],
+  ['Roadside breakdowns', 'Flat tires and blowouts, hot wheel bearings and hubs, electric brakes and breakaway switches, couplers, tongue jacks and safety chains.', null],
+  ['Roof and storm damage', 'Wind and hail damage sealed up so you can get home dry.', null],
+];
+SERVICES.forEach(([name, description, image], i) => {
+  let p = findProduct(name);
+  if (!p) p = db.prepare('SELECT * FROM products WHERE id = ?').get(db.prepare('INSERT INTO products (tenant_id, name, description, price_cents, on_site) VALUES (?,?,?,0,1)').run(t.id, name, description).lastInsertRowid);
+  if (image && (!p.image || ownFiles.has(p.image))) { remove(p.image); db.prepare('UPDATE products SET image = ? WHERE id = ?').run(copy(image, 'prod'), p.id); }
+  db.prepare('UPDATE products SET description = ?, on_site = 1, active = 1, sort = ? WHERE id = ?').run(description, i + 1, p.id);
+});
+ensureWinter(SERVICES.length + 1);
 const diag = findProduct('Repair diagnosis and onsite review');
 if (diag) db.prepare('UPDATE products SET sort = ? WHERE id = ?').run(SERVICES.length + 2, diag.id);
 
