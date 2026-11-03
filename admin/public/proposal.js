@@ -24,6 +24,7 @@
     let q;
     try { q = await api('/api/public/proposals/' + encodeURIComponent(token)); }
     catch (e) { doc.innerHTML = `<p class="alert err">${esc(e.message)}</p>`; return; }
+    if (q.kind === 'invoice') document.title = 'Your invoice';
     applyBrand(q.business);
     render(q);
   }
@@ -31,9 +32,10 @@
   function render(q) {
     const t = q.totals;
     const signed = Boolean(q.signed_at), paid = q.status === 'paid';
+    const inv = q.kind === 'invoice'; // no signature: the customer accepts the terms by paying
     doc.innerHTML = `
       <div class="stack" style="gap:6px">
-        <p class="muted small">Proposal #${q.id} · ${date(q.created_at)}</p>
+        <p class="muted small">${inv ? 'Invoice' : 'Proposal'} #${q.id} · ${date(q.created_at)}</p>
         <h1>${esc(q.title)}</h1>
         ${paid ? '<div><span class="paid-stamp">Paid</span></div>' : ''}
       </div>
@@ -45,6 +47,7 @@
         </dl>
       </section>
       ${q.notes ? `<section class="card"><h2>Notes</h2><p style="white-space:pre-wrap">${esc(q.notes)}</p></section>` : ''}
+      ${q.photos && q.photos.length ? `<section class="card stack"><h2>Photos</h2><div class="photos">${q.photos.map((ph, i) => `<a href="${esc(ph.url)}" target="_blank" rel="noopener"><img src="${esc(ph.url)}" alt="Job photo ${i + 1}" loading="lazy"></a>`).join('')}</div></section>` : ''}
       <section class="card stack">
         <table class="items">
           <thead><tr><th scope="col">Work and parts</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Amount</th></tr></thead>
@@ -55,8 +58,10 @@
           ${t.tax ? `<dt>Sales tax (${q.tax_rate_bp / 100}%)</dt><dd>${money(t.tax)}</dd>` : ''}
           <dt>Total</dt><dd>${money(t.total)}</dd>
           ${t.credit ? `<dt>Deposit already paid</dt><dd>−${money(t.credit)}</dd>` : ''}
+          ${t.paid && !paid ? `<dt>Already paid</dt><dd>−${money(t.paid)}</dd>` : ''}
           <dt class="big">${paid ? 'Paid' : 'Balance due'}</dt><dd class="big">${money(t.balance)}</dd>
         </dl>
+        ${q.pay_over_time ? '<p class="small"><strong>Pay over time available at checkout.</strong></p>' : ''}
       </section>
       ${q.terms ? `<section class="card"><h2>Terms</h2><p class="small" style="white-space:pre-wrap">${esc(q.terms)}</p></section>` : ''}
       <section class="card stack" id="sign"></section>
@@ -65,17 +70,26 @@
     document.getElementById('print').addEventListener('click', () => window.print());
 
     const sign = document.getElementById('sign');
-    if (signed) {
+    if (inv) sign.hidden = true;
+    else if (signed) {
       sign.innerHTML = `<h2>Accepted</h2><img class="sig-img" src="${q.signature_png}" alt="Signature of ${esc(q.signer_name)}"><p>${esc(q.signer_name)} · ${date(q.signed_at)}</p>`;
     } else {
       sign.innerHTML = `
         <h2>Accept and sign</h2>
         <form id="sf" class="stack">
           <div><label for="sn">Your full name</label><input id="sn" name="name" autocomplete="name" value="${esc(q.customer_name || '')}" required></div>
+          <div class="grid2">
+            <div><label for="sp">Mobile phone (for your receipt)</label><input id="sp" name="phone" type="tel" autocomplete="tel" value="${esc(q.customer_phone || '')}"></div>
+            <div><label for="se">Email (for your receipt)</label><input id="se" name="email" type="email" autocomplete="email" value="${esc(q.customer_email || '')}"></div>
+          </div>
           <div><p id="sig-label" style="font-family:var(--cond);font-weight:600;font-size:17px;margin-bottom:4px">Sign with your finger or mouse</p>
             <canvas class="sigpad" id="pad" role="img" aria-labelledby="sig-label"></canvas>
             <button class="linkbtn" type="button" id="clear">Clear signature</button></div>
           <label class="check"><input type="checkbox" name="agree" id="agree"> <span>I approve this work and the total above, and I agree to the terms above${q.customer_terms ? `, ${esc(q.business.name)}’s <a href="${esc(q.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> (version ${q.customer_terms.version})` : ''} and the <a href="/legal/customer-terms" target="_blank" rel="noopener">payment and e-signature notice</a>, including signing electronically.</span></label>
+          <fieldset class="stack consent"><legend class="small muted">Stay in touch (optional)</legend>
+            <label class="check small"><input type="checkbox" name="subscribe_email" ${q.subscribe_email_default === false ? '' : 'checked'}> <span>${esc(q.consent.email)}</span></label>
+            <label class="check small"><input type="checkbox" name="subscribe_sms"> <span>${esc(q.consent.sms)}</span></label>
+          </fieldset>
           <p class="alert err" id="serr" hidden></p>
           <button class="btn primary block" type="submit">Accept and sign</button>
         </form>`;
@@ -83,8 +97,9 @@
     }
 
     const pay = document.getElementById('pay');
-    if (paid) pay.innerHTML = `<p class="alert ok">Paid in full. Thank you!</p>`;
-    else if (!signed) pay.hidden = true;
+    if (inv && !paid && t.balance > 0) return renderInvoicePay(q, pay);
+    if (paid) pay.innerHTML = `<p class="alert ok">Paid in full. Thank you!</p>${(q.receipts || []).map((r) => `<p><a href="${esc(r.url)}">View your receipt (${money(r.amount_cents)})</a></p>`).join('')}`;
+    else if (!signed && !inv) pay.hidden = true;
     else if (t.balance <= 0) pay.innerHTML = `<p class="alert ok">Nothing is due right now.</p>`;
     else {
       const o = q.online;
@@ -102,6 +117,42 @@
       pb.disabled = true; pb.textContent = 'Opening secure checkout…';
       try { const { url } = await api(`/api/public/proposals/${encodeURIComponent(token)}/checkout`, {}); location.href = url; }
       catch (e) { const el = document.getElementById('perr'); el.textContent = e.message; el.hidden = false; pb.disabled = false; pb.textContent = 'Try again'; }
+    });
+  }
+
+  // Invoices: confirm where the receipt goes, optional updates, then pay. Paying accepts the terms.
+  function renderInvoicePay(q, pay) {
+    const t = q.totals, o = q.online, b = q.business;
+    if (!o.card_payments) { pay.innerHTML = `<h2>Pay ${money(t.balance)}</h2><p>Pay ${esc(b.name)} directly by cash or check.</p>`; return; }
+    pay.innerHTML = `
+      <h2>Pay ${money(t.balance)}</h2>
+      <form id="ipf" class="stack">
+        <div class="grid2">
+          <div><label for="ip">Mobile phone (for your receipt)</label><input id="ip" name="phone" type="tel" autocomplete="tel" value="${esc(q.customer_phone || '')}"></div>
+          <div><label for="ie">Email (for your receipt)</label><input id="ie" name="email" type="email" autocomplete="email" value="${esc(q.customer_email || '')}"></div>
+        </div>
+        <fieldset class="stack consent"><legend class="small muted">Stay in touch (optional)</legend>
+          <label class="check small"><input type="checkbox" name="subscribe_email" ${q.subscribe_email_default === false ? '' : 'checked'}> <span>${esc(q.consent.email)}</span></label>
+          <label class="check small"><input type="checkbox" name="subscribe_sms"> <span>${esc(q.consent.sms)}</span></label>
+        </fieldset>
+        <p class="small">${q.customer_terms ? `By paying, you agree to ${esc(b.name)}’s <a href="${esc(q.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> (version ${q.customer_terms.version}) and the <a href="/legal/customer-terms" target="_blank" rel="noopener">payment notice</a>.` : `By paying, you agree to the terms above and the <a href="/legal/customer-terms" target="_blank" rel="noopener">payment notice</a>.`}</p>
+        <button class="btn primary block" type="submit" id="paybtn">Pay ${money(o.charge)} by card or bank</button>
+        <p class="small muted">You’ll go to Stripe’s secure checkout, then come right back here.</p>
+        <p class="small">Or pay ${esc(b.name)} directly by cash or check.</p>
+        <p class="alert err" id="perr" hidden></p>
+      </form>`;
+    const f = document.getElementById('ipf'), pb = document.getElementById('paybtn'), err = document.getElementById('perr');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (f.elements.subscribe_sms.checked && !f.elements.phone.value.trim()) { err.textContent = 'Add your mobile number to get texts, or uncheck that box.'; err.hidden = false; return; }
+      pb.disabled = true; pb.textContent = 'Opening secure checkout…';
+      try {
+        const { url } = await api(`/api/public/invoices/${encodeURIComponent(token)}/checkout`, {
+          terms_version: q.customer_terms ? q.customer_terms.version : undefined, phone: f.elements.phone.value, email: f.elements.email.value,
+          subscribe_email: f.elements.subscribe_email.checked, subscribe_sms: f.elements.subscribe_sms.checked,
+        });
+        location.href = url;
+      } catch (ex) { err.textContent = ex.message; err.hidden = false; pb.disabled = false; pb.textContent = 'Try again'; }
     });
   }
 
@@ -134,12 +185,16 @@
       if (!f.elements.name.value.trim()) { err.textContent = 'Type your full name.'; err.hidden = false; return; }
       if (!inked) { err.textContent = 'Please sign in the box.'; err.hidden = false; return; }
       if (!f.elements.agree.checked) { err.textContent = 'Check the box to approve the work.'; err.hidden = false; return; }
+      if (f.elements.subscribe_sms.checked && !f.elements.phone.value.trim()) { err.textContent = 'Add your mobile number to get texts, or uncheck that box.'; err.hidden = false; return; }
       // Export on a white background, scaled down to keep it small.
       const out = document.createElement('canvas'); out.width = 600; out.height = 600 * canvas.height / canvas.width;
       const o = out.getContext('2d'); o.fillStyle = '#fff'; o.fillRect(0, 0, out.width, out.height); o.drawImage(canvas, 0, 0, out.width, out.height);
       const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
       try {
-        await api(`/api/public/proposals/${encodeURIComponent(token)}/sign`, { name: f.elements.name.value, agree: true, signature: out.toDataURL('image/png'), terms_version: q.customer_terms ? q.customer_terms.version : undefined });
+        await api(`/api/public/proposals/${encodeURIComponent(token)}/sign`, {
+          name: f.elements.name.value, agree: true, signature: out.toDataURL('image/png'), terms_version: q.customer_terms ? q.customer_terms.version : undefined,
+          phone: f.elements.phone.value, email: f.elements.email.value, subscribe_email: f.elements.subscribe_email.checked, subscribe_sms: f.elements.subscribe_sms.checked,
+        });
         load();
       } catch (ex) { err.textContent = ex.message; err.hidden = false; btn.disabled = false; }
     });

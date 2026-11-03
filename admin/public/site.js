@@ -1,4 +1,21 @@
 'use strict';
+// Videos load YouTube's player only when a visitor presses play (faster pages, no tracking until then).
+(function () {
+  document.addEventListener('click', function (e) {
+    var a = e.target.closest && e.target.closest('a[data-yt]');
+    if (!a || e.metaKey || e.ctrlKey || e.shiftKey) return;
+    e.preventDefault();
+    var f = document.createElement('iframe');
+    f.src = 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(a.getAttribute('data-yt')) + '?autoplay=1&rel=0';
+    f.title = a.getAttribute('data-title') || 'Video';
+    f.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
+    f.allowFullscreen = true;
+    f.referrerPolicy = 'strict-origin-when-cross-origin'; // YouTube's player needs to know which site embeds it
+    var box = document.createElement('div'); box.className = 'yt'; box.appendChild(f);
+    a.replaceWith(box);
+  });
+})();
+
 (function () {
   var f = document.getElementById('req-form'); if (!f) return;
   var slug = f.getAttribute('data-slug');

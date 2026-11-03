@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createApp } from '../server.js';
+import * as owner from '../src/owner-features.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -23,6 +24,11 @@ const v2Requests = [];
 const appFees = new Map(); // application fees (platform account) for refund tests
 const appFeeRefunds = [];
 const stripeFee = (amt) => Math.round(amt * 0.029) + 30;
+// A Checkout Session is open until it's paid (tests set payment_status = 'paid') or expired.
+const sessionStatus = (s) => (s.expired ? 'expired' : s.payment_status === 'paid' ? 'complete' : 'open');
+const expired = []; // sessions the app expired: [id, Stripe-Account]
+// The charge.refunded event Stripe sends from a business's account after a refund in its Dashboard.
+const chargeRefunded = (sess, amountRefunded, applicationFee) => ({ type: 'charge.refunded', account: sess.account, data: { object: { id: 'ch_' + sess.id, object: 'charge', amount: sess.amount_total, amount_refunded: amountRefunded, refunded: amountRefunded >= sess.amount_total, application_fee: applicationFee } } });
 const stripeMock = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -89,7 +95,16 @@ const stripeMock = http.createServer((req, res) => {
         terms_version: p.get('metadata[customer_terms_version]'), pi_terms_version: p.get('payment_intent_data[metadata][customer_terms_version]'), payment_status: 'unpaid',
       };
       sessions.set(id, s);
-      return ok(s);
+      return ok({ ...s, status: 'open' });
+    }
+    // Only an open session can be expired, and only on the account it belongs to.
+    if (req.method === 'POST' && (m = /^\/v1\/checkout\/sessions\/([^/]+)\/expire$/.exec(req.url))) {
+      const s = sessions.get(m[1]);
+      if (!s || (s.account || null) !== onAccount) return bad('No such checkout.session');
+      if (sessionStatus(s) !== 'open') return bad(`Only Checkout Sessions with a status in ["open"] can be expired. This one is ${sessionStatus(s)}.`);
+      s.expired = true;
+      expired.push([s.id, onAccount]);
+      return ok({ ...s, status: 'expired', url: null });
     }
     if (req.method === 'GET' && (m = /^\/v1\/checkout\/sessions\/([^?]+)\?expand\[\]=payment_intent\.latest_charge\.balance_transaction$/.exec(req.url)) && sessions.has(m[1])) {
       const s = sessions.get(m[1]);
@@ -100,7 +115,7 @@ const stripeMock = http.createServer((req, res) => {
       const bt = s.account
         ? { id: 'txn_' + s.id, fee: sf + app, net: s.amount_total - sf - app, fee_details: [{ type: 'stripe_fee', amount: sf }, { type: 'application_fee', amount: app }] }
         : { id: 'txn_' + s.id, fee: sf };
-      return ok({ ...s, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, latest_charge: { id: 'ch_' + s.id, balance_transaction: bt } } : null });
+      return ok({ ...s, status: sessionStatus(s), url: sessionStatus(s) === 'open' ? s.url : null, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, status: 'succeeded', latest_charge: { id: 'ch_' + s.id, amount_refunded: s.amount_refunded || 0, balance_transaction: bt } } : null });
     }
     if (req.method === 'POST' && req.url === '/v1/transfers') {
       const dest = accounts.get(p.get('destination'));
@@ -118,6 +133,28 @@ const stripeMock = http.createServer((req, res) => {
 
 let server, base, dataDir, appDb;
 const WHSEC = 'whsec_platform_test';
+
+// ---- fake Anthropic Messages API (photo-to-proposal drafts) ----
+const aiCalls = [];
+const aiMock = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => {
+    const b = JSON.parse(body || '{}');
+    aiCalls.push({ headers: req.headers, body: b });
+    const content = b.messages?.[0]?.content || [];
+    const text = content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+    if (/FAIL/.test(text)) { res.writeHead(529, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error' } })); }
+    const list = JSON.parse(/Price list \(JSON\): (\[.*\])/.exec(text)[1]);
+    const first = list[0];
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ model: b.model, content: [{ type: 'tool_use', id: 'tu_1', name: 'draft_proposal', input: {
+      title: 'Awning arm replacement', customer_summary: 'The front awning arm is bent at the elbow, so the awning can’t roll up.',
+      findings: ['Front awning arm bent at the elbow', 'Fabric looks intact'], safety_notes: [], questions_for_technician: ['Confirm the awning brand and arm length'],
+      line_items: [{ product_id: first.product_id, name: 'whatever the model said', quantity: 1 }, { product_id: 999999, name: 'Replacement awning arm', description: 'OEM-style arm', quantity: 1 }, { product_id: null, name: '', quantity: 1 }],
+    } }] }));
+  });
+});
 
 // Tiny cookie-jar client per user.
 function client() {
@@ -148,21 +185,25 @@ function webhook(evt) {
 
 before(async () => {
   await new Promise((r) => stripeMock.listen(0, r));
+  await new Promise((r) => aiMock.listen(0, r));
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsqu-test-'));
-  const { handler, db } = createApp({
+  const { handler, db, outbox: ob, runDueMessages: rd } = createApp({
     DATA_DIR: dataDir, SUPER_ADMIN_EMAIL: 'aaron@agilities.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw',
     STRIPE_SECRET_KEY: 'sk_test_platform', STRIPE_API_BASE: `http://localhost:${stripeMock.address().port}`, STRIPE_WEBHOOK_SECRET: WHSEC,
+    ANTHROPIC_API_KEY: 'sk-ant-test', ANTHROPIC_API_BASE: `http://localhost:${aiMock.address().port}`, NOTIFY_CAPTURE: '1', DISABLE_WORKER: '1',
   });
   appDb = db;
+  outbox = ob;
+  runDue = rd;
   server = http.createServer(handler);
   await new Promise((r) => server.listen(0, r));
   base = `http://localhost:${server.address().port}`;
 });
-after(() => { server.close(); stripeMock.close(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+after(() => { server.close(); stripeMock.close(); aiMock.close(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 const SIG = 'data:image/png;base64,' + 'A'.repeat(400);
-let mikeId, mikeSlug;
+let mikeId, mikeSlug, outbox, runDue;
 
 test('super admin creates a business; owner sets password and must accept agreements', async () => {
   assert.equal((await superA('GET', '/api/super/overview')).status, 401);
@@ -515,6 +556,1160 @@ test('view-as, suspension, hosted website and custom domain', async () => {
   assert.equal((await mike('GET', '/api/requests')).status, 200);
 });
 
+function viaHost(host, p) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: 'localhost', port: server.address().port, path: p, headers: { Host: host } }, (r) => {
+      let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => resolve({ status: r.statusCode, text: b, headers: r.headers }));
+    }).on('error', reject);
+  });
+}
+
+test('website sections, city pages, PDFs and local-search markup', async () => {
+  const st = await mike('GET', '/api/website');
+  assert.equal(st.status, 200);
+  assert.ok(st.json.checklist.length >= 10);
+  assert.equal(st.json.checklist.find((c) => c.key === 'base').done, false);
+
+  const bad = await mike('PUT', '/api/website', { base_city: 'Ogden', base_state: 'ZZ', cities: [{ name: 'Layton' }], videos: [{ url: 'https://vimeo.com/123' }], links: { facebook: 'not a url' }, search_console: '<script>' });
+  assert.equal(bad.status, 422);
+  for (const k of ['base_state', 'cities.0.state', 'videos.0.url', 'links.facebook', 'search_console']) assert.ok(bad.json.field_errors[k], k);
+
+  const longIntro = 'We fix water heaters, slide-outs and roof leaks at Fort Buenaventura, the Ogden Valley campgrounds and driveways all over town, usually within a day of your call.';
+  const good = await mike('PUT', '/api/website', {
+    service_phrase: 'Mobile RV repair', base_city: 'Ogden', base_state: 'ut', radius_miles: '60',
+    cities: [{ name: 'Ogden', state: 'UT', intro: longIntro }, { name: 'Layton', state: 'UT', intro: 'Short note.' }, { name: '', state: '', intro: '' }],
+    hours: { always_open: false, note: 'Emergency calls answered after hours', days: { mon: { open: '08:00', close: '17:00' }, sat: { open: '09:00', close: '13:00' } } },
+    credentials: [{ title: 'RVTI Certified Technician, Level 2', detail: 'Since 2015' }],
+    faqs: [{ q: 'Do you come to campgrounds?', a: 'Yes, anywhere within about 60 miles.' }],
+    videos: [{ url: 'https://youtu.be/dQw4w9WgXcQ', title: 'Water heater repair' }, { url: 'https://www.youtube.com/shorts/abcdefghijk' }],
+    links: { google_review: 'g.page/r/abc123/review', google_profile: 'https://maps.app.goo.gl/xyz' },
+    search_console: '<meta name="google-site-verification" content="abcDEF123_-abcDEF123_-xyz" />',
+  });
+  assert.equal(good.status, 200, JSON.stringify(good.json));
+  const P = good.json.profile;
+  assert.equal(P.base_state, 'UT');
+  assert.equal(P.radius_miles, 60);
+  assert.equal(P.cities.length, 2);
+  assert.deepEqual(P.videos.map((v) => v.id), ['dQw4w9WgXcQ', 'abcdefghijk']);
+  assert.equal(P.links.google_review, 'https://g.page/r/abc123/review');
+  assert.equal(P.search_console, 'abcDEF123_-abcDEF123_-xyz');
+  assert.equal(good.json.checklist.find((c) => c.key === 'base').done, true);
+  assert.equal(good.json.checklist.find((c) => c.key === 'city_intros').done, false); // Layton is too short
+
+  // PDFs: only real PDFs, then listed and downloadable
+  const pdf = 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4\n% test checklist\n%%EOF').toString('base64');
+  assert.equal((await mike('POST', '/api/website/resources', { title: 'Tank checklist', file: PNG.replace('image/png', 'application/pdf') })).status, 400);
+  assert.equal((await mike('POST', '/api/website/resources', { title: '', file: pdf })).status, 400);
+  const up = await mike('POST', '/api/website/resources', { title: 'Black and grey tank checklist', description: 'Print before your trip', file: pdf });
+  assert.equal(up.status, 201);
+  const doc = up.json.profile.resources[0];
+  assert.match(doc.file, /^t\d+-doc-[\w-]+\.pdf$/);
+  // Saving other sections keeps the file; renaming works
+  const again = await mike('PUT', '/api/website', { ...P, resources: [{ file: doc.file, title: 'Tank checklist', description: 'Print before your trip' }, { file: 't999-doc-evil.pdf', title: 'x' }] });
+  assert.equal(again.status, 200);
+  assert.deepEqual(again.json.profile.resources.map((r) => [r.file, r.title]), [[doc.file, 'Tank checklist']]);
+  // Another business can't touch it
+  assert.equal((await other('DELETE', '/api/website/resources/' + doc.file)).status, 404);
+
+  // Mike uses his own domain: canonical URLs point there; pages on the platform keep /s/<slug> links
+  const site = await anon('GET', `/s/${mikeSlug}`);
+  assert.equal(site.status, 200);
+  assert.match(site.headers.get('content-security-policy'), /frame-src https:\/\/www\.youtube-nocookie\.com/);
+  assert.match(site.text, /<link rel="canonical" href="https:\/\/www\.mikesrv\.test\/">/);
+  assert.match(site.text, /<meta name="google-site-verification" content="abcDEF123_-abcDEF123_-xyz">/);
+  const ld = [...site.text.matchAll(/<script type="application\/ld\+json">(.*?)<\/script>/gs)].map((m) => JSON.parse(m[1]));
+  const biz = ld.find((x) => x['@type'] === 'AutoRepair');
+  assert.ok(biz, 'business markup');
+  assert.deepEqual(biz.areaServed.map((a) => a.name), ['Ogden, UT', 'Layton, UT']);
+  assert.equal(biz.address.addressLocality, 'Ogden');
+  assert.deepEqual(biz.openingHoursSpecification.map((h) => h.dayOfWeek), ['Monday', 'Saturday']);
+  assert.deepEqual(biz.sameAs, ['https://maps.app.goo.gl/xyz']);
+  assert.equal(biz.hasCredential[0].name, 'RVTI Certified Technician, Level 2');
+  assert.ok(ld.find((x) => x['@type'] === 'FAQPage'));
+  assert.match(site.text, /data-yt="dQw4w9WgXcQ"/);
+  assert.match(site.text, new RegExp(`href="/s/${mikeSlug}/areas/ogden-ut"`));
+  assert.match(site.text, new RegExp(`href="/s/${mikeSlug}/files/${doc.file}"`));
+  assert.match(site.text, /Review us on Google/);
+  assert.match(site.text, /9 AM–1 PM/);
+
+  const ogden = await anon('GET', `/s/${mikeSlug}/areas/ogden-ut`);
+  assert.equal(ogden.status, 200);
+  assert.match(ogden.text, /<title>Mobile RV repair in Ogden, UT \| /);
+  assert.match(ogden.text, /<meta name="robots" content="index,follow">/);
+  assert.match(ogden.text, /Fort Buenaventura/);
+  assert.match(ogden.text, /"@type":"Service"/);
+  assert.match((await anon('GET', `/s/${mikeSlug}/areas/layton-ut`)).text, /<meta name="robots" content="noindex,follow">/);
+  assert.equal((await anon('GET', `/s/${mikeSlug}/areas/provo-ut`)).status, 404);
+
+  const file = await fetch(`${base}/s/${mikeSlug}/files/${doc.file}`);
+  assert.equal(file.status, 200);
+  assert.equal(file.headers.get('content-type'), 'application/pdf');
+  assert.match(file.headers.get('content-disposition'), /filename="tank-checklist\.pdf"/);
+  assert.equal((await fetch(`${base}/s/${mikeSlug}/files/t1-doc-nope.pdf`)).status, 404);
+
+  // On his own domain: links are relative to the domain; sitemap lists indexable pages only
+  const home = await viaHost('www.mikesrv.test', '/');
+  assert.match(home.text, /href="\/areas\/ogden-ut"/);
+  assert.equal((await viaHost('www.mikesrv.test', '/areas/ogden-ut')).status, 200);
+  assert.equal((await viaHost('www.mikesrv.test', `/files/${doc.file}`)).status, 200);
+  const sm = await viaHost('www.mikesrv.test', '/sitemap.xml');
+  assert.match(sm.text, /<loc>https:\/\/www\.mikesrv\.test\/<\/loc>/);
+  assert.match(sm.text, /<loc>https:\/\/www\.mikesrv\.test\/areas\/ogden-ut<\/loc>/);
+  assert.doesNotMatch(sm.text, /layton/);
+  assert.match(sm.text, new RegExp(`/files/${doc.file}`));
+  assert.match((await viaHost('www.mikesrv.test', '/robots.txt')).text, /Sitemap: https:\/\/www\.mikesrv\.test\/sitemap\.xml/);
+  // The platform sitemap lists hosted business sites, but not ones on their own domain
+  const psm = await anon('GET', '/sitemap.xml');
+  assert.doesNotMatch(psm.text, new RegExp(`/s/${mikeSlug}/`));
+  assert.match(psm.text, /\/s\/[\w-]+\/<\/loc>/);
+
+  // A domain becomes canonical only once requests actually arrive on it
+  assert.equal((await other('PUT', '/api/business', { custom_domain: 'not a domain' })).status, 400);
+  assert.equal((await other('PUT', '/api/business', { custom_domain: 'www.other-rv.test' })).status, 200);
+  const before = await other('GET', '/api/website');
+  assert.match(before.json.site_url, /\/s\/[\w-]+\/$/);
+  assert.match((await anon('GET', '/sitemap.xml')).text, new RegExp(before.json.site_url.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')));
+  assert.equal((await viaHost('www.other-rv.test', '/')).status, 200);
+  assert.equal((await other('GET', '/api/website')).json.site_url, 'https://www.other-rv.test/');
+  await other('PUT', '/api/business', { custom_domain: '' });
+  // Lenient inputs: YouTube links without https://, closing at midnight
+  const lenient = await other('PUT', '/api/website', { videos: [{ url: 'youtube.com/watch?v=dQw4w9WgXcQ' }], hours: { days: { fri: { open: '18:00', close: '00:00' } } } });
+  assert.equal(lenient.status, 200, JSON.stringify(lenient.json));
+  assert.equal(lenient.json.profile.videos[0].id, 'dQw4w9WgXcQ');
+  assert.deepEqual(lenient.json.profile.hours.days.fri, { open: '18:00', close: '23:59' });
+
+  const del = await mike('DELETE', '/api/website/resources/' + doc.file);
+  assert.equal(del.status, 200);
+  assert.equal(del.json.profile.resources.length, 0);
+  assert.equal((await fetch(`${base}/s/${mikeSlug}/files/${doc.file}`)).status, 404);
+});
+
+test('photo quote: AI draft from the price list, photos on the proposal, consent, receipt by text and email, unsubscribe', async () => {
+  const JPG = PNG; // tiny valid image
+  assert.equal((await mike('POST', '/api/quotes/from-photos', { photos: [] })).status, 400);
+  assert.equal((await mike('POST', '/api/quotes/from-photos', { photos: ['data:text/plain;base64,aGk='] })).status, 400);
+
+  const d = await mike('POST', '/api/quotes/from-photos', { photos: [JPG, JPG], rig: '2019 Jayco Jay Flight', note: 'Awning will not retract' });
+  assert.equal(d.status, 201, JSON.stringify(d.json));
+  const call = aiCalls.at(-1);
+  assert.equal(call.headers['x-api-key'], 'sk-ant-test');
+  assert.equal(call.headers['anthropic-version'], '2023-06-01');
+  assert.equal(call.body.model, 'claude-sonnet-5-5');
+  assert.equal(call.body.messages[0].content.filter((c) => c.type === 'image').length, 2);
+  const q = d.json;
+  assert.equal(q.title, 'Awning arm replacement');
+  assert.match(q.notes, /awning arm is bent/);
+  assert.equal(q.photos.length, 2);
+  assert.deepEqual(q.ai_draft.findings, ['Front awning arm bent at the elbow', 'Fabric looks intact']);
+  // Price-list line keeps the business's own name and price; unknown product id becomes a $0 line to price
+  const products = (await mike('GET', '/api/products')).json.filter((p) => p.active);
+  const listed = products.sort((a, b) => a.name.localeCompare(b.name))[0];
+  assert.equal(q.items[0].name, listed.name);
+  assert.equal(q.items[0].unit_cents, listed.price_cents);
+  assert.equal(q.items[1].name, 'Replacement awning arm');
+  assert.equal(q.items[1].unit_cents, 0);
+  assert.equal(q.items.length, 2); // nameless line dropped
+  assert.deepEqual(q.ai_draft.needs_price, ['Replacement awning arm']);
+
+  // AI failure still keeps the photos
+  const failed = await mike('POST', '/api/quotes/from-photos', { photos: [JPG], note: 'FAIL please' });
+  assert.equal(failed.status, 201);
+  assert.match(failed.json.ai_draft.error, /529/);
+  assert.equal(failed.json.photos.length, 1);
+  assert.equal(failed.json.items.length, 0);
+  assert.equal(failed.json.notes, ''); // the technician's note stays private
+  assert.equal(failed.json.ai_draft.note, 'FAIL please');
+  assert.equal((await other('GET', `/api/uploads/${failed.json.photos[0].file}`)).status, 404); // other businesses can't see it
+
+  // Owner prices the open line, hides one photo, adds the customer
+  const items = q.items.map((it) => ({ ...it, unit_cents: it.unit_cents || 18500 }));
+  const saved = await mike('PUT', `/api/quotes/${q.id}`, { title: q.title, customer_name: 'Pat Camper', customer_phone: '801-555-0142', customer_email: '', rig: q.rig, notes: q.notes, terms: '', tax_rate_bp: 0, items, photos: [{ file: q.photos[0].file, show: true }, { file: q.photos[1].file, show: false }] });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.json.photos.map((p) => p.show), [true, false]);
+
+  const pub = await anon('GET', `/api/public/proposals/${q.token}`);
+  assert.equal(pub.json.photos.length, 1);
+  assert.equal((await fetch(base + pub.json.photos[0].url)).status, 200);
+  assert.equal((await fetch(`${base}/api/public/proposals/${q.token}/photos/${q.photos[1].file}`)).status, 404);
+  assert.equal(pub.json.customer_phone, '801-555-0142');
+  assert.match(pub.json.consent.sms, /Reply STOP/);
+
+  // Sign: confirm contact, keep email updates on, opt in to texts
+  const tv = pub.json.customer_terms?.version;
+  assert.equal((await anon('POST', `/api/public/proposals/${q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: tv, email: 'not-an-email' })).status, 400);
+  const signed = await anon('POST', `/api/public/proposals/${q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: tv, phone: '(801) 555-0142', email: 'Pat@Example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(signed.status, 200, JSON.stringify(signed.json));
+  const custs = (await mike('GET', '/api/customers')).json;
+  const pat = custs.find((c) => c.email === 'pat@example.test');
+  assert.ok(pat && pat.email_opt_in === 1 && pat.sms_opt_in === 1);
+  assert.match(appDb.prepare('SELECT sms_consent_text FROM customers WHERE id = ?').get(pat.id).sms_consent_text, /Consent isn't required to buy/);
+  assert.equal((await other('GET', '/api/customers')).json.some((c) => c.email === 'pat@example.test'), false);
+  const csv = await mike('GET', '/api/customers.csv');
+  assert.match(csv.text, /pat@example\.test,yes/);
+
+  // Paid (cash): receipt by text and email, once
+  const before = outbox.length;
+  assert.equal((await mike('POST', `/api/quotes/${q.id}/payments`, { method: 'cash' })).status, 200);
+  await new Promise((r) => setTimeout(r, 50));
+  const sent = outbox.slice(before);
+  const sms = sent.find((m) => m.kind === 'sms' && m.to === '+18015550142');
+  assert.ok(sms, 'receipt text');
+  assert.match(sms.body, /Thanks, Pat! We received your payment of \$/);
+  const rpath = /(\/r\/[\w-]+)/.exec(sms.body)[1];
+  const mail = sent.find((m) => m.kind === 'email' && m.to === 'pat@example.test');
+  assert.ok(mail, 'receipt email');
+  assert.match(mail.text, new RegExp(rpath));
+  const unsub = /(\/u\/[\w-]+)/.exec(mail.text)[1];
+  assert.match(mail.headers['List-Unsubscribe'], new RegExp(unsub));
+  const receipt = await anon('GET', rpath);
+  assert.equal(receipt.status, 200);
+  assert.match(receipt.text, /Receipt/);
+  assert.match(receipt.text, /Replacement awning arm/);
+  assert.match(receipt.text, /Cash/);
+  const again = appDb.prepare('SELECT receipt_sent_at FROM payments WHERE token = ?').get(rpath.slice(3));
+  assert.ok(again.receipt_sent_at);
+  assert.match((await anon('GET', `/api/public/proposals/${q.token}`)).json.receipts[0].url, /^\/r\//);
+
+  // Unsubscribe: GET asks, POST does it
+  assert.match((await anon('GET', unsub)).text, /Unsubscribe from/);
+  assert.equal(appDb.prepare('SELECT email_opt_in FROM customers WHERE id = ?').get(pat.id).email_opt_in, 1);
+  assert.match((await anon('POST', unsub, 'List-Unsubscribe=One-Click', { 'Content-Type': 'application/x-www-form-urlencoded' })).text, /You’re unsubscribed/);
+  assert.equal(appDb.prepare('SELECT email_opt_in FROM customers WHERE id = ?').get(pat.id).email_opt_in, 0);
+  assert.equal((await anon('GET', '/u/nope')).status, 404);
+  assert.equal((await anon('GET', '/r/nope')).status, 404);
+});
+
+test('consent follows the person and the number; STOP and unsubscribe stick; CSV is safe', async () => {
+  const newQuote = async (fields) => {
+    const q = (await mike('POST', '/api/quotes', {})).json;
+    await mike('PUT', `/api/quotes/${q.id}`, { title: 'Check-up', customer_name: 'Pat Camper', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Visit', qty: 1, unit_cents: 5000 }], ...fields });
+    const pub = (await anon('GET', `/api/public/proposals/${q.token}`)).json;
+    return { q, pub, sign: (body) => anon('POST', `/api/public/proposals/${q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: pub.customer_terms?.version, ...body }) };
+  };
+  const pat = () => appDb.prepare(`SELECT * FROM customers WHERE email = 'pat@example.test'`).get();
+  // Pat unsubscribed in the last test: the email box starts unchecked for her
+  const a = await newQuote({ customer_email: 'pat@example.test' });
+  assert.equal(a.pub.subscribe_email_default, false);
+  // Same email, new number, texts not re-checked: text consent doesn't move to the new number
+  assert.equal((await a.sign({ phone: '801-555-0199', email: 'pat@example.test', subscribe_email: false, subscribe_sms: false })).status, 200);
+  assert.equal(pat().phone_key, '8015550199');
+  assert.equal(pat().sms_opt_in, 0);
+  assert.equal(pat().email_opt_in, 0);
+  const log = appDb.prepare('SELECT channel, action, address FROM consent_log WHERE customer_id = ? ORDER BY id').all(pat().id);
+  assert.deepEqual(log.map((l) => `${l.channel}:${l.action}`), ['email:opt_in', 'sms:opt_in', 'email:opt_out', 'sms:opt_out']);
+
+  // A household number that already belongs to someone else's email doesn't overwrite them
+  const b = await newQuote({});
+  await b.sign({ phone: '801-555-0199', email: 'sam@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(pat().email, 'pat@example.test');
+  const sam = appDb.prepare(`SELECT * FROM customers WHERE email = 'sam@example.test'`).get();
+  assert.ok(sam && sam.email_opt_in === 1 && sam.sms_opt_in === 1);
+
+  // STOP from that number removes text consent everywhere
+  assert.equal((await anon('POST', '/api/twilio/inbound', 'From=%2B18015550199&Body=Stop', { 'Content-Type': 'application/x-www-form-urlencoded' })).status, 200);
+  assert.equal(appDb.prepare('SELECT sms_opt_in FROM customers WHERE id = ?').get(sam.id).sms_opt_in, 0);
+
+  // A stored phone that isn't a number (e.g. "-") doesn't block signing from an old page
+  const c = await newQuote({ customer_phone: '-' });
+  assert.equal(c.pub.customer_phone, undefined);
+  assert.equal((await anon('POST', `/api/public/proposals/${c.q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: c.pub.customer_terms?.version })).status, 200);
+
+  // Control characters can't sneak a formula into the CSV
+  const d = await newQuote({});
+  await d.sign({ name: 'Eve\r=1+2', phone: '801-555-0177', email: 'eve@example.test', subscribe_email: true });
+  const csv = (await mike('GET', '/api/customers.csv')).text;
+  assert.doesNotMatch(csv, /\r=1\+2/);
+  assert.match(csv, /Eve =1\+2/);
+});
+
+test('service pages with the same name get their own addresses', async () => {
+  const one = (await mike('POST', '/api/products', { name: 'Awning repair', price_cents: 0, on_site: true, details: 'First.' })).json;
+  const two = (await mike('POST', '/api/products', { name: 'Awning repair!', price_cents: 0, on_site: true, details: 'Second.' })).json;
+  assert.match((await anon('GET', `/s/${mikeSlug}/services/awning-repair`)).text, /<p>First\.<\/p>/);
+  assert.match((await anon('GET', `/s/${mikeSlug}/services/awning-repair-${two.id}`)).text, /<p>Second\.<\/p>/);
+  await mike('PATCH', `/api/products/${one.id}`, { active: false });
+  await mike('PATCH', `/api/products/${two.id}`, { active: false });
+});
+
+// ---------- owner features ----------
+// Local wall-clock time `hh:mm` on the first day at or after `after` (in the business's time zone).
+function localAt(after, hhmm, tz) {
+  const d = owner.localParts(after, tz).date;
+  const t = owner.zonedTimeToUtc(d, hhmm, tz);
+  return t >= after ? t : owner.zonedTimeToUtc(owner.addDays(d, 1), hhmm, tz);
+}
+const sentTo = (to, from = 0) => outbox.slice(from).filter((m) => m.to === to);
+// A signed and paid (cash) job for a customer, with the consent boxes they chose when signing.
+async function paidJob({ name, phone, email, subscribe_email = false, subscribe_sms = false, cents = 25000 }) {
+  const q = (await mike('POST', '/api/quotes', {})).json;
+  await mike('PUT', `/api/quotes/${q.id}`, { title: 'Water pump', customer_name: name, customer_phone: phone, customer_email: email, rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Water pump', qty: 1, unit_cents: cents }] });
+  const pub = (await anon('GET', `/api/public/proposals/${q.token}`)).json;
+  const s = await anon('POST', `/api/public/proposals/${q.token}/sign`, { name, agree: true, signature: SIG, terms_version: pub.customer_terms?.version, phone, email, subscribe_email, subscribe_sms });
+  assert.equal(s.status, 200, JSON.stringify(s.json));
+  assert.equal((await mike('POST', `/api/quotes/${q.id}/payments`, { method: 'cash' })).status, 200);
+  await new Promise((r) => setTimeout(r, 20));
+  return { q, pay: appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'paid'`).get(q.id) };
+}
+const reviewRows = (payId) => appDb.prepare(`SELECT * FROM scheduled_messages WHERE kind = 'review' AND ref_id = ? ORDER BY id`).all(payId);
+
+test('business time zone: each business picks its own; receipts show dates in it', async () => {
+  const st = (await mike('GET', '/api/owner-settings')).json;
+  assert.equal(st.timezone, 'America/Denver', 'Mountain time until the owner changes it');
+  assert.ok(st.timezones.some(([v]) => v === 'America/Phoenix'));
+  assert.equal((await mike('PUT', '/api/owner-settings', { timezone: 'Mars/Olympus' })).status, 400);
+  assert.equal((await other('PUT', '/api/owner-settings', { timezone: 'America/Los_Angeles' })).status, 200);
+  assert.equal((await mike('GET', '/api/owner-settings')).json.timezone, 'America/Denver', 'another business’s choice doesn’t touch Mike’s');
+
+  // Paid at 06:30 UTC on Nov 3: still Nov 2 in Mountain time, already Nov 3 in Eastern time.
+  const pay = appDb.prepare(`SELECT token FROM payments WHERE tenant_id = ? AND status = 'paid' ORDER BY id LIMIT 1`).get(mikeId);
+  appDb.prepare(`UPDATE payments SET paid_at = '2026-11-03 06:30:00' WHERE token = ?`).run(pay.token);
+  assert.match((await anon('GET', '/r/' + pay.token)).text, /<dt>Date<\/dt><dd>November 2, 2026<\/dd>/);
+  assert.equal((await mike('PUT', '/api/owner-settings', { timezone: 'America/New_York' })).json.timezone, 'America/New_York');
+  assert.match((await anon('GET', '/r/' + pay.token)).text, /<dt>Date<\/dt><dd>November 3, 2026<\/dd>/);
+
+  // Wall-clock times convert correctly, including daylight saving time and Arizona.
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-11-20', '09:00', 'America/New_York')), '2026-11-20 14:00:00');
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-07-01', '09:00', 'America/Denver')), '2026-07-01 15:00:00');
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-07-01', '09:00', 'America/Phoenix')), '2026-07-01 16:00:00');
+  assert.equal(owner.utcString(owner.zonedTimeToUtc('2026-03-08', '09:00', 'America/Chicago')), '2026-03-08 14:00:00', 'the day clocks spring forward');
+});
+
+test('review requests: on with a Google review link, consent respected, quiet hours, once only, 90-day limit', async () => {
+  const tz = 'America/New_York';
+  // Without a review link: nothing is scheduled and the receipt has no review button.
+  const site = (await mike('GET', '/api/website')).json;
+  assert.equal((await mike('PUT', '/api/website', { ...site.profile, links: { ...site.profile.links, google_review: '' } })).status, 200);
+  assert.equal((await mike('GET', '/api/owner-settings')).json.review.active, false);
+  const none = await paidJob({ name: 'Nora None', phone: '801-555-0150', email: 'nora@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(none.pay.id).length, 0);
+  assert.doesNotMatch((await anon('GET', '/r/' + none.pay.token)).text, /Google review/);
+
+  assert.equal((await mike('PUT', '/api/website', { ...site.profile, links: { ...site.profile.links, google_review: 'https://g.page/r/mike-rv/review' } })).status, 200);
+  const st = (await mike('GET', '/api/owner-settings')).json.review;
+  assert.deepEqual([st.enabled, st.active, st.delay_hours], [true, true, 24], 'on by default once the link exists');
+  assert.equal((await mike('PUT', '/api/owner-settings', { review_message: 'hi' })).status, 400);
+  assert.equal((await mike('PUT', '/api/owner-settings', { review_delay_hours: 5 })).status, 400);
+
+  // Rita agreed to emails and texts.
+  const rita = await paidJob({ name: 'Rita Reyes', phone: '801-555-0161', email: 'rita@example.test', subscribe_email: true, subscribe_sms: true });
+  const receipt = (await anon('GET', '/r/' + rita.pay.token)).text;
+  assert.match(receipt, /Happy with the work\? Leave us a Google review\./);
+  assert.match(receipt, /href="https:\/\/g\.page\/r\/mike-rv\/review"/);
+  const deposit = appDb.prepare(`SELECT token FROM payments WHERE tenant_id = ? AND kind = 'deposit' AND status = 'paid' LIMIT 1`).get(mikeId);
+  assert.doesNotMatch((await anon('GET', '/r/' + deposit.token)).text, /Google review/, 'not on deposit receipts: the work isn’t done yet');
+  let rows = reviewRows(rita.pay.id);
+  assert.deepEqual(rows.map((r) => r.channel), ['email', 'sms']);
+  const due = new Date(owner.parseUtc(rita.pay.paid_at).getTime() + 24 * 3600_000);
+  assert.ok(rows.every((r) => r.send_after === owner.utcString(due)), 'a day after payment');
+
+  let mark = outbox.length;
+  await runDue(new Date(due.getTime() - 60_000));
+  assert.equal(sentTo('rita@example.test', mark).length + sentTo('+18015550161', mark).length, 0, 'not before the delay');
+
+  // Due at 10pm local: the email goes, the text waits for 8am.
+  const late = localAt(due, '22:00', tz);
+  await runDue(late);
+  const mail = sentTo('rita@example.test', mark);
+  assert.equal(mail.length, 1);
+  assert.match(mail[0].subject, /How did we do\?/);
+  assert.match(mail[0].text, /Hi Rita,/);
+  assert.match(mail[0].text, /https:\/\/g\.page\/r\/mike-rv\/review/);
+  assert.match(mail[0].text, /801-232-4995/, 'business phone');
+  const unsub = /\/u\/([\w-]+)/.exec(mail[0].text)[0];
+  assert.match(mail[0].headers['List-Unsubscribe'], new RegExp(unsub));
+  assert.equal(sentTo('+18015550161', mark).length, 0, 'no texts after 8pm');
+  const sms = appDb.prepare(`SELECT * FROM scheduled_messages WHERE kind = 'review' AND ref_id = ? AND channel = 'sms'`).get(rita.pay.id);
+  const eight = owner.zonedTimeToUtc(owner.addDays(owner.localParts(late, tz).date, 1), '08:00', tz);
+  assert.deepEqual([sms.status, sms.send_after], ['pending', owner.utcString(eight)]);
+
+  // Two workers at 8:01am (a second app on the same database): the text goes out exactly once.
+  const second = createApp({ DATA_DIR: dataDir, NOTIFY_CAPTURE: '1', DISABLE_WORKER: '1' });
+  await Promise.all([runDue(new Date(eight.getTime() + 60_000)), second.runDueMessages(new Date(eight.getTime() + 60_000)), runDue(new Date(eight.getTime() + 60_000))]);
+  const texts = [...sentTo('+18015550161', mark), ...second.outbox.filter((m) => m.to === '+18015550161')];
+  assert.equal(texts.length, 1);
+  assert.match(texts[0].body, /^Mike Stevens Emergency RV & Trailer Repair: /);
+  assert.match(texts[0].body, /g\.page\/r\/mike-rv\/review/);
+  assert.match(texts[0].body, /Reply STOP to opt out\./);
+  await runDue(new Date(eight.getTime() + 3 * 3600_000));
+  const all = [...outbox.slice(mark), ...second.outbox];
+  assert.equal(all.filter((m) => m.to === '+18015550161').length, 1, 'the text went once');
+  assert.equal(all.filter((m) => m.to === 'rita@example.test').length, 1, 'the email went once');
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'review' AND ref_id = ? AND status = 'sent'`).get(rita.pay.id).n, 2);
+
+  // Rita pays for another job: no second request within 90 days.
+  const again = await paidJob({ name: 'Rita Reyes', phone: '801-555-0161', email: 'rita@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(again.pay.id).length, 0);
+  appDb.prepare(`UPDATE scheduled_messages SET created_at = datetime('now', '-91 days') WHERE kind = 'review' AND ref_id = ?`).run(rita.pay.id);
+  const later = await paidJob({ name: 'Rita Reyes', phone: '801-555-0161', email: 'rita@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(later.pay.id).length, 2, 'after 90 days she can be asked again');
+
+  // Consent: emails only for people who agreed to emails, texts only for people who agreed to texts.
+  const emailOnly = await paidJob({ name: 'Ed Mail', phone: '801-555-0162', email: 'ed@example.test', subscribe_email: true });
+  assert.deepEqual(reviewRows(emailOnly.pay.id).map((r) => r.channel), ['email']);
+  const neither = await paidJob({ name: 'Nat Quiet', phone: '801-555-0163', email: 'nat@example.test' });
+  assert.equal(reviewRows(neither.pay.id).length, 0);
+  // Pat unsubscribed and her text consent was removed earlier.
+  const pat = await paidJob({ name: 'Pat Camper', phone: '801-555-0199', email: 'pat@example.test' });
+  assert.equal(reviewRows(pat.pay.id).length, 0);
+
+  // Changes of mind before the send time are respected: unsubscribe and STOP.
+  const sue = await paidJob({ name: 'Sue Change', phone: '801-555-0164', email: 'sue@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(reviewRows(sue.pay.id).length, 2);
+  const sueToken = appDb.prepare(`SELECT unsub_token FROM customers WHERE email = 'sue@example.test'`).get().unsub_token;
+  await anon('POST', '/u/' + sueToken, 'List-Unsubscribe=One-Click', { 'Content-Type': 'application/x-www-form-urlencoded' });
+  await anon('POST', '/api/twilio/inbound', 'From=%2B18015550164&Body=STOP', { 'Content-Type': 'application/x-www-form-urlencoded' });
+  mark = outbox.length;
+  await runDue(localAt(new Date(Date.now() + 2 * 864e5), '12:00', tz));
+  assert.equal(sentTo('sue@example.test', mark).length + sentTo('+18015550164', mark).length, 0);
+  assert.deepEqual(reviewRows(sue.pay.id).map((r) => r.status), ['skipped', 'skipped']);
+  assert.ok(appDb.prepare(`SELECT 1 FROM sms_stops WHERE phone_key = '8015550164'`).get());
+  assert.equal(sentTo('ed@example.test', mark).length, 1);
+
+  // The owner can turn it off.
+  assert.equal((await mike('PUT', '/api/owner-settings', { review_requests: false })).json.review.active, false);
+  const off = await paidJob({ name: 'Otto Off', phone: '801-555-0165', email: 'otto@example.test', subscribe_email: true });
+  assert.equal(reviewRows(off.pay.id).length, 0);
+  assert.doesNotMatch((await anon('GET', '/r/' + off.pay.token)).text, /Google review/);
+  const saved = (await mike('PUT', '/api/owner-settings', { review_requests: true, review_delay_hours: 2, review_message: 'Thanks from Mike! A quick review would mean a lot.' })).json.review;
+  assert.deepEqual([saved.active, saved.delay_hours, saved.message], [true, 2, 'Thanks from Mike! A quick review would mean a lot.']);
+  assert.equal((await other('GET', '/api/owner-settings')).json.review.link, '', 'settings are per business');
+});
+
+let tia, tiaId, bookedJob;
+test('scheduling: confirmation, reminder at 9am business time the day before, quiet hours, changes, once only', async () => {
+  const tz = 'America/New_York'; // Mike's time zone since the time zone test
+  const day = owner.addDays(owner.todayIn(tz), 10);
+  assert.equal((await mike('POST', '/api/team', { name: 'Tia Tech', email: 'tia@rv.test', password: 'tia-temp-password' })).status, 201);
+  tia = client();
+  assert.equal((await tia('POST', '/api/login', { email: 'tia@rv.test', password: 'tia-temp-password' })).status, 200);
+  tiaId = appDb.prepare(`SELECT id FROM users WHERE email = 'tia@rv.test'`).get().id;
+  const olaId = appDb.prepare(`SELECT id FROM users WHERE email = 'ola@other.test'`).get().id;
+
+  // "Schedule this job" from a request fills in the customer.
+  const rq = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { type: 'repair', name: 'Jo Booker', phone: '801-555-0170', email: 'jo@example.test', location: '12 Elm St, Ogden', issue: 'Slide-out stuck' });
+  const pre = (await mike('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json;
+  assert.deepEqual([pre.customer_name, pre.customer_phone, pre.customer_email, pre.address, pre.request_id], ['Jo Booker', '801-555-0170', 'jo@example.test', '12 Elm St, Ogden', rq.json.id]);
+  assert.equal((await other('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json.customer_name, '', 'another business gets nothing');
+  assert.equal((await mike('POST', '/api/jobs', { ...pre, date: 'soon', time: '14:00' })).status, 400);
+  assert.equal((await mike('POST', '/api/jobs', { ...pre, date: day, time: '14:00', user_id: olaId })).status, 400, 'only your own team');
+
+  let mark = outbox.length;
+  const made = await mike('POST', '/api/jobs', { ...pre, date: day, time: '14:00', duration_min: 90, user_id: tiaId, notes: 'Bring a slide motor' });
+  assert.equal(made.status, 201, JSON.stringify(made.json));
+  const job = bookedJob = made.json;
+  assert.deepEqual([job.date, job.time, job.start_label, job.end_label, job.start_at], [day, '14:00', '2:00 PM', '3:30 PM', owner.utcString(owner.zonedTimeToUtc(day, '14:00', tz))]);
+  const jobRows = (id) => appDb.prepare(`SELECT * FROM scheduled_messages WHERE ref_id = ? AND kind IN ('job_confirm','job_reminder','job_on_way') ORDER BY id`).all(id);
+  let rows = jobRows(job.id);
+  assert.deepEqual(rows.map((r) => `${r.kind}:${r.channel}`), ['job_confirm:email', 'job_confirm:sms', 'job_reminder:email', 'job_reminder:sms']);
+  const reminderAt = owner.zonedTimeToUtc(owner.addDays(day, -1), '09:00', tz);
+  assert.ok(rows.slice(2).every((r) => r.send_after === owner.utcString(reminderAt)), 'reminder at 9am the day before, business time');
+  assert.equal(outbox.length, mark, 'nothing is sent inside the request; the background sender does it');
+
+  // The worker runs at 9pm business time: the email goes now, the text waits for 8am.
+  const night = localAt(new Date(), '21:00', tz);
+  await runDue(night);
+  const conf = sentTo('jo@example.test', mark);
+  assert.equal(conf.length, 1);
+  assert.match(conf[0].subject, /^Your appointment with Mike Stevens Emergency RV & Trailer Repair: \w{3}, \w{3} \d+ at 2:00 PM$/);
+  assert.match(conf[0].text, /Where: 12 Elm St, Ogden/);
+  assert.match(conf[0].text, /801-232-4995/);
+  assert.equal(sentTo('+18015550170', mark).length, 0, 'no texts at 9pm');
+  const eight = owner.zonedTimeToUtc(owner.addDays(owner.localParts(night, tz).date, 1), '08:00', tz);
+  assert.equal(jobRows(job.id)[1].send_after, owner.utcString(eight));
+  await Promise.all([runDue(new Date(eight.getTime() + 60_000)), runDue(new Date(eight.getTime() + 60_000))]);
+  await runDue(new Date(eight.getTime() + 120_000));
+  const texts = sentTo('+18015550170', mark);
+  assert.equal(texts.length, 1, 'sent once');
+  assert.match(texts[0].body, /^Mike Stevens Emergency RV & Trailer Repair: You’re booked for \w{3}, \w{3} \d+ at 2:00 PM at 12 Elm St, Ogden\. Questions\? Call or text 801-232-4995\. Reply STOP to opt out\.$/);
+
+  // The owner moves it to the next day at 10am: the old reminder is dropped and the customer hears the new time.
+  const moved = await mike('PUT', `/api/jobs/${job.id}`, { ...job, date: owner.addDays(day, 1), time: '10:00', duration_min: 90, user_id: tiaId, notify: true });
+  assert.equal(moved.status, 200);
+  rows = jobRows(job.id);
+  assert.deepEqual(rows.slice(2, 4).map((r) => r.status), ['canceled', 'canceled']);
+  const newReminder = owner.zonedTimeToUtc(day, '09:00', tz);
+  assert.deepEqual(rows.slice(4).map((r) => `${r.kind}:${r.channel}:${r.status}`), ['job_confirm:email:pending', 'job_confirm:sms:pending', 'job_reminder:email:pending', 'job_reminder:sms:pending']);
+  assert.ok(rows.slice(6).every((r) => r.send_after === owner.utcString(newReminder)));
+  mark = outbox.length;
+  await runDue(localAt(new Date(eight.getTime() + 3600_000), '12:00', tz));
+  assert.match(sentTo('+18015550170', mark)[0].body, /Your appointment changed\. You’re now booked for \w{3}, \w{3} \d+ at 10:00 AM/);
+  assert.match(sentTo('jo@example.test', mark)[0].subject, /^Updated appointment/);
+
+  // The reminder: not a minute early, then once.
+  mark = outbox.length;
+  await runDue(new Date(newReminder.getTime() - 60_000));
+  assert.equal(sentTo('+18015550170', mark).length + sentTo('jo@example.test', mark).length, 0);
+  await runDue(new Date(newReminder.getTime() + 60_000));
+  await runDue(new Date(newReminder.getTime() + 3600_000));
+  assert.equal(sentTo('jo@example.test', mark).length, 1);
+  const rem = sentTo('+18015550170', mark);
+  assert.equal(rem.length, 1);
+  assert.match(rem[0].body, /Reminder, we’ll see you tomorrow, \w{3}, \w{3} \d+ at 10:00 AM at 12 Elm St, Ogden\. Need to change it\? Call 801-232-4995\./);
+
+  // A canceled appointment's reminder never goes. A number that replied STOP gets no texts at all.
+  const b = (await mike('POST', '/api/jobs', { customer_name: 'Sue Change', customer_phone: '801-555-0164', customer_email: 'sue2@example.test', address: 'Roy', date: owner.addDays(day, 3), time: '09:30' })).json;
+  assert.deepEqual(jobRows(b.id).map((r) => `${r.kind}:${r.channel}`), ['job_confirm:email', 'job_reminder:email'], 'Sue replied STOP earlier');
+  assert.equal((await mike('POST', `/api/jobs/${b.id}/on-my-way`, { minutes: 20 })).status, 409);
+  await mike('POST', `/api/jobs/${b.id}/status`, { status: 'canceled' });
+  assert.deepEqual(jobRows(b.id).map((r) => r.status), ['canceled', 'canceled']);
+  assert.equal((await mike('PUT', `/api/jobs/${b.id}`, { ...b, date: day, time: '10:00' })).status, 409);
+  const noTell = (await mike('POST', '/api/jobs', { customer_name: 'Quiet Booking', customer_phone: '801-555-0171', date: day, time: '16:00', notify: false })).json;
+  assert.equal(jobRows(noTell.id).length, 0, 'the owner can book without messaging the customer');
+
+  // Lists: day, week (from Monday), canceled hidden, only this business.
+  const list = (await mike('GET', `/api/jobs?from=${owner.addDays(day, 1)}&days=1`)).json;
+  assert.deepEqual(list.jobs.map((j) => j.customer_name), ['Jo Booker']);
+  assert.equal(list.jobs[0].assignee_name, 'Tia Tech');
+  const week = (await mike('GET', `/api/jobs?from=${day}&days=7&snap=week`)).json;
+  assert.equal(new Date(week.from + 'T00:00:00Z').getUTCDay(), 1, 'weeks start on Monday');
+  assert.equal(week.tz, tz);
+  assert.ok(!week.jobs.some((j) => j.id === b.id), 'canceled appointments are hidden');
+  assert.equal((await tia('GET', `/api/jobs/${job.id}`)).status, 200, 'the team sees the schedule');
+  assert.equal((await other('GET', `/api/jobs/${job.id}`)).status, 404);
+  assert.equal((await other('PUT', `/api/jobs/${job.id}`, { ...job })).status, 404);
+  assert.equal((await other('POST', `/api/jobs/${job.id}/on-my-way`, { minutes: 5 })).status, 404);
+  assert.equal((await other('GET', `/api/jobs?from=${day}&days=7&snap=week`)).json.jobs.length, 0);
+
+  // "On my way" texts right now, but only 8am to 8pm business time. Try a zone where it's daytime and one where it's night.
+  const zones = owner.US_TIMEZONES.map(([z]) => z);
+  const pick = [zones.find((z) => owner.inTextHours(new Date(), z)), zones.find((z) => !owner.inTextHours(new Date(), z))].filter(Boolean);
+  assert.equal((await mike('POST', `/api/jobs/${job.id}/on-my-way`, { minutes: 0 })).status, 400);
+  for (const z of pick) {
+    await mike('PUT', '/api/owner-settings', { timezone: z });
+    mark = outbox.length;
+    const r = await mike('POST', `/api/jobs/${job.id}/on-my-way`, { minutes: 25 });
+    if (owner.inTextHours(new Date(), z)) {
+      assert.equal(r.status, 200, JSON.stringify(r.json));
+      assert.deepEqual(sentTo('+18015550170', mark).map((m) => m.body), ['Mike Stevens Emergency RV & Trailer Repair is on the way, about 25 minutes. Questions? Call 801-232-4995.']);
+      assert.equal((await mike('GET', `/api/jobs/${job.id}`)).json.status, 'en_route');
+    } else {
+      assert.equal(r.status, 409);
+      assert.match(r.json.error, /outside texting hours \(8am to 8pm\)/);
+      assert.equal(sentTo('+18015550170', mark).length, 0);
+    }
+  }
+  await mike('PUT', '/api/owner-settings', { timezone: tz });
+});
+
+test('calendar feed: a private link per person, valid VCALENDAR, owners see all, team members see theirs', async () => {
+  const link = (await mike('GET', '/api/calendar')).json;
+  assert.equal(link.owner, true);
+  const feedPath = new URL(link.url).pathname;
+  assert.match(feedPath, /^\/cal\/[\w-]{32}\.ics$/);
+  assert.equal((await mike('GET', '/api/calendar')).json.url, link.url, 'the same link until you ask for a new one');
+  const res = await fetch(base + feedPath);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^text\/calendar/);
+  const ics = await res.text();
+  assert.ok(ics.startsWith('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:'));
+  assert.ok(ics.endsWith('END:VCALENDAR\r\n'));
+  assert.ok(!/[^\r]\n/.test(ics), 'every line ends in CRLF');
+  assert.ok(ics.split('\r\n').every((l) => Buffer.byteLength(l) <= 75), 'long lines are folded');
+  assert.equal((ics.match(/BEGIN:VEVENT/g) || []).length, (ics.match(/END:VEVENT/g) || []).length);
+  const unfolded = ics.replace(/\r\n /g, '');
+  const ev = unfolded.split('BEGIN:VEVENT').find((e) => e.includes(`UID:job-${bookedJob.id}@`));
+  assert.ok(ev, 'the booked job is in the feed');
+  const start = owner.zonedTimeToUtc(owner.addDays(bookedJob.date, 1), '10:00', 'America/New_York');
+  assert.match(ev, new RegExp(`DTSTART:${start.toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`));
+  assert.match(ev, /SUMMARY:Jo Booker/);
+  assert.match(ev, /LOCATION:12 Elm St\\, Ogden/, 'commas escaped');
+  assert.match(ev, /DESCRIPTION:Phone: 801-555-0170\\nTech: Tia Tech\\nBring a slide motor/);
+  assert.doesNotMatch(unfolded, /Sue Change/, 'canceled appointments are left out');
+  assert.match(unfolded, /SUMMARY:Quiet Booking/);
+
+  // Tia's link shows only her appointments; Ola's shows none of Mike's.
+  const tiaFeed = await (await fetch(base + new URL((await tia('GET', '/api/calendar')).json.url).pathname)).text();
+  assert.match(tiaFeed, /SUMMARY:Jo Booker/);
+  assert.doesNotMatch(tiaFeed, /Quiet Booking/);
+  const olaFeed = await (await fetch(base + new URL((await other('GET', '/api/calendar')).json.url).pathname)).text();
+  assert.doesNotMatch(olaFeed, /BEGIN:VEVENT/);
+
+  // A new link turns the old one off.
+  const fresh = (await mike('POST', '/api/calendar/reset')).json.url;
+  assert.notEqual(fresh, link.url);
+  assert.equal((await fetch(base + feedPath)).status, 404);
+  assert.equal((await fetch(base + new URL(fresh).pathname)).status, 200);
+  assert.equal((await fetch(base + '/cal/not-a-real-calendar-token-at-all.ics')).status, 404);
+  await superA('POST', '/api/super/view-as', { tenant_id: mikeId });
+  assert.equal((await superA('GET', '/api/calendar')).status, 409, 'platform staff don’t get a link');
+  await superA('POST', '/api/super/view-as', { tenant_id: 0 });
+});
+
+test('quick invoices: no signature, the customer accepts the terms by paying, receipt sent, cash works too', async () => {
+  const inv = (await mike('POST', '/api/invoices', {})).json;
+  assert.deepEqual([inv.kind, inv.title, inv.tax_rate_bp], ['invoice', 'Invoice', 725]);
+  assert.equal((await other('GET', `/api/quotes/${inv.id}`)).status, 404);
+  const saved = await mike('PUT', `/api/quotes/${inv.id}`, { title: 'Furnace repair', customer_name: 'Ivy Payne', customer_phone: '801-555-0180', customer_email: '', rig: '', notes: 'Replaced the igniter.', terms: '', tax_rate_bp: 725, items: [{ name: 'Igniter', qty: 1, unit_cents: 4000, taxable: 1 }, { name: 'Labor', qty: 1, unit_cents: 12000 }] });
+  assert.deepEqual(saved.json.totals, { subtotal: 16000, tax: 290, total: 16290, credit: 0, balance: 16290 });
+  assert.ok((await mike('GET', '/api/quotes')).json.some((q) => q.id === inv.id && q.kind === 'invoice'));
+
+  const pub = (await anon('GET', `/api/public/proposals/${inv.token}`)).json;
+  assert.equal(pub.kind, 'invoice');
+  assert.equal(pub.customer_terms.version, 1);
+  assert.equal(pub.online.card_payments, true);
+  const pay = (body) => anon('POST', `/api/public/invoices/${inv.token}/checkout`, body);
+  assert.equal((await pay({})).status, 409, 'must be shown the current terms');
+  assert.equal((await pay({ terms_version: 99 })).status, 409);
+  assert.equal((await pay({ terms_version: 1, email: 'nope' })).status, 400);
+  assert.equal((await pay({ terms_version: 1, phone: '', subscribe_sms: true })).status, 400);
+  assert.equal((await anon('POST', `/api/public/invoices/${saved.json.token.replace(/.$/, '')}x/checkout`, { terms_version: 1 })).status, 404);
+  const proposal = (await mike('POST', '/api/quotes', {})).json;
+  assert.equal((await anon('POST', `/api/public/invoices/${proposal.token}/checkout`, { terms_version: 1 })).status, 404, 'proposals still need a signature');
+
+  const co = await pay({ terms_version: 1, phone: '801-555-0180', email: 'Ivy@Example.test', subscribe_email: true, subscribe_sms: false });
+  assert.equal(co.status, 200, JSON.stringify(co.json));
+  const sess = [...sessions.values()].find((x) => x.lines[0]?.name === `Furnace repair (#${inv.id})`);
+  assert.equal(sess.account, mikeAcct, 'paid to the business’s own Stripe account');
+  assert.deepEqual([sess.amount_total, sess.terms_version, sess.pi_terms_version], [16290, '1', '1']);
+  const row = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  assert.equal(row.customer_terms_version, 1, 'the terms version accepted by paying is recorded');
+  const ivy = appDb.prepare(`SELECT * FROM customers WHERE email = 'ivy@example.test'`).get();
+  assert.ok(ivy && ivy.email_opt_in === 1 && ivy.sms_opt_in === 0 && ivy.source === `Invoice #${inv.id}`);
+  assert.equal((await pay({ terms_version: 1, phone: '801-555-0180', email: 'ivy@example.test', subscribe_email: true })).status, 200, 'trying again reuses the payment');
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE quote_id = ?`).get(inv.id).n, 1);
+
+  const mark = outbox.length;
+  const latest = sessions.get(appDb.prepare('SELECT stripe_session_id FROM payments WHERE id = ?').get(row.id).stripe_session_id); // the second try's checkout
+  latest.payment_status = 'paid';
+  assert.equal((await anon('POST', `/api/public/payments/${row.token}/confirm`, { session_id: latest.id })).json.paid, true);
+  await new Promise((r) => setTimeout(r, 30));
+  const done = (await mike('GET', `/api/quotes/${inv.id}`)).json;
+  assert.equal(done.status, 'paid');
+  assert.equal(done.signed_at, null, 'never signed');
+  assert.equal(done.payments[0].transfer_status, 'direct');
+  const mail = sentTo('ivy@example.test', mark);
+  assert.equal(mail.length, 1);
+  assert.match(mail[0].text, /payment of \$162\.90 for Furnace repair/);
+  assert.match(sentTo('+18015550180', mark)[0].body, /Thanks, Ivy! We received your payment of \$162\.90/);
+  const receipt = (await anon('GET', `/r/${row.token}`)).text;
+  assert.match(receipt, new RegExp(`Furnace repair \\(invoice #${inv.id}\\)`));
+  assert.match(receipt, /Sales tax/);
+  assert.match(receipt, /View the invoice/);
+  assert.equal(reviewRows(row.id).length, 1, 'review request by email: Ivy agreed to emails, not texts');
+  assert.equal((await pay({ terms_version: 1 })).status, 409, 'already paid');
+  const after = (await anon('GET', `/api/public/proposals/${inv.token}`)).json;
+  assert.deepEqual([after.status, after.customer_phone, after.customer_email], ['paid', undefined, undefined], 'contact details hidden once paid');
+
+  // Cash or check works the same, without a signature.
+  const cash = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${cash.id}`, { title: 'Battery swap', customer_name: 'Cal Cash', customer_phone: '801-555-0181', customer_email: 'cal@example.test', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Battery', qty: 1, unit_cents: 18900 }] });
+  const paid = await mike('POST', `/api/quotes/${cash.id}/payments`, { method: 'check' });
+  assert.equal(paid.json.status, 'paid');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(sentTo('cal@example.test', mark).length, 1, 'receipt email');
+  // An invoice from a request picks up the paid deposit, and other businesses can't use Mike's request.
+  const rid = (await mike('GET', '/api/requests?filter=all')).json.rows.find((r) => r.name === 'Dana').id;
+  assert.equal((await mike('POST', '/api/invoices', { request_id: rid })).json.deposit_credit_cents, 12900);
+  assert.equal((await other('POST', '/api/invoices', { request_id: rid })).json.request_id, null);
+});
+
+test('emails to subscribers: address required, opted-in only, unsubscribe link and headers, batches, one a day', async () => {
+  const draft = { subject: 'Spring check-up special', body: 'Hi there,\n\nBook a spring check-up this month and get 10% off.\n\nMike' };
+  // Without a mailing address (Ola never filled in Customer Terms details), nothing can be sent.
+  assert.equal((await other('GET', '/api/campaigns')).json.address.ok, false);
+  assert.match((await other('POST', '/api/campaigns/test', draft)).json.error, /mailing address/);
+  assert.match((await other('POST', '/api/campaigns', draft)).json.error, /mailing address/);
+  assert.equal((await tia('GET', '/api/campaigns')).status, 403, 'owners only');
+  assert.equal((await tia('POST', '/api/campaigns', draft)).status, 403);
+  assert.equal((await mike('POST', '/api/campaigns', { ...draft, subject: '' })).status, 400);
+  assert.equal((await mike('POST', '/api/campaigns', { ...draft, body: 'Hi' })).status, 400);
+
+  const st = (await mike('GET', '/api/campaigns')).json;
+  assert.deepEqual([st.address.ok, st.address.line], [true, '1 Main St, Ogden, UT 84401']);
+  const optedIn = appDb.prepare(`SELECT DISTINCT email FROM customers WHERE tenant_id = ? AND email_opt_in = 1 AND email != ''`).all(mikeId).map((r) => r.email).sort();
+  assert.equal(st.subscribers, optedIn.length);
+  assert.ok(!optedIn.includes('pat@example.test') && !optedIn.includes('sue@example.test') && !optedIn.includes('nat@example.test'));
+  assert.ok(optedIn.length >= 4);
+
+  // A test goes only to the owner and doesn't count as the day's email.
+  let mark = outbox.length;
+  const t1 = await mike('POST', '/api/campaigns/test', draft);
+  assert.equal(t1.status, 200);
+  const test1 = outbox.slice(mark);
+  assert.deepEqual(test1.map((m) => [m.to, m.subject]), [['mike@rv.test', '[Test] Spring check-up special']]);
+  assert.match(test1[0].text, /10% off[\s\S]*Mike Stevens Emergency RV & Trailer Repair\nMike Stevens RV Repair LLC\n1 Main St, Ogden, UT 84401/);
+
+  const sent = await mike('POST', '/api/campaigns', draft);
+  assert.equal(sent.status, 201, JSON.stringify(sent.json));
+  assert.equal(sent.json.recipients, optedIn.length);
+  assert.equal(outbox.length, mark + 1, 'queued for the background sender, not sent in the request');
+  assert.equal((await mike('POST', '/api/campaigns', { ...draft, subject: 'Again' })).status, 429, 'one a day');
+  assert.match((await mike('GET', '/api/campaigns')).json.next_allowed_label, / at /);
+
+  // Someone unsubscribes after it's queued: they're skipped.
+  const leaving = optedIn.find((e) => e === 'eve@example.test') || optedIn[0];
+  const tok = appDb.prepare('SELECT unsub_token FROM customers WHERE tenant_id = ? AND email = ?').get(mikeId, leaving).unsub_token;
+  await anon('POST', '/u/' + tok, 'List-Unsubscribe=One-Click', { 'Content-Type': 'application/x-www-form-urlencoded' });
+
+  // Sent in batches by the background sender.
+  mark = outbox.length;
+  const soon = new Date(Date.now() + 1000);
+  const campaign = () => appDb.prepare('SELECT * FROM campaigns WHERE id = ?').get(sent.json.id);
+  await runDue(soon, { limit: 2 });
+  assert.ok(campaign().sent + campaign().skipped <= 2, 'one batch at a time');
+  for (let i = 0; i < 20 && campaign().status !== 'done'; i++) await runDue(soon, { limit: 2 });
+  const c = campaign();
+  assert.deepEqual([c.status, c.recipients, c.sent, c.skipped, c.failed], ['done', optedIn.length, optedIn.length - 1, 1, 0]);
+  const mails = outbox.slice(mark).filter((m) => m.subject === draft.subject);
+  assert.deepEqual(mails.map((m) => m.to).sort(), optedIn.filter((e) => e !== leaving));
+  for (const m of mails) {
+    const cust = appDb.prepare('SELECT unsub_token FROM customers WHERE tenant_id = ? AND email = ?').get(mikeId, m.to);
+    assert.match(m.text, new RegExp(`Unsubscribe: http://localhost:3000/u/${cust.unsub_token}$`));
+    assert.equal(m.headers['List-Unsubscribe'], `<http://localhost:3000/u/${cust.unsub_token}>`);
+    assert.equal(m.headers['List-Unsubscribe-Post'], 'List-Unsubscribe=One-Click');
+    assert.match(m.text, /1 Main St, Ogden, UT 84401/);
+    assert.equal(m.fromName, 'Mike Stevens Emergency RV & Trailer Repair');
+  }
+  await runDue(soon);
+  assert.equal(outbox.slice(mark).filter((m) => m.subject === draft.subject).length, mails.length, 'nobody gets it twice');
+  const list = (await mike('GET', '/api/campaigns')).json.campaigns;
+  assert.deepEqual([list[0].subject, list[0].sent, list[0].skipped], [draft.subject, optedIn.length - 1, 1]);
+
+  // The next day, another one can go.
+  appDb.prepare(`UPDATE campaigns SET created_at = datetime('now', '-25 hours') WHERE id = ?`).run(sent.json.id);
+  assert.equal((await mike('GET', '/api/campaigns')).json.next_allowed_at, null);
+  assert.equal((await other('GET', '/api/campaigns')).json.campaigns.length, 0, 'each business sees only its own');
+});
+
+test('review fixes: invoice edits close open checkouts, voided invoices can’t be paid quietly, On my way only for live jobs', async () => {
+  const inv = (await mike('POST', '/api/invoices', {})).json;
+  const body = (cents) => ({ title: 'Water pump', customer_name: 'Rae Cole', customer_phone: '801-555-0166', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Water pump', qty: 1, unit_cents: cents, taxable: 0 }] });
+  await mike('PUT', `/api/quotes/${inv.id}`, body(10000));
+  const pay = () => anon('POST', `/api/public/invoices/${inv.token}/checkout`, { terms_version: 1, phone: '801-555-0166', email: 'rae@example.test', subscribe_email: false });
+  assert.equal((await pay()).status, 200);
+  const first = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  // Editing the amount closes the customer's open checkout and cancels that payment
+  const ex = expired.length;
+  assert.equal((await mike('PUT', `/api/quotes/${inv.id}`, body(30000))).status, 200);
+  assert.ok(expired.slice(ex).some(([id]) => id === first.stripe_session_id), 'old checkout expired');
+  assert.equal(appDb.prepare('SELECT status FROM payments WHERE id = ?').get(first.id).status, 'canceled');
+  // The same amount in a second tab gets the same checkout back
+  const a = (await pay()).json.url, b = (await pay()).json.url;
+  assert.equal(a, b);
+  // Paid while the owner tries to edit: refused, not silently changed
+  const live = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  sessions.get(live.stripe_session_id).payment_status = 'paid';
+  assert.equal((await mike('PUT', `/api/quotes/${inv.id}`, body(5000))).status, 409);
+  // A payment that lands on a voided invoice is recorded with a note for the owner, and the invoice stays void
+  const inv2 = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${inv2.id}`, body(7000));
+  await anon('POST', `/api/public/invoices/${inv2.token}/checkout`, { terms_version: 1, phone: '801-555-0166', email: 'rae@example.test' });
+  const p2 = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv2.id);
+  appDb.prepare(`UPDATE quotes SET status = 'void' WHERE id = ?`).run(inv2.id); // voided while the customer was in checkout
+  sessions.get(p2.stripe_session_id).payment_status = 'paid';
+  await anon('POST', `/api/public/payments/${p2.token}/confirm`, { session_id: p2.stripe_session_id });
+  assert.equal(appDb.prepare('SELECT status FROM quotes WHERE id = ?').get(inv2.id).status, 'void');
+  assert.match(appDb.prepare('SELECT note FROM payments WHERE id = ?').get(p2.id).note, /after you voided/);
+
+  // On my way: refused for a canceled appointment
+  const date = new Date(Date.now() + 3 * 864e5).toISOString().slice(0, 10);
+  const job = await mike('POST', '/api/jobs', { customer_name: 'Rae Cole', customer_phone: '801-555-0166', address: 'Ogden', date, time: '10:00', duration_min: 60, notify: false });
+  assert.equal(job.status, 201, JSON.stringify(job.json));
+  assert.equal((await mike('POST', `/api/jobs/${job.json.id}/status`, { status: 'canceled' })).status, 200);
+  assert.equal((await mike('POST', `/api/jobs/${job.json.id}/on-my-way`, { minutes: 20 })).status, 409);
+});
+
+test('pay over time: Checkout uses each business’s own payment methods; the note shows at $50 or more once the owner turns it on', async () => {
+  // createCheckout never forces payment_method_types, so Affirm and Klarna appear when the business turns them on in Stripe.
+  const seen = [];
+  const cap = http.createServer((req, res) => {
+    let b = ''; req.on('data', (c) => (b += c));
+    req.on('end', () => { seen.push({ url: req.url, account: req.headers['stripe-account'], body: new URLSearchParams(b) }); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"id":"cs_cap","url":"https://checkout.stripe.test/cs_cap"}'); });
+  });
+  await new Promise((r) => cap.listen(0, r));
+  const { stripeClient } = await import('../src/stripe.js');
+  await stripeClient({ STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_API_BASE: `http://localhost:${cap.address().port}` })
+    .createCheckout({ account: 'acct_cap', name: 'Roof reseal', amountCents: 60000, applicationFeeCents: 1800, successUrl: 'https://x.test/s', cancelUrl: 'https://x.test/c', ref: 'tok_cap' });
+  cap.close();
+  assert.deepEqual([seen[0].url, seen[0].account, seen[0].body.get('mode')], ['/v1/checkout/sessions', 'acct_cap', 'payment']);
+  assert.ok(![...seen[0].body.keys()].some((k) => k.startsWith('payment_method_types')));
+
+  const invoice = async (cents) => {
+    const q = (await mike('POST', '/api/invoices', {})).json;
+    await mike('PUT', `/api/quotes/${q.id}`, { title: 'Roof reseal', customer_name: 'Rae Roof', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Reseal', qty: 1, unit_cents: cents }] });
+    return async () => (await anon('GET', `/api/public/proposals/${q.token}`)).json.pay_over_time;
+  };
+  const big = await invoice(60000), small = await invoice(4900);
+  assert.equal(await big(), false, 'off until the owner says Affirm or Klarna is on');
+  assert.equal((await tia('PUT', '/api/owner-settings', { pay_over_time: true })).status, 403);
+  assert.equal((await mike('PUT', '/api/owner-settings', { pay_over_time: true })).json.pay_over_time, true);
+  assert.equal(await big(), true);
+  assert.equal(await small(), false, 'under $50');
+  const olaQuote = (await other('POST', '/api/quotes', {})).json;
+  await other('PUT', '/api/owner-settings', { pay_over_time: true });
+  await other('PUT', `/api/quotes/${olaQuote.id}`, { title: 'Job', customer_name: 'X', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Job', qty: 1, unit_cents: 90000 }] });
+  assert.equal((await anon('GET', `/api/public/proposals/${olaQuote.token}`)).json.pay_over_time, false, 'never without card payments on');
+});
+
+test('QuickBooks download: paid payments for a date range, every cell quoted, formulas neutralized, owner only', async () => {
+  // A customer name and title that a spreadsheet would run as formulas.
+  const q = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${q.id}`, { title: '-2+3 cmd', customer_name: '=HYPERLINK("http://evil.test","Click")', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Part', qty: 1, unit_cents: 1234 }] });
+  await mike('POST', `/api/quotes/${q.id}/payments`, { method: 'check' });
+  const url = '/api/exports/quickbooks.csv?from=2020-01-01&to=2030-12-31';
+  assert.equal((await tia('GET', url)).status, 403, 'owners only');
+  const res = await mike('GET', url);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^text\/csv/);
+  assert.match(res.headers.get('content-disposition'), /attachment; filename="payments-2020-01-01-to-2030-12-31\.csv"/);
+  const lines = res.text.trim().split('\r\n');
+  assert.equal(lines[0], '"Date","Customer","Description","Amount","Method","Processing fees","Net","Reference"');
+  const cell = /"(?:[^"]|"")*"/.source;
+  assert.ok(lines.every((l) => new RegExp(`^${cell}(,${cell}){7}$`).test(l)), 'eight quoted cells on every line');
+  const paidCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid'`).get(mikeId).n;
+  const refundCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid' AND refunded_cents > 0`).get(mikeId).n;
+  assert.equal(lines.length, paidCount + refundCount + 1, 'a row per payment, and one per refund');
+  const evil = lines.find((l) => l.includes('HYPERLINK'));
+  assert.match(evil, /^"\d{2}\/\d{2}\/\d{4}","'=HYPERLINK\(""http:\/\/evil\.test"",""Click""\)","'-2\+3 cmd \(#\d+\)","12\.34","Check","0\.00","12\.34","Receipt #\d+"$/);
+  assert.ok(!lines.some((l) => /(^|,)"(?!-\d+\.\d\d")[=+\-@]/.test(l)), 'no cell starts with a formula character (a refund amount is a plain negative number)');
+  // A card payment shows Stripe's fee plus the platform share, and what the business kept.
+  const card = appDb.prepare(`SELECT * FROM payments WHERE tenant_id = ? AND status = 'paid' AND method = 'card' AND transfer_status = 'direct' ORDER BY id DESC LIMIT 1`).get(mikeId);
+  const row = lines.find((l) => l.includes(`"Receipt #${card.id} ${card.charge_id}"`));
+  const fees = card.stripe_fee_cents + card.fee_cents - card.fee_refunded_cents;
+  assert.ok(row.includes(`"${(card.amount_cents / 100).toFixed(2)}","Card or bank (online)","${(fees / 100).toFixed(2)}","${((card.amount_cents - fees) / 100).toFixed(2)}"`), row);
+  // The date range uses the business's time zone: a payment at 01:30 Eastern on Nov 3 is in Nov 3, not Nov 2.
+  const late = appDb.prepare(`SELECT id FROM payments WHERE paid_at = '2026-11-03 06:30:00' AND tenant_id = ?`).get(mikeId);
+  assert.ok((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text.includes(`"11/03/2026"`));
+  assert.ok((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text.includes(`"Receipt #${late.id}`));
+  assert.ok(!(await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-04&to=2026-11-04')).text.includes(`"Receipt #${late.id}`));
+  assert.equal((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-05&to=2026-11-01')).status, 400);
+  assert.equal((await other('GET', url)).text.trim().split('\r\n').length, 1, 'only your own payments');
+});
+
+test('install on phone: manifest, service worker that never stores /api/, offline page', async () => {
+  const man = await anon('GET', '/manifest.webmanifest');
+  assert.equal(man.status, 200);
+  assert.match(man.headers.get('content-type'), /^application\/manifest\+json/);
+  assert.deepEqual([man.json.name, man.json.start_url, man.json.scope, man.json.display], ['HitchPoint', '/admin/#/requests', '/admin/', 'standalone']);
+  for (const size of ['192x192', '512x512']) assert.ok(man.json.icons.some((i) => i.sizes === size && i.type === 'image/png'), size);
+  assert.ok(man.json.icons.some((i) => i.purpose === 'maskable'));
+  for (const i of man.json.icons) assert.equal((await fetch(base + i.src)).status, 200, i.src);
+  const admin = await anon('GET', '/admin/');
+  assert.match(admin.text, /<link rel="manifest" href="\/manifest\.webmanifest">/);
+  assert.match(admin.text, /apple-touch-icon/);
+  assert.equal((await fetch(base + '/static/brand/apple-touch-icon.png')).status, 200);
+  const off = await anon('GET', '/admin/offline.html');
+  assert.equal(off.status, 200);
+  assert.match(off.text, /You’re offline/);
+  const swRes = await anon('GET', '/admin/sw.js');
+  assert.equal(swRes.status, 200);
+  assert.match(swRes.headers.get('content-type'), /^text\/javascript/);
+  assert.equal(swRes.headers.get('service-worker-allowed'), '/admin/');
+
+  // Run the service worker against fake caches and network.
+  const vm = await import('node:vm');
+  const on = {}, puts = [];
+  let online = true;
+  const sandbox = {
+    URL, console,
+    self: { location: { origin: 'https://app.test' }, addEventListener: (type, fn) => { on[type] = fn; }, skipWaiting: async () => {}, clients: { claim: async () => {} } },
+    caches: { open: async () => ({ addAll: async () => {}, put: async (req) => { puts.push(new URL(req.url).pathname); } }), match: async (k) => `cached ${typeof k === 'string' ? k : new URL(k.url).pathname}`, keys: async () => [] },
+    fetch: async () => { if (!online) throw new TypeError('offline'); return { ok: true, clone() { return this; }, body: 'live' }; },
+  };
+  vm.runInNewContext(swRes.text, sandbox);
+  const run = async (pathname, mode = 'no-cors', method = 'GET') => {
+    let p = null;
+    on.fetch({ request: { method, mode, url: 'https://app.test' + pathname }, respondWith: (x) => { p = x; } });
+    const out = p ? await p : 'not handled';
+    await new Promise((r) => setTimeout(r, 5));
+    return out;
+  };
+  assert.equal(await run('/api/requests?filter=new', 'cors'), 'not handled', 'API calls go straight to the network');
+  assert.equal(await run('/api/quotes', 'cors', 'POST'), 'not handled');
+  assert.equal((await run('/static/admin.js')).body, 'live', 'online: the live file');
+  assert.deepEqual(puts, ['/static/admin.js'], 'and a copy for offline');
+  online = false;
+  assert.equal(await run('/static/admin.js'), 'cached /static/admin.js');
+  assert.equal(await run('/admin/', 'navigate'), 'cached /admin/offline.html', 'offline pages show the friendly offline page');
+  assert.equal(await run('/api/me', 'cors'), 'not handled');
+  assert.ok(!puts.some((x) => x.startsWith('/api/')), 'nothing from /api/ is ever stored');
+});
+
+test('bold look: banner, service tiles, highlights, service pages', async () => {
+  const st = (await mike('GET', '/api/website')).json;
+  assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);
+  const look = await mike('PUT', '/api/website', { ...st.profile, theme: 'bold', banner: { alt: 'Mike’s banner' }, highlights: [{ icon: 'tools', title: 'On-site service', text: 'At your location' }, { icon: 'nope', title: 'Reliable repairs', text: '' }, { title: '', text: 'no title' }] });
+  assert.equal(look.status, 422);
+  assert.ok(look.json.field_errors['highlights.2.title']);
+  const ok = await mike('PUT', '/api/website', { ...st.profile, theme: 'bold', banner: { alt: 'Mike’s banner' }, highlights: [{ icon: 'tools', title: 'On-site service', text: 'At your location' }, { icon: 'nope', title: 'Reliable repairs', text: '' }] });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.profile.highlights[1].icon, 'star');
+  assert.equal((await other('POST', '/api/website/banner', { kind: 'desktop', image: PNG })).status, 200); // other business, own banner
+  const banner = await mike('POST', '/api/website/banner', { kind: 'desktop', image: PNG });
+  assert.equal(banner.status, 200);
+  assert.equal((await mike('POST', '/api/website/banner', { kind: 'side', image: PNG })).status, 400);
+  assert.equal((await fetch(base + banner.json.banner_urls.desktop)).status, 200);
+
+  const products = (await mike('GET', '/api/products')).json;
+  const svc = products.find((p) => p.on_site) || products[0];
+  await mike('PATCH', `/api/products/${svc.id}`, { on_site: true, sort: -5, details: '## What’s included\n- Every step\n- Antifreeze\n\nCall to book.' });
+  const pic = await mike('POST', `/api/products/${svc.id}/image`, { image: PNG });
+  assert.equal(pic.status, 200);
+  assert.match(pic.json.image, /^t\d+-prod-/);
+  assert.equal((await other('POST', `/api/products/${svc.id}/image`, { image: PNG })).status, 404);
+
+  const home = await anon('GET', `/s/${mikeSlug}`);
+  assert.match(home.text, /<body class="bold">/);
+  assert.match(home.text, /class="bnav"/);
+  assert.match(home.text, new RegExp(`<img src="${banner.json.banner_urls.desktop}" alt="Mike’s banner"`));
+  assert.match(home.text, new RegExp(`/media/${mikeSlug}/${pic.json.image}`));
+  assert.match(home.text, /On-site service/);
+  assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 200);
+  const slug = svc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  assert.match(home.text, new RegExp(`/s/${mikeSlug}/services/${slug}`));
+  const page = await anon('GET', `/s/${mikeSlug}/services/${slug}`);
+  assert.equal(page.status, 200);
+  assert.match(page.text, /<h2>What’s included<\/h2>/);
+  assert.match(page.text, /<li>Antifreeze<\/li>/);
+  assert.match(page.text, /"@type":"Service"/);
+  assert.equal((await anon('GET', `/s/${mikeSlug}/services/not-a-service`)).status, 404);
+  assert.match((await viaHost('www.mikesrv.test', '/sitemap.xml')).text, new RegExp(`/services/${slug}`));
+  // Removing the picture stops serving it
+  await mike('POST', `/api/products/${svc.id}/image`, { image: null });
+  assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 404);
+  await mike('PUT', '/api/website', { ...ok.json.profile, theme: 'classic' });
+});
+
+test('affiliate program: links, sign-up credit, earnings, payouts and privacy', async () => {
+  const IP = { 'X-Forwarded-For': '198.51.100.7' }; // its own rate-limit buckets
+  const loc = (r) => r.headers.get('location');
+  const setCookie = (r) => r.headers.get('set-cookie') || '';
+  const mikeName = appDb.prepare('SELECT name FROM tenants WHERE id = ?').get(mikeId).name;
+
+  // Super admin makes Mike's business an affiliate: 20% of HitchPoint's fee, 12 months per referral.
+  assert.equal((await mike('GET', '/api/super/affiliates')).status, 403);
+  const made = await superA('POST', '/api/super/affiliates', { tenant_id: mikeId, share_bp: 2000, months: '12' });
+  assert.equal(made.status, 201, JSON.stringify(made.json));
+  const affId = made.json.affiliate.id;
+  assert.equal(made.json.affiliate.code, mikeSlug, 'the code defaults from the business slug');
+  assert.equal((await superA('POST', '/api/super/affiliates', { tenant_id: mikeId, share_bp: 2000 })).status, 409);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { share_bp: 20000 })).status, 400);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { months: '1.5' })).status, 400);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { code: 'Mike Stevens!' })).status, 400);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { code: 'mike-stevens' })).json.affiliate.code, 'mike-stevens');
+
+  // The link works only after the owner accepts the Affiliate Program Terms.
+  let r = await anon('GET', '/a/mike-stevens', null, IP);
+  assert.deepEqual([r.status, loc(r), setCookie(r)], [302, '/', '']);
+  let page = (await mike('GET', '/api/affiliate')).json;
+  assert.deepEqual([page.affiliate.link, page.affiliate.terms.needs_accept, page.referrals], [null, true, undefined]);
+  await superA('POST', '/api/super/view-as', { tenant_id: mikeId });
+  assert.equal((await superA('GET', '/api/affiliate')).status, 200, 'super admin can look');
+  assert.equal((await superA('POST', '/api/affiliate/terms', { agree: true })).status, 403, 'only the owner accepts');
+  await superA('POST', '/api/super/view-as', { tenant_id: 0 });
+  assert.equal((await mike('POST', '/api/affiliate/terms', { agree: false })).status, 400);
+  page = (await mike('POST', '/api/affiliate/terms', { agree: true })).json;
+  assert.match(page.affiliate.link, /\/a\/mike-stevens$/);
+  assert.equal(page.affiliate.terms.needs_accept, false);
+  assert.ok(appDb.prepare(`SELECT 1 FROM agreements WHERE tenant_id = ? AND doc = 'affiliate-terms' AND version = ?`).get(mikeId, page.affiliate.terms.version));
+  assert.match((await anon('GET', '/legal/affiliate-terms')).text, /Affiliate Program Terms[\s\S]*Morgan County/);
+
+  // A click sets a 90-day first-party cookie and lands on the home page with ?ref. First click wins.
+  r = await anon('GET', '/a/MIKE-STEVENS', null, IP);
+  assert.deepEqual([r.status, loc(r)], [302, '/?ref=mike-stevens']);
+  assert.equal(setCookie(r), 'hp_ref=mike-stevens; Max-Age=7776000; Path=/; SameSite=Lax; HttpOnly');
+  assert.match(setCookie(await anon('GET', '/a/mike-stevens', null, { ...IP, 'X-Forwarded-Proto': 'https' })), /; Secure$/);
+  const otherId = (await other('GET', '/api/me')).json.tenant.id;
+  const oaff = (await superA('POST', '/api/super/affiliates', { tenant_id: otherId, share_bp: 1000, code: 'other-co' })).json.affiliate;
+  await other('POST', '/api/affiliate/terms', { agree: true });
+  r = await anon('GET', '/a/other-co', null, { ...IP, Cookie: 'hp_ref=mike-stevens' });
+  assert.deepEqual([loc(r), setCookie(r)], ['/?ref=other-co', ''], 'an existing working code is kept');
+  assert.match(setCookie(await anon('GET', '/a/other-co', null, { ...IP, Cookie: 'hp_ref=no-such-code' })), /^hp_ref=other-co;/, 'a code that no longer works is replaced');
+  r = await anon('GET', '/a/no-such-code', null, IP);
+  assert.deepEqual([r.status, loc(r), setCookie(r)], [302, '/', '']);
+  assert.equal(loc(await anon('GET', '/a/x', null, IP)), '/');
+  await superA('PATCH', `/api/super/affiliates/${oaff.id}`, { status: 'paused' });
+  r = await anon('GET', '/a/other-co', null, IP);
+  assert.deepEqual([loc(r), setCookie(r)], ['/', ''], 'paused codes stop working');
+
+  // Clicks: daily counts; unique visitors from a keyed hash, never the raw IP; previews, HEAD and floods don't count.
+  const burst = { 'X-Forwarded-For': '203.0.113.9' };
+  for (let i = 0; i < 25; i++) await anon('GET', '/a/mike-stevens', null, burst);
+  await anon('HEAD', '/a/mike-stevens', null, IP);
+  await anon('GET', '/a/mike-stevens', null, { ...IP, 'User-Agent': 'Slackbot-LinkExpanding 1.0' });
+  const clicks = appDb.prepare('SELECT * FROM affiliate_clicks WHERE affiliate_id = ?').all(affId);
+  assert.deepEqual(clicks.map((c) => [c.clicks, c.uniques]), [[2 + 20, 2]]);
+  const visitors = appDb.prepare('SELECT * FROM affiliate_click_visitors').all();
+  assert.ok(visitors.length && visitors.every((v) => /^[0-9a-f]{32}$/.test(v.ip_hash)));
+  assert.doesNotMatch(JSON.stringify(visitors), /198\.51|203\.0|127\.0|::1/);
+
+  // Who referred this visitor (sign-up form and landing note): the cookie first, else ?code; paused codes don't show.
+  assert.deepEqual((await anon('GET', '/api/public/referral?code=other-co', null, { ...IP, Cookie: 'hp_ref=mike-stevens' })).json, { code: 'mike-stevens', name: mikeName });
+  assert.equal((await anon('GET', '/api/public/referral?code=other-co', null, IP)).json.code, null);
+  assert.equal(loc(await anon('GET', '/signup?ref=Mike-Stevens', null, IP)), '/admin/?ref=mike-stevens#/signup');
+
+  // Sign-ups: the link cookie or a typed code is credited; unknown, paused and own codes are refused with a fix.
+  const signup = (who, body, headers = {}) => who('POST', '/api/signup', { name: 'Owner', password: 'long-enough-pw', agree: true, ...body }, { ...IP, ...headers });
+  const tenantOf = async (who) => appDb.prepare('SELECT * FROM tenants WHERE id = ?').get((await who('GET', '/api/me')).json.tenant.id);
+  const ref1 = client(), ref2 = client(), self2 = client();
+  assert.equal((await signup(ref1, { business_name: 'Referred RV One', email: 'one@ref.test', phone: '801-555-0161' }, { Cookie: 'hp_ref=mike-stevens' })).status, 201);
+  const t1 = await tenantOf(ref1);
+  assert.deepEqual([t1.referred_by_affiliate_id, t1.referred_how, Boolean(t1.referred_at)], [affId, 'link', true]);
+  assert.match((await signup(client(), { business_name: 'Nope Co', email: 'nope@ref.test', referral_code: 'no-such-code' })).json.error, /don’t recognize that referral code/);
+  assert.equal((await signup(client(), { business_name: 'Paused Co', email: 'paused@ref.test', referral_code: 'other-co' })).status, 400);
+  const self = await signup(client(), { business_name: 'Mike Two', email: 'mike2@ref.test', phone: '(801) 232-4995', referral_code: 'mike-stevens' });
+  assert.equal(self.status, 400);
+  assert.match(self.json.error, /can’t use your own referral code/);
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM tenants WHERE name IN ('Nope Co', 'Paused Co', 'Mike Two')`).get().n, 0);
+  assert.equal((await signup(self2, { business_name: 'Mike Three', email: 'mike3@ref.test', phone: '801-232-4995' }, { Cookie: 'hp_ref=mike-stevens' })).status, 201);
+  assert.equal((await tenantOf(self2)).referred_by_affiliate_id, null, 'the link cookie never credits an affiliate for itself');
+  assert.equal((await signup(ref2, { business_name: '=Referred Two', email: 'two@ref.test', phone: '801-555-0162', referral_code: ' MIKE-STEVENS ' })).status, 201);
+  const t2 = await tenantOf(ref2);
+  assert.deepEqual([t2.referred_by_affiliate_id, t2.referred_how], [affId, 'code']);
+  assert.equal((await superA('PUT', `/api/super/tenants/${mikeId}/referral`, { affiliate_id: affId })).status, 400, 'a business can’t refer itself');
+  // Super admin adds a business Mike signed up in person, with his code.
+  const grp = await superA('POST', '/api/super/tenants', { business_name: 'Group Shop', owner_email: 'group@ref.test', referral_code: 'mike-stevens' });
+  assert.equal(grp.status, 201);
+  assert.equal(appDb.prepare('SELECT referred_how FROM tenants WHERE id = ?').get(grp.json.tenant.id).referred_how, 'admin');
+  assert.equal((await superA('POST', '/api/super/tenants', { business_name: 'Bad Code Shop', owner_email: 'bad@ref.test', referral_code: 'nope-nope' })).status, 400);
+
+  // A referred business goes live: its own Stripe account and approved customer terms.
+  async function goLive(who) {
+    const acct = (await who('POST', '/api/stripe/connect')).json.url.split('/').pop();
+    Object.assign(merchants.get(acct), { due: null, submitted: true, card: 'active' });
+    await who('POST', '/api/stripe/refresh');
+    const details = { legalName: 'Referred RV LLC', addressLine1: '2 Main St', city: 'Ogden', state: 'UT', postalCode: '84401', warrantyDays: 30, venueCounty: 'Weber County', taxConfirmed: true };
+    assert.equal((await who('PUT', '/api/legal-profile', { profile: details, tax_rate_bp: 0 })).status, 200);
+    const draft = (await who('GET', '/api/customer-terms')).json.draft;
+    assert.equal((await who('POST', '/api/customer-terms/approve', { markdown: draft, name: 'Owner', title: 'Owner', authorized: true, reviewed: true, seller_of_record: true })).status, 201);
+    return acct;
+  }
+  async function cardPayment(who, acct, amountCents) {
+    const slug = (await who('GET', '/api/me')).json.tenant.slug;
+    await who('PUT', '/api/settings', { deposit_cents: amountCents });
+    const rq = await anon('POST', `/api/public/t/${slug}/requests`, { name: 'Cam', phone: '801-555-0111', location: 'Ogden' }, IP);
+    const dep = await who('POST', `/api/requests/${rq.json.id}/deposit`, { method: 'card' });
+    assert.ok((await anon('POST', `/api/public/payments/${dep.json.token}/checkout`, {})).json.url);
+    const sess = [...sessions.values()].find((s) => s.client_reference_id === dep.json.token);
+    sess.payment_status = 'paid';
+    await post(anon, { type: 'checkout.session.completed', account: acct, data: { object: sess } });
+    return { sess, pay: appDb.prepare('SELECT * FROM payments WHERE token = ?').get(dep.json.token) };
+  }
+  const ledgerFor = (paymentId) => appDb.prepare('SELECT * FROM affiliate_ledger WHERE payment_id = ? ORDER BY id').all(paymentId);
+
+  // $5,000.00 paid online: HitchPoint's 3% is $150.00 and Mike earns 20% of it, $30.00, held for 30 days.
+  const acct1 = await goLive(ref1);
+  const A = await cardPayment(ref1, acct1, 500000);
+  assert.deepEqual([A.pay.status, A.pay.charge_type, A.pay.fee_cents], ['paid', 'direct', 15000]);
+  let rows = ledgerFor(A.pay.id);
+  assert.deepEqual(rows.map((x) => [x.affiliate_id, x.tenant_id, x.type, x.amount_cents, x.status, x.share_bp]), [[affId, t1.id, 'earning', 3000, 'pending', 2000]]);
+  assert.equal(rows[0].available_at, appDb.prepare(`SELECT datetime(?, '+30 days') AS d`).get(A.pay.paid_at).d);
+  // Replays and re-runs don't double count.
+  await post(anon, { type: 'checkout.session.completed', account: acct1, data: { object: A.sess } });
+  await superA('POST', `/api/super/payments/${A.pay.id}/settle`);
+  assert.equal(ledgerFor(A.pay.id).length, 1);
+  // 10% refunded (and replayed): $15.00 of HitchPoint's fee goes back, so $3.00 comes off Mike's share.
+  appFees.set('fee_aff1', { id: 'fee_aff1', amount: 15000, amount_refunded: 0 });
+  const refund = (amt) => post(anon, { type: 'charge.refunded', account: acct1, data: { object: { id: 'ch_' + A.sess.id, object: 'charge', amount: 500000, amount_refunded: amt, application_fee: 'fee_aff1' } } });
+  await refund(50000); await refund(50000);
+  assert.deepEqual(ledgerFor(A.pay.id).map((x) => [x.type, x.amount_cents, x.status]), [['earning', 3000, 'pending'], ['reversal', -300, 'pending']]);
+  // A later share change doesn't rewrite this payment: the next refund still uses 20%.
+  await superA('PATCH', `/api/super/affiliates/${affId}`, { share_bp: 5000 });
+  await refund(100000);
+  assert.deepEqual(ledgerFor(A.pay.id).map((x) => [x.type, x.amount_cents, x.share_bp]), [['earning', 3000, 2000], ['reversal', -300, 2000], ['reversal', -300, 2000]]);
+  await superA('PATCH', `/api/super/affiliates/${affId}`, { share_bp: 2000 });
+  // Outside the 12-month window (counted from the business's sign-up): nothing.
+  appDb.prepare(`UPDATE tenants SET created_at = datetime('now', '-13 months') WHERE id = ?`).run(t1.id);
+  const late = await cardPayment(ref1, acct1, 10000);
+  assert.equal(late.pay.status, 'paid');
+  assert.equal(ledgerFor(late.pay.id).length, 0);
+
+  // Payments made before the referral earn nothing; counting from an earlier day picks them up. Cash never earns.
+  const acct2 = await goLive(ref2);
+  assert.equal((await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: null })).json.referred_by, null);
+  const B = await cardPayment(ref2, acct2, 10000);
+  const walkIn = await ref2('POST', '/api/requests', { name: 'Walk-up', phone: '1', location: 'Shop' });
+  const cash = await ref2('POST', `/api/requests/${walkIn.json.id}/deposit`, { method: 'cash' });
+  assert.equal(ledgerFor(B.pay.id).length, 0);
+  appDb.prepare(`UPDATE tenants SET created_at = datetime('now', '-3 days') WHERE id = ?`).run(t2.id);
+  appDb.prepare(`UPDATE payments SET paid_at = datetime('now', '-2 days') WHERE tenant_id = ?`).run(t2.id);
+  let refd = await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId });
+  assert.deepEqual([refd.json.referred_by.code, refd.json.how], ['mike-stevens', 'admin']);
+  assert.equal(ledgerFor(B.pay.id).length, 0, 'paid before the referral');
+  const threeDaysAgo = appDb.prepare(`SELECT date('now', '-3 days') AS d`).get().d;
+  refd = await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId, from: threeDaysAgo });
+  assert.equal(refd.status, 200);
+  assert.deepEqual(ledgerFor(B.pay.id).map((x) => [x.type, x.amount_cents]), [['earning', 60]]);
+  assert.equal(ledgerFor(cash.json.id).length, 0);
+  assert.equal((await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId, from: '2999-01-01' })).status, 400);
+
+  // Payouts: blocked without a W-9 and under $25.00; then the whole available balance is paid and marked.
+  const shown = async () => (await superA('GET', `/api/super/affiliates/${affId}`)).json.affiliate.available_cents;
+  const payout = async (body = {}) => superA('POST', `/api/super/affiliates/${affId}/payouts`, { method: 'ach', reference: 'ACH-1001', amount_cents: await shown(), ...body });
+  let po = await payout();
+  assert.equal(po.status, 409);
+  assert.match(po.json.error, /W-9/);
+  await superA('PATCH', `/api/super/affiliates/${affId}`, { w9_on_file: true });
+  assert.match((await payout()).json.error, /available balance is \$0\.00\. Payouts start at \$25\.00/);
+  appDb.prepare(`UPDATE affiliate_ledger SET available_at = datetime('now', '-1 minute') WHERE affiliate_id = ?`).run(affId); // 30 days later
+  assert.match((await payout()).json.error, /\$24\.60/); // $30.00 - $3.00 - $3.00 + $0.60
+  assert.equal((await payout({ method: 'cash' })).status, 400);
+  assert.equal((await superA('POST', `/api/super/affiliates/${affId}/adjustments`, { amount_cents: 1000, note: '' })).status, 400);
+  assert.equal((await superA('POST', `/api/super/affiliates/${affId}/adjustments`, { amount_cents: 1000, note: 'Welcome bonus' })).status, 201);
+  po = await payout();
+  assert.equal(po.status, 201, JSON.stringify(po.json));
+  assert.deepEqual([po.json.affiliate.available_cents, po.json.affiliate.pending_cents, po.json.affiliate.paid_cents], [0, 0, 3460]);
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM affiliate_ledger WHERE affiliate_id = ? AND (status != 'paid' OR payout_id IS NULL)`).get(affId).n, 0, 'every row is marked paid');
+  assert.deepEqual(appDb.prepare(`SELECT amount_cents, status FROM affiliate_ledger WHERE affiliate_id = ? AND type = 'payout'`).all(affId).map((x) => [x.amount_cents, x.status]), [[-3460, 'paid']]);
+  assert.equal((await payout()).status, 409, 'nothing left to pay');
+  assert.throws(() => appDb.prepare('DELETE FROM affiliate_ledger').run(), /append-only/);
+  assert.throws(() => appDb.prepare('UPDATE affiliate_ledger SET amount_cents = 1').run(), /never change/);
+  // Yearly totals for 1099s.
+  const year = new Date().toISOString().slice(0, 4);
+  const y1099 = await superA('GET', `/api/super/affiliate-payouts.csv?year=${year}`);
+  assert.match(y1099.text, /^"Year","Affiliate","Legal name \(W-9 line 1\)","Business name \(line 2\)","Tax classification","Tax ID \(last 4\)","Address","Email","Affiliate code","W-9","Backup withholding","Payouts","Total paid","At or over \$2,000 \(1099 likely\)"\n/);
+  assert.match(y1099.text, new RegExp(`"${year}","Mike Stevens Emergency RV & Trailer Repair","Mike Stevens RV Repair LLC","","","","1 Main St, Ogden, UT 84401","mike@rv.test","mike-stevens","paper \\(${year}-\\d\\d-\\d\\d\\)","","1","34.60","no"`));
+  assert.equal((await mike('GET', '/api/super/affiliate-payouts.csv')).status, 403);
+
+  // Mike's page: names and his earnings only, never a referred business's payment volume.
+  page = (await mike('GET', '/api/affiliate')).json;
+  assert.deepEqual(page.totals, { pending_cents: 0, available_cents: 0, paid_cents: 3460 });
+  assert.deepEqual(page.clicks, { last_30_days: 22, all_time: 22 });
+  assert.deepEqual(page.referrals.map((x) => x.name).sort(), ['=Referred Two', 'Group Shop', 'Referred RV One']);
+  for (const x of page.referrals) assert.deepEqual(Object.keys(x).sort(), ['earned_cents', 'joined', 'name', 'share_ends', 'state']);
+  const one = page.referrals.find((x) => x.name === 'Referred RV One');
+  assert.deepEqual([one.earned_cents, one.state], [2400, 'taking_payments']);
+  assert.equal(page.referrals.find((x) => x.name === 'Group Shop').state, 'setting_up');
+  for (const x of page.ledger) assert.deepEqual(Object.keys(x).sort(), ['amount_cents', 'business', 'date', 'method', 'month', 'note', 'reference', 'status', 'type']);
+  // Earnings come as one line per business per month, never single payments.
+  assert.ok(page.ledger.filter((x) => x.type === 'earnings').every((x) => /^\d{4}-\d\d$/.test(x.month) && x.date === null));
+  assert.equal(page.ledger.some((x) => x.type === 'earning' || x.type === 'reversal'), false);
+  assert.equal('platform_fee_bp' in page.affiliate, false);
+  assert.doesNotMatch(JSON.stringify(page), /500000|15000|13500|amount_refunded|fee_cents|payment_id|description|"Cam"/);
+
+  // Staff, other businesses, referred businesses and visitors can't see Mike's referral data.
+  await mike('POST', '/api/team', { email: 'tech@rv.test', name: 'Tech', password: 'tech-long-password' });
+  const staff = client();
+  assert.equal((await staff('POST', '/api/login', { email: 'tech@rv.test', password: 'tech-long-password' })).status, 200);
+  assert.equal((await staff('GET', '/api/affiliate')).status, 403);
+  assert.equal((await staff('GET', '/api/affiliate/ledger.csv')).status, 403);
+  const theirs = (await other('GET', '/api/affiliate')).json;
+  assert.deepEqual([theirs.affiliate.code, theirs.referrals, theirs.ledger], ['other-co', [], []]);
+  assert.doesNotMatch(JSON.stringify(theirs), /Referred RV One|mike-stevens/);
+  assert.doesNotMatch((await other('GET', '/api/affiliate/ledger.csv')).text, /Referred/);
+  assert.equal((await other('GET', `/api/super/affiliates/${affId}`)).status, 403);
+  assert.equal((await ref1('GET', '/api/affiliate')).json.affiliate, null);
+  assert.equal((await anon('GET', '/api/affiliate')).status, 401);
+
+  // CSV: every cell quoted, formula-looking text neutralized.
+  const csv = (await mike('GET', '/api/affiliate/ledger.csv')).text;
+  assert.match(csv, /^"Month or date","Business","What it is","Amount","Status"\n/);
+  assert.match(csv, /"\d{4}-\d\d","'=Referred Two","Your share of HitchPoint’s fees","0.60","paid"/);
+  assert.match(csv, /"\d{4}-\d\d","Referred RV One","Your share of HitchPoint’s fees","24.00","paid"/); // net of the refund taken back
+  assert.doesNotMatch(csv, /(^|,)"=/m);
+  assert.match(csv, /"Paid to you by ACH \(ACH-1001\)","-34.60","paid"/);
+  assert.doesNotMatch(csv, /Taken back/);
+
+  // Super admin detail: how each business was credited, payouts and share history.
+  const det = (await superA('GET', `/api/super/affiliates/${affId}`)).json;
+  assert.deepEqual(det.referrals.map((x) => [x.name, x.how]).sort(), [['=Referred Two', 'admin'], ['Group Shop', 'admin'], ['Referred RV One', 'link']]);
+  assert.deepEqual([det.payouts[0].amount_cents, det.payouts[0].method, det.payouts[0].created_by], [3460, 'ach', 'aaron@agilities.test']);
+  assert.deepEqual(det.rates.map((x) => x.share_bp), [2000, 5000, 2000]);
+  const list = (await superA('GET', '/api/super/affiliates')).json;
+  assert.deepEqual(list.affiliates.map((x) => x.code).sort(), ['mike-stevens', 'other-co']);
+  assert.ok(!list.businesses.some((b) => b.id === mikeId || b.id === otherId));
+});
+
 test('static pages, legal pages and seed script', async () => {
   const home = await anon('GET', '/');
   assert.equal(home.status, 200);
@@ -533,5 +1728,22 @@ test('static pages, legal pages and seed script', async () => {
   const seedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsqu-seed-'));
   const out = execFileSync(process.execPath, ['--no-warnings', 'scripts/seed-mike.js', 'mike@seed.test'], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir, BASE_URL: 'https://dash.test' } }).toString();
   assert.match(out, /https:\/\/dash\.test\/admin\/#\/reset\//);
+  // Moving Mike's RSQU site onto HitchPoint: twice, to prove it's safe to re-run
+  const apply = (...a) => execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-site.js', ...a], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
+  assert.match(apply(), /Done\. 11 cities, 9 services \(7 with tile pictures\), 5 files/);
+  assert.match(apply(), /Already applied on .*Nothing changed/);
+  assert.match(apply('--force'), /Done\. 11 cities/);
+  const { handler: h2 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
+  const srv2 = http.createServer(h2); await new Promise((r) => srv2.listen(0, r));
+  const b2 = `http://localhost:${srv2.address().port}`;
+  const rsqu = await (await fetch(b2 + '/s/mike-stevens')).text();
+  assert.match(rsqu, /<body class="bold">/);
+  assert.match(rsqu, /RSQU Mobile RV Service/);
+  assert.equal([...rsqu.matchAll(/class="tile-grid"[\s\S]*?<\/ul>/g)][0][0].match(/<img /g).length, 7);
+  const winter = await fetch(b2 + '/s/mike-stevens/services/onsite-rv-winterizing-package');
+  assert.equal(winter.status, 200);
+  assert.match(await winter.text(), /The 12-step winterizing checklist/);
+  assert.equal(fs.readdirSync(path.join(seedDir, 'uploads')).length, 15); // photo, 2 banners, 7 tiles, 5 PDFs: nothing left over
+  srv2.close();
   fs.rmSync(seedDir, { recursive: true, force: true });
 });
