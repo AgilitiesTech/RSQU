@@ -12,7 +12,11 @@ const jsonLd = (o) => `<script type="application/ld+json">${JSON.stringify(o).re
 const clip = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : t; };
 const ampm = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return `${((h + 11) % 12) + 1}${m ? ':' + String(m).padStart(2, '0') : ''} ${h < 12 ? 'AM' : 'PM'}`; };
 const kb = (n) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1000))} KB`);
-export const serviceSlug = (p) => slugify(p.name) || String(p.id);
+// A service page's address. If two services would share one, the later one gets its id added.
+export const serviceSlug = (p, all = []) => {
+  const base = slugify(p.name) || String(p.id);
+  return all.some((o) => o.id < p.id && o.id !== p.id && hasPage(o) && (slugify(o.name) || String(o.id)) === base) ? `${base}-${p.id}` : base;
+};
 export const hasPage = (p) => Boolean(p.on_site && String(p.details || '').trim());
 // Owner-written service write-up: blank lines between paragraphs, "## " headings, "- " bullets.
 function details(text) {
@@ -291,7 +295,7 @@ function topBar(t, u, img, profile, opts) {
 </div></header>`;
 }
 
-const servicesSection = (services, u) => (services.length ? `<section class="s" id="services"><div class="wrap"><h2>Services</h2><div class="grid">${services.map((p) => `<div class="svc" id="svc-${p.id}"><h3>${esc(p.name)}</h3>${p.bookable && p.price_cents ? `<p class="price">${money(p.price_cents)}</p>` : ''}${p.description ? `<p>${esc(p.description)}</p>` : ''}${u && hasPage(p) ? `<a class="more" href="${u.rel('/services/' + serviceSlug(p))}">More about ${esc(p.name.toLowerCase())}</a>` : ''}</div>`).join('')}</div></div></section>` : '');
+const servicesSection = (services, u) => (services.length ? `<section class="s" id="services"><div class="wrap"><h2>Services</h2><div class="grid">${services.map((p) => `<div class="svc" id="svc-${p.id}"><h3>${esc(p.name)}</h3>${p.bookable && p.price_cents ? `<p class="price">${money(p.price_cents)}</p>` : ''}${p.description ? `<p>${esc(p.description)}</p>` : ''}${u && hasPage(p) ? `<a class="more" href="${u.rel('/services/' + serviceSlug(p, services))}">More about ${esc(p.name.toLowerCase())}</a>` : ''}</div>`).join('')}</div></div></section>` : '');
 
 const credentialsSection = (profile) => (profile.credentials.length ? `<section class="s alt" id="credentials"><div class="wrap"><h2>Certifications and experience</h2><div class="grid">${profile.credentials.map((c) => `<div class="cred"><h3>${esc(c.title)}</h3>${c.detail ? `<p>${esc(c.detail)}</p>` : ''}</div>`).join('')}</div></div></section>` : '');
 
@@ -320,7 +324,7 @@ function boldTop(t, profile, u, img, services, bookable, tel) {
   const phrase = servicePhrase(profile);
   return `${boldHeader(t, profile, u, { current: 'home', sections: sectionsOf(t, profile, services) })}
 ${B.desktop ? `<section class="banner" aria-label="${esc(t.name)}"><picture>${B.mobile ? `<source media="(max-width: 700px)" srcset="${img(B.mobile)}">` : ''}<img src="${img(B.desktop)}" alt="${esc(B.alt || t.name)}" fetchpriority="high"></picture></section>` : ''}
-${tiles.length ? `<section class="tiles" aria-labelledby="tiles-h"><div class="wrap"><h2 id="tiles-h" class="sr-only">What we work on</h2><ul class="tile-grid">${tiles.map((p) => `<li><a href="${hasPage(p) ? u.rel('/services/' + serviceSlug(p)) : '#svc-' + p.id}"><img src="${img(p.image)}" alt="${esc(p.name)}" loading="lazy" width="204" height="204"></a></li>`).join('')}</ul></div></section>` : ''}
+${tiles.length ? `<section class="tiles" aria-labelledby="tiles-h"><div class="wrap"><h2 id="tiles-h" class="sr-only">What we work on</h2><ul class="tile-grid">${tiles.map((p) => `<li><a href="${hasPage(p) ? u.rel('/services/' + serviceSlug(p, services)) : '#svc-' + p.id}"><img src="${img(p.image)}" alt="${esc(p.name)}" loading="lazy" width="204" height="204"></a></li>`).join('')}</ul></div></section>` : ''}
 ${profile.highlights.length ? `<section class="hl" aria-label="Why choose ${esc(t.name)}"><ul class="wrap">${profile.highlights.map((h) => `<li>${icon(h.icon)}<span><strong>${esc(h.title)}</strong>${esc(h.text)}</span></li>`).join('')}</ul></section>` : ''}
 <section class="help" id="contact"><div class="wrap">
   <div class="hero-l">
@@ -343,7 +347,7 @@ export function renderServicePage(t, products, profile, product, { platformBase,
   const services = products.filter((p) => p.on_site);
   const bookable = products.filter((p) => p.bookable);
   const place = profile.base_city ? `${profile.base_city}, ${profile.base_state}` : '';
-  const canonical = u.abs('/services/' + serviceSlug(product));
+  const canonical = u.abs('/services/' + serviceSlug(product, products));
   const title = `${product.name}${place ? ` in ${place}` : ''} | ${t.name}`;
   const description = clip(product.description || product.details || '', 160);
   const business = businessSchema(t, profile, products, u, mediaAbs);
@@ -366,7 +370,7 @@ ${topBar(t, u, img, profile, { current: 'services', sections: sectionsOf(t, prof
 </div></section>
 <section class="s"><div class="wrap prose">${details(product.details)}</div></section>
 <section class="s alt" id="request-wrap"><div class="wrap" style="display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start"><div style="flex:1 1 320px;min-width:0"><h2>${product.bookable ? `Book ${esc(product.name.toLowerCase())}` : 'Request service'}</h2><p>Send your location and a few details and we’ll call or text you back.</p></div>${requestCard(t, bookable)}</div></section>
-${others.length ? `<section class="s"><div class="wrap"><h2>Other services</h2><ul class="areas">${others.map((p) => `<li><a href="${u.rel('/services/' + serviceSlug(p))}">${esc(p.name)}</a></li>`).join('')}</ul></div></section>` : ''}
+${others.length ? `<section class="s"><div class="wrap"><h2>Other services</h2><ul class="areas">${others.map((p) => `<li><a href="${u.rel('/services/' + serviceSlug(p, products))}">${esc(p.name)}</a></li>`).join('')}</ul></div></section>` : ''}
 ${footer(t, profile, u)}`;
 }
 
@@ -450,7 +454,7 @@ ${footer(t, profile, u)}`;
 // Pages search engines should index for one business, as absolute URLs.
 export function sitePages(t, profile, platformBase, products) {
   const u = siteUrls(t, platformBase);
-  return [u.abs('/'), ...profile.cities.filter(cityIndexable).map((c) => u.abs('/areas/' + citySlug(c))), ...(products || []).filter(hasPage).map((p) => u.abs('/services/' + serviceSlug(p))), ...profile.resources.map((r) => u.abs('/files/' + r.file))];
+  return [u.abs('/'), ...profile.cities.filter(cityIndexable).map((c) => u.abs('/areas/' + citySlug(c))), ...(products || []).filter(hasPage).map((p) => u.abs('/services/' + serviceSlug(p, products))), ...profile.resources.map((r) => u.abs('/files/' + r.file))];
 }
 
 export function tenantSitemap(urls) {

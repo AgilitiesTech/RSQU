@@ -1,10 +1,12 @@
 // Moves Mike's RSQU Mobile RV Service website onto his HitchPoint-hosted site (Bold look) so he can
 // edit it himself: name and tagline, banner, service tiles, highlights, services (with a full page
 // for winterizing), credentials, FAQs, cities served and his customer checklists.
-// Safe to run again: it updates the same records and replaces the pictures and files it added.
+// Runs once. After that it stops, because Mike may have edited his site; add --force to apply it
+// again, which replaces those sections and the pictures and files this script added (never his own).
 //
 // Usage (Render shell): node scripts/apply-rsqu-site.js            (business slug mike-stevens)
 //                       node scripts/apply-rsqu-site.js other-slug
+//                       node scripts/apply-rsqu-site.js --force
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,20 +16,31 @@ import { parseProfile } from '../src/site-profile.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SRC = path.join(ROOT, 'seed', 'rsqu');
-const slug = process.argv[2] || 'mike-stevens';
+const args = process.argv.slice(2);
+const force = args.includes('--force');
+const slug = args.find((a) => !a.startsWith('--')) || 'mike-stevens';
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(ROOT, 'data'));
 const db = openDb(dataDir);
 const uploads = path.join(dataDir, 'uploads');
 const t = db.prepare('SELECT * FROM tenants WHERE slug = ?').get(slug);
 if (!t) { console.error(`No business with the address "${slug}". Run scripts/seed-mike.js first, or pass the right slug.`); process.exit(1); }
 
+const before = parseProfile(t.site_profile);
+if (before.import && before.import.by === 'rsqu' && !force) {
+  console.log(`Already applied on ${before.import.at}. Nothing changed. Run with --force to apply it again (that replaces Mike's edits to these sections).`);
+  process.exit(0);
+}
+// Only files this script added before are ever deleted.
+const ownFiles = new Set(before.import?.files || []);
+const added = [];
 const copy = (file, prefix) => {
   const ext = path.extname(file);
   const name = `t${t.id}-${prefix}-${randomToken(8)}${ext}`;
   fs.copyFileSync(path.join(SRC, file), path.join(uploads, name));
+  added.push(name);
   return name;
 };
-const remove = (name) => { if (name && name.startsWith(`t${t.id}-`)) try { fs.unlinkSync(path.join(uploads, path.basename(name))); } catch { /* gone */ } };
+const remove = (name) => { if (name && ownFiles.has(name)) try { fs.unlinkSync(path.join(uploads, path.basename(name))); } catch { /* gone */ } };
 
 // ---- business details ----
 db.prepare(`UPDATE tenants SET name = ?, tagline = ?, hero_headline = ?, about = ?, primary_color = ?, accent_color = ? WHERE id = ?`).run(
@@ -53,7 +66,7 @@ const findProduct = (name) => db.prepare('SELECT * FROM products WHERE tenant_id
 SERVICES.forEach(([name, description, image], i) => {
   let p = findProduct(name);
   if (!p) p = db.prepare('SELECT * FROM products WHERE id = ?').get(db.prepare('INSERT INTO products (tenant_id, name, description, price_cents, on_site) VALUES (?,?,?,0,1)').run(t.id, name, description).lastInsertRowid);
-  if (image) { remove(p.image); db.prepare('UPDATE products SET image = ? WHERE id = ?').run(copy(image, 'prod'), p.id); }
+  if (image && (!p.image || ownFiles.has(p.image))) { remove(p.image); db.prepare('UPDATE products SET image = ? WHERE id = ?').run(copy(image, 'prod'), p.id); }
   db.prepare('UPDATE products SET description = ?, on_site = 1, active = 1, sort = ? WHERE id = ?').run(description, i + 1, p.id);
 });
 const WINTER = `## Why winterizing matters
@@ -102,18 +115,19 @@ if (diag) db.prepare('UPDATE products SET sort = ? WHERE id = ?').run(SERVICES.l
 // ---- website sections ----
 const profile = parseProfile(t.site_profile);
 remove(profile.banner.desktop); remove(profile.banner.mobile);
-const ours = new Set(['Know Before You Go: 10-minute RV check', 'Plumbing spot check', 'Heating and air conditioning spot check', 'Black and grey tank spot check', 'Mike’s credentials and experience']);
-for (const r of profile.resources) if (ours.has(r.title)) remove(r.file);
+for (const r of profile.resources) if (ownFiles.has(r.file)) remove(r.file);
 const resource = (file, title, description) => {
   const name = copy(file, 'doc');
   return { file: name, title, description, size: fs.statSync(path.join(uploads, name)).size, added_at: new Date().toISOString() };
 };
 const keepCities = new Map(profile.cities.map((c) => [`${c.name}|${c.state}`, c.intro]));
+const keepBanner = (kind) => (profile.banner[kind] && !ownFiles.has(profile.banner[kind]) ? profile.banner[kind] : '');
 const next = {
   ...profile,
   theme: 'bold',
   service_phrase: profile.service_phrase || 'Mobile RV repair',
-  banner: { desktop: copy('rsqu-hero.jpg', 'site'), mobile: copy('rsqu-hero-mobile.jpg', 'site'), alt: 'RSQU Mobile RV Service: mobile RV maintenance and repair service' },
+  // Keeps a banner Mike uploaded himself; otherwise uses the RSQU banner.
+  banner: { desktop: keepBanner('desktop') || copy('rsqu-hero.jpg', 'site'), mobile: keepBanner('mobile') || copy('rsqu-hero-mobile.jpg', 'site'), alt: profile.banner.alt || 'RSQU Mobile RV Service: mobile RV maintenance and repair service' },
   highlights: [
     { icon: 'tools', title: 'On-site service', text: 'At your location' },
     { icon: 'shield', title: 'Reliable repairs', text: 'Get back on the road' },
@@ -135,9 +149,11 @@ const next = {
   ],
   // Cities from his service area. Each page goes to Google once Mike writes a few sentences for it.
   cities: [['South Salt Lake', 'UT'], ['Salt Lake City', 'UT'], ['Bountiful', 'UT'], ['Farmington', 'UT'], ['Layton', 'UT'], ['Ogden', 'UT'], ['North Ogden', 'UT'], ['Park City', 'UT'], ['Heber City', 'UT'], ['Morgan', 'UT'], ['Huntsville', 'UT']]
-    .map(([name, state]) => ({ name, state, intro: keepCities.get(`${name}|${state}`) || '' })),
+    .map(([name, state]) => ({ name, state, intro: keepCities.get(`${name}|${state}`) || '' }))
+    .concat(profile.cities.filter((c) => !['South Salt Lake', 'Salt Lake City', 'Bountiful', 'Farmington', 'Layton', 'Ogden', 'North Ogden', 'Park City', 'Heber City', 'Morgan', 'Huntsville'].includes(c.name)))
+    .slice(0, 20),
   resources: [
-    ...profile.resources.filter((r) => !ours.has(r.title)),
+    ...profile.resources.filter((r) => !ownFiles.has(r.file)),
     resource('know-before-you-go-10-minute-rv-check.pdf', 'Know Before You Go: 10-minute RV check', 'A walk-around before you leave: tires, water and electrical, slides and awnings, propane and alarms, hitch and lights.'),
     resource('plumbing-spot-check.pdf', 'Plumbing spot check', 'Odors, leaks and drains: where you notice it, which fixture, and when it happens.'),
     resource('heating-and-air-spot-check.pdf', 'Heating and air conditioning spot check', 'AC, furnace and heat pump problems, plus what to do first if you smell gas or hear a CO alarm.'),
@@ -145,6 +161,7 @@ const next = {
     resource('mike-stevens-credentials-and-experience.pdf', 'Mike’s credentials and experience', 'RV systems training and 30 years in the fire service.'),
   ],
 };
+next.import = { by: 'rsqu', at: new Date().toISOString(), files: added };
 db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(next), t.id);
 console.log(`Done. ${next.cities.length} cities, ${SERVICES.length} services (${SERVICES.filter((s) => s[2]).length} with tile pictures), ${next.resources.length} files. Open /s/${slug} to see it.`);
 console.log('Still for Mike to fill in (Business → Edit website sections): base city, hours, Google links, and a few sentences for each city. Set prices for the new services in Products.');

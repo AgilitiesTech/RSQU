@@ -71,7 +71,7 @@ export async function draftProposal({ apiKey, model, apiBase, images, note, rig,
   };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  let res;
+  let res, data;
   try {
     res = await fetch(`${apiBase.replace(/\/$/, '')}/v1/messages`, {
       method: 'POST',
@@ -79,10 +79,10 @@ export async function draftProposal({ apiKey, model, apiBase, images, note, rig,
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
+    data = await res.json().catch((e) => { if (e.name === 'AbortError') throw e; return {}; });
   } catch (e) {
     throw new Error(e.name === 'AbortError' ? 'The AI draft took too long.' : 'Couldn’t reach the AI service.');
   } finally { clearTimeout(timer); }
-  const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`The AI service returned an error (${res.status}${data.error?.type ? ': ' + data.error.type : ''}).`);
   const use = (data.content || []).find((c) => c.type === 'tool_use' && c.name === TOOL.name);
   let out = use?.input;

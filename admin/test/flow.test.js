@@ -700,6 +700,8 @@ test('photo quote: AI draft from the price list, photos on the proposal, consent
   assert.match(failed.json.ai_draft.error, /529/);
   assert.equal(failed.json.photos.length, 1);
   assert.equal(failed.json.items.length, 0);
+  assert.equal(failed.json.notes, ''); // the technician's note stays private
+  assert.equal(failed.json.ai_draft.note, 'FAIL please');
   assert.equal((await other('GET', `/api/uploads/${failed.json.photos[0].file}`)).status, 404); // other businesses can't see it
 
   // Owner prices the open line, hides one photo, adds the customer
@@ -758,6 +760,58 @@ test('photo quote: AI draft from the price list, photos on the proposal, consent
   assert.equal(appDb.prepare('SELECT email_opt_in FROM customers WHERE id = ?').get(pat.id).email_opt_in, 0);
   assert.equal((await anon('GET', '/u/nope')).status, 404);
   assert.equal((await anon('GET', '/r/nope')).status, 404);
+});
+
+test('consent follows the person and the number; STOP and unsubscribe stick; CSV is safe', async () => {
+  const newQuote = async (fields) => {
+    const q = (await mike('POST', '/api/quotes', {})).json;
+    await mike('PUT', `/api/quotes/${q.id}`, { title: 'Check-up', customer_name: 'Pat Camper', customer_phone: '', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Visit', qty: 1, unit_cents: 5000 }], ...fields });
+    const pub = (await anon('GET', `/api/public/proposals/${q.token}`)).json;
+    return { q, pub, sign: (body) => anon('POST', `/api/public/proposals/${q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: pub.customer_terms?.version, ...body }) };
+  };
+  const pat = () => appDb.prepare(`SELECT * FROM customers WHERE email = 'pat@example.test'`).get();
+  // Pat unsubscribed in the last test: the email box starts unchecked for her
+  const a = await newQuote({ customer_email: 'pat@example.test' });
+  assert.equal(a.pub.subscribe_email_default, false);
+  // Same email, new number, texts not re-checked: text consent doesn't move to the new number
+  assert.equal((await a.sign({ phone: '801-555-0199', email: 'pat@example.test', subscribe_email: false, subscribe_sms: false })).status, 200);
+  assert.equal(pat().phone_key, '8015550199');
+  assert.equal(pat().sms_opt_in, 0);
+  assert.equal(pat().email_opt_in, 0);
+  const log = appDb.prepare('SELECT channel, action, address FROM consent_log WHERE customer_id = ? ORDER BY id').all(pat().id);
+  assert.deepEqual(log.map((l) => `${l.channel}:${l.action}`), ['email:opt_in', 'sms:opt_in', 'email:opt_out', 'sms:opt_out']);
+
+  // A household number that already belongs to someone else's email doesn't overwrite them
+  const b = await newQuote({});
+  await b.sign({ phone: '801-555-0199', email: 'sam@example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(pat().email, 'pat@example.test');
+  const sam = appDb.prepare(`SELECT * FROM customers WHERE email = 'sam@example.test'`).get();
+  assert.ok(sam && sam.email_opt_in === 1 && sam.sms_opt_in === 1);
+
+  // STOP from that number removes text consent everywhere
+  assert.equal((await anon('POST', '/api/twilio/inbound', 'From=%2B18015550199&Body=Stop', { 'Content-Type': 'application/x-www-form-urlencoded' })).status, 200);
+  assert.equal(appDb.prepare('SELECT sms_opt_in FROM customers WHERE id = ?').get(sam.id).sms_opt_in, 0);
+
+  // A stored phone that isn't a number (e.g. "-") doesn't block signing from an old page
+  const c = await newQuote({ customer_phone: '-' });
+  assert.equal(c.pub.customer_phone, undefined);
+  assert.equal((await anon('POST', `/api/public/proposals/${c.q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: c.pub.customer_terms?.version })).status, 200);
+
+  // Control characters can't sneak a formula into the CSV
+  const d = await newQuote({});
+  await d.sign({ name: 'Eve\r=1+2', phone: '801-555-0177', email: 'eve@example.test', subscribe_email: true });
+  const csv = (await mike('GET', '/api/customers.csv')).text;
+  assert.doesNotMatch(csv, /\r=1\+2/);
+  assert.match(csv, /Eve =1\+2/);
+});
+
+test('service pages with the same name get their own addresses', async () => {
+  const one = (await mike('POST', '/api/products', { name: 'Awning repair', price_cents: 0, on_site: true, details: 'First.' })).json;
+  const two = (await mike('POST', '/api/products', { name: 'Awning repair!', price_cents: 0, on_site: true, details: 'Second.' })).json;
+  assert.match((await anon('GET', `/s/${mikeSlug}/services/awning-repair`)).text, /<p>First\.<\/p>/);
+  assert.match((await anon('GET', `/s/${mikeSlug}/services/awning-repair-${two.id}`)).text, /<p>Second\.<\/p>/);
+  await mike('PATCH', `/api/products/${one.id}`, { active: false });
+  await mike('PATCH', `/api/products/${two.id}`, { active: false });
 });
 
 test('bold look: banner, service tiles, highlights, service pages', async () => {
@@ -824,10 +878,10 @@ test('static pages, legal pages and seed script', async () => {
   const out = execFileSync(process.execPath, ['--no-warnings', 'scripts/seed-mike.js', 'mike@seed.test'], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir, BASE_URL: 'https://dash.test' } }).toString();
   assert.match(out, /https:\/\/dash\.test\/admin\/#\/reset\//);
   // Moving Mike's RSQU site onto HitchPoint: twice, to prove it's safe to re-run
-  for (let i = 0; i < 2; i++) {
-    const applied = execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-site.js'], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
-    assert.match(applied, /Done\. 11 cities, 9 services \(7 with tile pictures\), 5 files/);
-  }
+  const apply = (...a) => execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-site.js', ...a], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
+  assert.match(apply(), /Done\. 11 cities, 9 services \(7 with tile pictures\), 5 files/);
+  assert.match(apply(), /Already applied on .*Nothing changed/);
+  assert.match(apply('--force'), /Done\. 11 cities/);
   const { handler: h2 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
   const srv2 = http.createServer(h2); await new Promise((r) => srv2.listen(0, r));
   const b2 = `http://localhost:${srv2.address().port}`;

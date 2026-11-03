@@ -29,7 +29,7 @@ export function notifier(env, log = console) {
         const res = await fetch('https://api.resend.com/emails', {
           method: 'POST',
           headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ from: opts.fromName ? `${opts.fromName.replace(/[<>"]/g, '')} <${String(env.EMAIL_FROM).replace(/^.*<|>.*$/g, '')}>` : env.EMAIL_FROM, to, subject, text, ...(opts.replyTo ? { reply_to: opts.replyTo } : {}), ...(opts.headers ? { headers: opts.headers } : {}) }),
+          body: JSON.stringify({ from: opts.fromName ? `"${opts.fromName.replace(/["\\\r\n<>]/g, '')}" <${String(env.EMAIL_FROM).replace(/^.*<|>.*$/g, '')}>` : env.EMAIL_FROM, to, subject, text, ...(opts.replyTo ? { reply_to: opts.replyTo } : {}), ...(opts.headers ? { headers: opts.headers } : {}) }),
         });
         if (!res.ok) { log.error('Email failed', res.status, await res.text()); return false; }
         return true;

@@ -82,7 +82,7 @@
             <button class="linkbtn" type="button" id="clear">Clear signature</button></div>
           <label class="check"><input type="checkbox" name="agree" id="agree"> <span>I approve this work and the total above, and I agree to the terms above${q.customer_terms ? `, ${esc(q.business.name)}’s <a href="${esc(q.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> (version ${q.customer_terms.version})` : ''} and the <a href="/legal/customer-terms" target="_blank" rel="noopener">payment and e-signature notice</a>, including signing electronically.</span></label>
           <fieldset class="stack consent"><legend class="small muted">Stay in touch (optional)</legend>
-            <label class="check small"><input type="checkbox" name="subscribe_email" checked> <span>${esc(q.consent.email)}</span></label>
+            <label class="check small"><input type="checkbox" name="subscribe_email" ${q.subscribe_email_default === false ? '' : 'checked'}> <span>${esc(q.consent.email)}</span></label>
             <label class="check small"><input type="checkbox" name="subscribe_sms"> <span>${esc(q.consent.sms)}</span></label>
           </fieldset>
           <p class="alert err" id="serr" hidden></p>

@@ -164,28 +164,56 @@ export function createApp(env = process.env) {
   const phoneKey = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 10 ? d.slice(-10) : ''; };
   const toE164 = (p) => { const s = String(p || '').trim(); const d = s.replace(/\D/g, ''); if (s.startsWith('+') && d.length >= 10) return '+' + d; if (d.length === 10) return '+1' + d; if (d.length === 11 && d[0] === '1') return '+' + d; return ''; };
   const normEmail = (e) => String(e || '').trim().toLowerCase();
+  const noCtl = (v, max) => clean(String(v ?? '').replace(/[\u0000-\u001F\u007F]/g, ' '), max);
   function findCustomer(tid, phone, email) {
     const k = phoneKey(phone), e = normEmail(email);
-    return (k && db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND phone_key = ? ORDER BY id LIMIT 1').get(tid, k))
-      || (e && db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND email = ? ORDER BY id LIMIT 1').get(tid, e)) || null;
+    return (e && db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND email = ? ORDER BY id LIMIT 1').get(tid, e))
+      || (k && db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND phone_key = ? ORDER BY id LIMIT 1').get(tid, k)) || null;
   }
-  // Records a customer and what they agreed to. Email updates follow the checkbox each time; a text
-  // opt-in is only ever added here (customers stop texts by replying STOP).
+  function logConsent(tid, customerId, channel, action, address, { text, source, ip, ua } = {}) {
+    db.prepare('INSERT INTO consent_log (tenant_id, customer_id, channel, action, address, text, source, ip, ua) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(tid, customerId ?? null, channel, action, address, text || null, source || null, ip || null, ua || null);
+  }
+  // Records a customer and what they agreed to. Email updates follow the checkbox (it starts unchecked
+  // for anyone who unsubscribed before); unchecking opts the address out everywhere for this business.
+  // A text opt-in belongs to the number that agreed: it's only ever added here, it doesn't follow the
+  // customer to a new number, and STOP replies remove it.
   function upsertCustomer(t, { name, phone, email, emailOptIn, smsOptIn, source, ip, ua }) {
     const ts = now(), e = normEmail(email), k = phoneKey(phone);
-    if (!e && !k) return null;
-    let c = findCustomer(t.id, phone, email);
+    const meta = { source, ip, ua };
+    // Match on email first; a phone match only counts if it doesn't already belong to a different email.
+    let c = e ? db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND email = ? ORDER BY id LIMIT 1').get(t.id, e) : null;
+    if (!c && k) {
+      const byPhone = db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND phone_key = ? ORDER BY id LIMIT 1').get(t.id, k);
+      if (byPhone && (!e || !byPhone.email || byPhone.email === e)) c = byPhone;
+    }
+    if (!c && !e && !k) return null;
     if (!c) {
-      const ins = db.prepare('INSERT INTO customers (tenant_id, name, phone, phone_key, email, unsub_token, source) VALUES (?,?,?,?,?,?,?)').run(t.id, name || '', phone || '', k, e || null, randomToken(), source);
+      const ins = db.prepare('INSERT INTO customers (tenant_id, name, phone, phone_key, email, unsub_token, source) VALUES (?,?,?,?,?,?,?)').run(t.id, name || '', k ? phone : '', k, e || null, randomToken(), source);
       c = db.prepare('SELECT * FROM customers WHERE id = ?').get(ins.lastInsertRowid);
     } else {
-      db.prepare(`UPDATE customers SET name = COALESCE(NULLIF(?, ''), name), phone = COALESCE(NULLIF(?, ''), phone), phone_key = COALESCE(NULLIF(?, ''), phone_key), email = COALESCE(NULLIF(?, ''), email), updated_at = ? WHERE id = ?`).run(name || '', phone || '', k, e, ts, c.id);
+      if (k && c.phone_key && k !== c.phone_key && c.sms_opt_in && !smsOptIn) {
+        db.prepare('UPDATE customers SET sms_opt_in = 0 WHERE id = ?').run(c.id);
+        logConsent(t.id, c.id, 'sms', 'opt_out', c.phone, { ...meta, text: 'Phone number changed; texts not re-confirmed' });
+      }
+      db.prepare(`UPDATE customers SET name = COALESCE(NULLIF(?, ''), name), phone = CASE WHEN ? != '' THEN ? ELSE phone END, phone_key = COALESCE(NULLIF(?, ''), phone_key), email = COALESCE(email, NULLIF(?, '')), updated_at = ? WHERE id = ?`)
+        .run(name || '', k, phone || '', k, e, ts, c.id);
+      c = db.prepare('SELECT * FROM customers WHERE id = ?').get(c.id);
     }
-    if (e) {
-      if (emailOptIn) db.prepare('UPDATE customers SET email_opt_in = 1, email_consent_at = ?, email_consent_text = ?, email_unsubscribed_at = NULL, consent_ip = ?, consent_ua = ?, source = ? WHERE id = ?').run(ts, consentText.email(t.name), ip, ua, source, c.id);
-      else if (c.email_opt_in) db.prepare('UPDATE customers SET email_opt_in = 0, email_unsubscribed_at = ? WHERE id = ?').run(ts, c.id);
+    const addr = e || c.email;
+    if (addr) {
+      if (emailOptIn && e) {
+        db.prepare('UPDATE customers SET email_opt_in = 1, email_consent_at = ?, email_consent_text = ?, email_unsubscribed_at = NULL, consent_ip = ?, consent_ua = ?, source = ? WHERE id = ?').run(ts, consentText.email(t.name), ip, ua, source, c.id);
+        logConsent(t.id, c.id, 'email', 'opt_in', e, { ...meta, text: consentText.email(t.name) });
+      } else if (!emailOptIn) {
+        const r = db.prepare('UPDATE customers SET email_opt_in = 0, email_unsubscribed_at = COALESCE(email_unsubscribed_at, ?) WHERE tenant_id = ? AND email = ? AND email_opt_in = 1').run(ts, t.id, addr);
+        if (r.changes) logConsent(t.id, c.id, 'email', 'opt_out', addr, { ...meta, text: 'Unchecked email updates when signing' });
+      }
     }
-    if (smsOptIn && k) db.prepare('UPDATE customers SET sms_opt_in = 1, sms_consent_at = ?, sms_consent_text = ?, consent_ip = ?, consent_ua = ?, source = ? WHERE id = ?').run(ts, consentText.sms(t.name), ip, ua, source, c.id);
+    if (smsOptIn && k) {
+      db.prepare('UPDATE customers SET sms_opt_in = 1, sms_consent_at = ?, sms_consent_text = ? WHERE id = ?').run(ts, consentText.sms(t.name), c.id);
+      logConsent(t.id, c.id, 'sms', 'opt_in', phone, { ...meta, text: consentText.sms(t.name) });
+    }
     return db.prepare('SELECT * FROM customers WHERE id = ?').get(c.id);
   }
 
@@ -562,7 +590,9 @@ export function createApp(env = process.env) {
       // The business's customer Terms & Conditions: the version signed, or the current one to accept.
       customer_terms: publicTerms(t, full.customer_terms_version),
       photos: full.photos.filter((ph) => ph.show).map((ph) => ({ url: `/api/public/proposals/${encodeURIComponent(q.token)}/photos/${encodeURIComponent(ph.file)}` })),
-      customer_phone: full.signed_at ? undefined : full.customer_phone, customer_email: full.signed_at ? undefined : full.customer_email,
+      customer_phone: full.signed_at || !phoneKey(full.customer_phone) ? undefined : full.customer_phone, customer_email: full.signed_at ? undefined : full.customer_email,
+      // Unchecked for anyone who unsubscribed before, so re-subscribing takes a deliberate check.
+      subscribe_email_default: (() => { const c = findCustomer(t.id, full.customer_phone, full.customer_email); return !(c && c.email_unsubscribed_at && !c.email_opt_in); })(),
       consent: { email: consentText.email(t.name), sms: consentText.sms(t.name) },
       receipts: full.payments.filter((pp) => pp.status === 'paid').map((pp) => ({ url: `/r/${pp.token}`, amount_cents: pp.amount_cents, paid_at: pp.paid_at })),
     });
@@ -578,7 +608,7 @@ export function createApp(env = process.env) {
     if (!q || q.status === 'void') throw new HttpError(404, 'This proposal isn’t available.');
     if (q.signed_at) throw new HttpError(409, 'This proposal is already signed.');
     const b = await json(req, 1_000_000);
-    const name = clean(b.name, 120);
+    const name = noCtl(b.name, 120);
     if (!name || !b.agree) throw new HttpError(400, 'Type your name and check the box to accept.');
     // The customer accepts the business's current Terms & Conditions with the proposal. If the
     // business approved a new version since the page loaded, ask them to review it first.
@@ -587,10 +617,10 @@ export function createApp(env = process.env) {
     if (!/^data:image\/png;base64,[A-Za-z0-9+/=]{200,}$/.test(b.signature || '')) throw new HttpError(400, 'Please sign in the box.');
     if (b.signature.length > 700_000) throw new HttpError(413, 'Signature is too large.');
     // Where the receipt goes, and what the customer agreed to receive.
-    const phone = b.phone !== undefined ? clean(b.phone, 40) : q.customer_phone;
-    const email = b.email !== undefined ? clean(b.email, 200).toLowerCase() : normEmail(q.customer_email);
+    const phone = b.phone !== undefined ? noCtl(b.phone, 40) : (phoneKey(q.customer_phone) ? q.customer_phone : '');
+    const email = b.email !== undefined ? noCtl(b.email, 200).toLowerCase() : normEmail(q.customer_email);
     if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Check your email address.');
-    if (phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
+    if (b.phone !== undefined && phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
     if (b.subscribe_sms && !phoneKey(phone)) throw new HttpError(400, 'Add your mobile number to get texts, or uncheck that box.');
     const ts = now();
     db.prepare(`UPDATE quotes SET status = 'signed', signer_name = ?, signature_png = ?, signer_ip = ?, signer_ua = ?, signed_at = ?, updated_at = ?, customer_terms_version = ?, customer_terms_sha256 = ?, customer_phone = ?, customer_email = ? WHERE id = ?`)
@@ -823,7 +853,7 @@ export function createApp(env = process.env) {
       } catch (e) { error = e.message; console.error('AI draft failed', e.message); }
     }
     const ins = db.prepare(`INSERT INTO quotes (tenant_id, token, request_id, title, customer_name, customer_phone, customer_email, location, rig, notes, terms, tax_rate_bp, deposit_credit_cents, photos, ai_draft) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(t.id, randomToken(), r?.id ?? null, ai?.title || 'Repair proposal', r?.name || '', r?.phone || '', r?.email || '', r?.location || '', rig, ai?.summary || note, t.terms || '', t.tax_rate_bp, paidDeposits(r?.id),
+      .run(t.id, randomToken(), r?.id ?? null, ai?.title || 'Repair proposal', r?.name || '', r?.phone || '', r?.email || '', r?.location || '', rig, ai?.summary || '', t.terms || '', t.tax_rate_bp, paidDeposits(r?.id),
         JSON.stringify(files.map((file) => ({ file, show: true }))),
         JSON.stringify({ note, error, model: ai?.model || null, findings: ai?.findings || [], safety: ai?.safety || [], questions: ai?.questions || [], needs_price: (ai?.items || []).filter((i) => i.needs_price).map((i) => i.name), estimates: (ai?.items || []).filter((i) => i.estimate).map((i) => i.name), at: now() }));
     const qid = Number(ins.lastInsertRowid);
@@ -917,13 +947,38 @@ export function createApp(env = process.env) {
     send(res, 200, publicTenant(getTenant(t.id)));
   }, { auth: 'owner' });
 
+  // Replies to the platform's text number. STOP-type words remove text consent for that number at every
+  // business (Twilio itself blocks further texts and sends the confirmation). Point the Twilio number's
+  // "A message comes in" webhook here.
+  route('POST', '/api/twilio/inbound', async (req, res) => {
+    const raw = await readBody(req, 100_000);
+    const params = Object.fromEntries(new URLSearchParams(raw));
+    if (env.TWILIO_AUTH_TOKEN && !env.NOTIFY_CAPTURE) {
+      const url = `${publicBase()}/api/twilio/inbound`;
+      const data = url + Object.keys(params).sort().map((k) => k + params[k]).join('');
+      const expected = crypto.createHmac('sha1', env.TWILIO_AUTH_TOKEN).update(data).digest('base64');
+      const got = String(req.headers['x-twilio-signature'] || '');
+      if (got.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected))) throw new HttpError(403, 'Forbidden');
+    }
+    const word = String(params.Body || '').trim().toUpperCase();
+    const k = phoneKey(params.From);
+    if (k && ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT', 'OPT OUT'].includes(word)) {
+      for (const c of db.prepare('SELECT id, tenant_id, phone FROM customers WHERE phone_key = ? AND sms_opt_in = 1').all(k)) {
+        db.prepare('UPDATE customers SET sms_opt_in = 0, updated_at = ? WHERE id = ?').run(now(), c.id);
+        logConsent(c.tenant_id, c.id, 'sms', 'opt_out', c.phone, { text: `Replied ${word}` });
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'text/xml' });
+    res.end('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  });
+
   // Customers and who's subscribed
   route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, db.prepare('SELECT id, name, phone, email, email_opt_in, sms_opt_in, email_consent_at, sms_consent_at, email_unsubscribed_at, source, created_at FROM customers WHERE tenant_id = ? ORDER BY id DESC LIMIT 2000').all(t.id));
   }, { auth: 'tenant' });
   route('GET', '/api/customers.csv', async (req, res, p, url, { tenant: t }) => {
     const rows = db.prepare('SELECT name, phone, email, email_opt_in, email_consent_at, email_unsubscribed_at, sms_opt_in, sms_consent_at, source, created_at FROM customers WHERE tenant_id = ? ORDER BY id').all(t.id);
-    const cell = (v) => { const x = String(v ?? ''); return /[",\n]/.test(x) || /^[=+\-@]/.test(x) ? `"${(/^[=+\-@]/.test(x) ? "'" : '') + x.replace(/"/g, '""')}"` : x; };
+    const cell = (v) => { const x = String(v ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' '); return /[",\r\n]/.test(x) || /^[=+\-@\t]/.test(x) ? `"${(/^[=+\-@\t]/.test(x) ? "'" : '') + x.replace(/"/g, '""')}"` : x; };
     const head = ['name', 'phone', 'email', 'email_updates', 'email_consent_at', 'email_unsubscribed_at', 'texts', 'text_consent_at', 'source', 'added'];
     const body = rows.map((r) => [r.name, r.phone, r.email, r.email_opt_in ? 'yes' : 'no', r.email_consent_at, r.email_unsubscribed_at, r.sms_opt_in ? 'yes' : 'no', r.sms_consent_at, r.source, r.created_at].map(cell).join(','));
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="customers.csv"', 'Cache-Control': 'no-store' });
@@ -1317,7 +1372,7 @@ export function createApp(env = process.env) {
   function serveService(req, res, t, slug, onDomain = false) {
     liveTenant(t);
     const products = activeProducts(t);
-    const product = products.find((x) => hasPage(x) && serviceSlug(x) === slug);
+    const product = products.find((x) => hasPage(x) && serviceSlug(x, products) === slug);
     if (!product) throw new HttpError(404, 'Not found');
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
     res.end(renderServicePage(t, products, siteProfile.parseProfile(t.site_profile), product, { platformBase: baseUrl(req), onDomain }));
@@ -1401,7 +1456,11 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
         const c = db.prepare('SELECT * FROM customers WHERE unsub_token = ?').get(um[1]);
         const t = c ? getTenant(c.tenant_id) : { name: platformName };
         let done = false;
-        if (c && req.method === 'POST') { db.prepare('UPDATE customers SET email_opt_in = 0, email_unsubscribed_at = COALESCE(email_unsubscribed_at, ?), updated_at = ? WHERE id = ?').run(now(), now(), c.id); done = true; }
+        if (c && req.method === 'POST') {
+          db.prepare('UPDATE customers SET email_opt_in = 0, email_unsubscribed_at = COALESCE(email_unsubscribed_at, ?), updated_at = ? WHERE tenant_id = ? AND email = ?').run(now(), now(), c.tenant_id, c.email);
+          if (c.email_opt_in) logConsent(c.tenant_id, c.id, 'email', 'opt_out', c.email || '', { text: 'Unsubscribe link', ip: clientIp(req), ua: clean(req.headers['user-agent'], 400) });
+          done = true;
+        }
         else if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
         res.writeHead(c ? 200 : 404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders });
         return res.end(renderUnsubscribe({ t, customer: c ? db.prepare('SELECT * FROM customers WHERE id = ?').get(c.id) : null, done, actionPath: `/u/${um[1]}` }));

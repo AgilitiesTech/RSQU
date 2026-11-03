@@ -56,7 +56,8 @@
     try { await navigator.clipboard.writeText(text); if (btn) { const t = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => (btn.textContent = t), 1500); } }
     catch { window.prompt('Copy this:', text); }
   }
-  function readImage(file, max = 1600) {
+  // alpha: keep PNG/WebP transparency (logos, tiles); job photos always become JPEG to stay small.
+  function readImage(file, max = 1600, alpha = true) {
     return new Promise((resolve) => {
       if (!file) return resolve(null);
       const img = new Image(), url = URL.createObjectURL(file);
@@ -64,7 +65,7 @@
         const s = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement('canvas');
         c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
-        resolve(c.toDataURL(/^image\/(png|webp)$/.test(file.type) ? 'image/png' : 'image/jpeg', 0.85)); // keep transparency
+        resolve(c.toDataURL(alpha && /^image\/(png|webp)$/.test(file.type) ? 'image/png' : 'image/jpeg', 0.85));
       };
       img.onerror = () => resolve(null);
       img.src = url;
@@ -582,7 +583,7 @@
     document.getElementById('pq-files').addEventListener('change', async (e) => {
       for (const f of [...e.target.files]) {
         if (photos.length >= 4) { flash(msg, 'Up to 4 photos. Remove one to add another.', 'err'); break; }
-        const d = await readImage(f, 1568);
+        const d = await readImage(f, 1568, false);
         if (d) photos.push(d); else flash(msg, 'That file isn’t a photo we can read. Use JPG or PNG.', 'err');
       }
       e.target.value = ''; draw();

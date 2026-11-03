@@ -272,5 +272,16 @@ function migrate(db) {
     );
     CREATE INDEX IF NOT EXISTS customers_phone ON customers (tenant_id, phone_key);
     CREATE INDEX IF NOT EXISTS customers_email ON customers (tenant_id, email);
+    -- Every opt-in and opt-out, append-only: the proof of who agreed to what, where, and when.
+    CREATE TABLE IF NOT EXISTS consent_log (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER REFERENCES tenants(id) ON DELETE CASCADE,
+      customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+      channel TEXT NOT NULL CHECK (channel IN ('email','sms')),
+      action TEXT NOT NULL CHECK (action IN ('opt_in','opt_out')),
+      address TEXT NOT NULL,                -- the email address or phone number it applies to
+      text TEXT, source TEXT, ip TEXT, ua TEXT,
+      at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 }

@@ -167,6 +167,7 @@ export function cleanProfile(input, current) {
   });
   for (const r of current.resources || []) if (!kept.has(r.file)) out.resources.push(r); // never drop files here
 
+  if (current.import) out.import = current.import; // set by a migration script, never edited here
   out.theme = THEMES.includes(b.theme) ? b.theme : 'classic';
   // Banner image files are managed by their own upload route; only the description changes here.
   out.banner = { desktop: current.banner?.desktop || '', mobile: current.banner?.mobile || '', alt: str(b.banner && b.banner.alt, 200) };
