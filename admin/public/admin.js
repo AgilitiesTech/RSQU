@@ -212,6 +212,16 @@
     });
     document.getElementById('ag-out').addEventListener('click', logout);
   }
+  // While the owner hasn't connected Stripe: a banner on every page, instead of blocking the dashboard.
+  function setupBanner() {
+    let el = document.getElementById('setup-banner');
+    const on = Boolean(me && me.needs_payout_setup && !me.viewing_as);
+    if (!on) { if (el) el.hidden = true; return; }
+    if (!el) { el = document.createElement('div'); el.id = 'setup-banner'; el.className = 'setup-banner'; el.setAttribute('role', 'status'); document.getElementById('topbar').after(el); }
+    const legacy = me.tenant && me.tenant.stripe_account_id && me.tenant.stripe_account_type !== 'v2_merchant';
+    el.innerHTML = `<span>${legacy ? 'Move online payments to your own Stripe account.' : 'Online payments are off until you connect your Stripe account.'} Cash and check work as usual.</span><a class="btn sm gold" href="#/onboarding">Connect Stripe</a>`;
+    el.hidden = false;
+  }
   async function onboardingView(sub) {
     showChrome(false);
     if (sub === 'return' || sub === 'refresh') { try { await api('/api/stripe/refresh', { method: 'POST' }); await loadMe(); } catch { /* shown below */ } if (!me.needs_payout_setup) { location.hash = '#/business'; return route(); } }
@@ -227,6 +237,8 @@
         ${sub === 'return' ? '<p class="alert err">Stripe still needs a few details. Pick up where you left off.</p>' : ''}
         <p class="alert err" id="ob-err" hidden></p>
         <button class="btn primary block" type="button" id="ob-go">Connect with Stripe</button>
+        <a class="btn ghost block" href="#/requests">Not now, open my dashboard</a>
+        <p class="small muted">Until you connect, customers pay you by cash or check, and everything else works as usual.</p>
         <button class="linkbtn" type="button" id="ob-out">Log out</button>
       </section>`;
     const go = document.getElementById('ob-go');
@@ -1784,9 +1796,9 @@
     if (!me) await loadMe();
     if (!me) return showAuth(['signup', 'forgot'].includes(a) ? a : 'login');
     if (me.needs_agreements) return agreementsView();
-    if (me.needs_payout_setup) return onboardingView(a === 'onboarding' ? b : '');
+    if (a === 'onboarding' && (me.needs_payout_setup || b)) return onboardingView(b || '');
     if (me.tenant && me.tenant.status !== 'active' && !isSuper()) { showChrome(false); view.innerHTML = '<section class="card login stack"><h1>Account suspended</h1><p>Contact Agilities support to restore access.</p><button class="btn ghost" type="button" id="lo">Log out</button></section>'; document.getElementById('lo').addEventListener('click', logout); return; }
-    showChrome(true); buildChrome();
+    showChrome(true); buildChrome(); setupBanner();
     try {
       if (!me.tenant) {
         if (a === 'super' && b) await superTenantView(b);
