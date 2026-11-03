@@ -284,4 +284,81 @@ function migrate(db) {
       at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+  migrateAffiliates(db);
+}
+
+// Affiliate (referral revenue-share) program. Agilities pays an affiliate business a share of
+// HitchPoint's net platform fee on online payments from businesses it referred (src/affiliates.js).
+function migrateAffiliates(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS affiliates (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE CASCADE, -- the affiliate is a business on the platform
+      code TEXT NOT NULL UNIQUE,                       -- /a/<code> and the sign-up form; /^[a-z0-9-]{3,40}$/
+      share_bp INTEGER NOT NULL CHECK (share_bp BETWEEN 0 AND 10000), -- of HitchPoint's net fee; 2000 = 20%
+      months INTEGER CHECK (months IS NULL OR months > 0),             -- from the referred business's sign-up; NULL = as long as it stays
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused')), -- paused: no new referrals
+      w9_on_file INTEGER NOT NULL DEFAULT 0, w9_on_file_at TEXT,
+      terms_accepted_at TEXT, terms_version TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    -- Every share/duration an affiliate has had, so each payment uses the terms in effect when it was paid.
+    CREATE TABLE IF NOT EXISTS affiliate_rates (
+      id INTEGER PRIMARY KEY,
+      affiliate_id INTEGER NOT NULL REFERENCES affiliates(id) ON DELETE CASCADE,
+      share_bp INTEGER NOT NULL, months INTEGER,
+      effective_at TEXT NOT NULL                       -- 'YYYY-MM-DD HH:MM:SS.sss' UTC
+    );
+    CREATE INDEX IF NOT EXISTS ix_aff_rates ON affiliate_rates(affiliate_id, effective_at);
+    -- Link clicks per day. Unique visitors are counted from a keyed hash of the IP that is kept only
+    -- for the current day (affiliate_click_visitors); raw IPs are never stored.
+    CREATE TABLE IF NOT EXISTS affiliate_clicks (
+      affiliate_id INTEGER NOT NULL REFERENCES affiliates(id) ON DELETE CASCADE,
+      day TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0, uniques INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (affiliate_id, day)
+    );
+    CREATE TABLE IF NOT EXISTS affiliate_click_visitors (
+      affiliate_id INTEGER NOT NULL, day TEXT NOT NULL, ip_hash TEXT NOT NULL,
+      PRIMARY KEY (affiliate_id, day, ip_hash)
+    );
+    CREATE INDEX IF NOT EXISTS ix_aff_visitors_day ON affiliate_click_visitors(day);
+    CREATE TABLE IF NOT EXISTS affiliate_payouts (
+      id INTEGER PRIMARY KEY,
+      affiliate_id INTEGER NOT NULL REFERENCES affiliates(id),
+      amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+      method TEXT NOT NULL CHECK (method IN ('ach','check','stripe','other')),
+      reference TEXT,
+      paid_at TEXT NOT NULL,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    -- Append-only: amounts never change and rows are never deleted. Only status moves
+    -- (pending -> available after the hold -> paid with a payout).
+    CREATE TABLE IF NOT EXISTS affiliate_ledger (
+      id INTEGER PRIMARY KEY,
+      affiliate_id INTEGER NOT NULL REFERENCES affiliates(id),
+      tenant_id INTEGER REFERENCES tenants(id) ON DELETE SET NULL,    -- the referred business
+      payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
+      type TEXT NOT NULL CHECK (type IN ('earning','reversal','payout','adjustment')),
+      amount_cents INTEGER NOT NULL,                   -- signed
+      status TEXT NOT NULL CHECK (status IN ('pending','available','paid')),
+      available_at TEXT,
+      payout_id INTEGER REFERENCES affiliate_payouts(id),
+      share_bp INTEGER,                                -- the share applied (earnings and reversals)
+      note TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS ix_aff_ledger ON affiliate_ledger(affiliate_id, status);
+    CREATE INDEX IF NOT EXISTS ix_aff_ledger_pay ON affiliate_ledger(payment_id);
+    CREATE TRIGGER IF NOT EXISTS affiliate_ledger_no_delete BEFORE DELETE ON affiliate_ledger
+      BEGIN SELECT RAISE(ABORT, 'affiliate_ledger is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS affiliate_ledger_fixed BEFORE UPDATE OF affiliate_id, type, amount_cents ON affiliate_ledger
+      BEGIN SELECT RAISE(ABORT, 'affiliate_ledger amounts never change'); END;
+  `);
+  // Who referred a business, when (payments before this earn nothing), and how: link | code | admin.
+  addColumn(db, 'tenants', 'referred_by_affiliate_id', 'INTEGER REFERENCES affiliates(id)');
+  addColumn(db, 'tenants', 'referred_at', 'TEXT');
+  addColumn(db, 'tenants', 'referred_how', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS ix_tenants_referrer ON tenants(referred_by_affiliate_id)');
 }

@@ -13,6 +13,7 @@ import * as siteProfile from './src/site-profile.js';
 import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
 import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
+import * as AFF from './src/affiliates.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -393,6 +394,7 @@ export function createApp(env = process.env) {
         .run(ch.id, stripeFee, share, net, pay.id);
       // A webhook and the return-page confirm can arrive together: only the first one notifies.
       if (r.changes) notify.sms(t?.notify_phone, `${money(net)} added to your Stripe balance (${money(pay.amount_cents)} paid, ${money(stripeFee + share)} Processing Fee).`);
+      syncAffiliateLedger(pay.id);
     } catch (e) {
       db.prepare(`UPDATE payments SET transfer_status = 'pending', transfer_error = ? WHERE id = ?`).run(String(e.message).slice(0, 300), pay.id);
     }
@@ -411,6 +413,7 @@ export function createApp(env = process.env) {
     const due = target - (fee.amount_refunded || 0);
     if (due > 0) await stripe.refundApplicationFee(feeId, due, `appfee-refund-${feeId}-${target}`);
     db.prepare('UPDATE payments SET fee_refunded_cents = ? WHERE id = ?').run(Math.max(target, fee.amount_refunded || 0), pay.id);
+    syncAffiliateLedger(pay.id);
   }
 
   async function retryPayouts(tenantId) {
@@ -473,9 +476,11 @@ export function createApp(env = process.env) {
     if (String(b.password || '').length < 10) throw new HttpError(400, 'Use a password of at least 10 characters.');
     if (!b.agree) throw new HttpError(400, 'Please accept the Terms of Service, Privacy Policy and Payment Processing and Fee Terms.');
     if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) throw new HttpError(409, 'That email already has an account. Log in instead.');
+    const ref = signupReferral(req, b, { email, phone });
     const t = db.prepare(`INSERT INTO tenants (slug, name, phone, email, notify_phone, terms) VALUES (?,?,?,?,?,?)`)
       .run(uniqueSlug(business), business, phone, email, phone, 'Work is done as described above. Anything not listed is quoted separately and only done with your approval. Payment is due when the work is complete.');
     const tid = Number(t.lastInsertRowid);
+    if (ref) setReferral(tid, ref.affiliate.id, ref.how);
     const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role, last_login_at) VALUES (?,?,?,?, 'owner', ?)`).run(tid, email, name, hashPassword(b.password), now());
     const user = getUser(Number(u.lastInsertRowid));
     recordAgreements(req, user, tid);
@@ -688,7 +693,7 @@ export function createApp(env = process.env) {
       // Direct charges arrive from the business's account (Connect endpoint, evt.account set);
       // legacy platform charges arrive on the platform endpoint (no evt.account).
       const rightAccount = pay && (pay.charge_type === 'direct' ? evt.account === pay.stripe_account : !evt.account);
-      if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); }
+      if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); syncAffiliateLedger(pay.id); }
     } else if (evt.type === 'charge.refunded' && evt.account && o?.id) {
       await returnPlatformFee(evt.account, o);
     } else if (evt.type === 'account.updated' && o?.id) {
@@ -1066,6 +1071,406 @@ export function createApp(env = process.env) {
     send(res, 200, websiteState(req, getTenant(t.id)));
   }, { auth: 'owner' });
 
+  // ---------- affiliates ----------
+  // Agilities pays affiliates (businesses on the platform) a share of HitchPoint's net platform fee on
+  // online payments from businesses they referred. Each payment's share lives in an append-only ledger:
+  // syncAffiliateLedger(paymentId) adds an earning or a reversal for whatever changed. Earnings wait
+  // HOLD_DAYS after the payment (refunds, disputes), then become available. Payouts are recorded by hand.
+  const usd = (c) => (c < 0 ? '-' : '') + '$' + (Math.abs(c) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const preciseNow = () => new Date().toISOString().replace('T', ' ').slice(0, 23);
+  const sqlTime = (ts, modifier) => db.prepare('SELECT datetime(?, ?) AS d').get(ts, modifier).d;
+  const getAffiliate = (id) => db.prepare('SELECT * FROM affiliates WHERE id = ?').get(id);
+  const affiliateOfTenant = (tid) => db.prepare('SELECT * FROM affiliates WHERE tenant_id = ?').get(tid);
+  const affiliateByCode = (code) => { const c = AFF.normalizeCode(code); return AFF.CODE_RE.test(c) ? db.prepare('SELECT * FROM affiliates WHERE code = ?').get(c) : null; };
+  const affiliateLink = (req, a) => `${siteOrigin(req)}/a/${a.code}`;
+  // A code that credits new sign-ups: active, terms accepted, and the affiliate's own business is active.
+  function liveAffiliate(code) {
+    const a = affiliateByCode(code);
+    if (!a || a.status !== 'active' || !a.terms_accepted_at) return null;
+    return getTenant(a.tenant_id)?.status === 'active' ? a : null;
+  }
+
+  // Share history: a payment always uses the share and duration in effect when it was paid.
+  const logRate = (a) => db.prepare('INSERT INTO affiliate_rates (affiliate_id, share_bp, months, effective_at) VALUES (?,?,?,?)').run(a.id, a.share_bp, a.months ?? null, preciseNow());
+  function rateAt(affId, at) {
+    return db.prepare('SELECT share_bp, months FROM affiliate_rates WHERE affiliate_id = ? AND effective_at <= ? ORDER BY effective_at DESC, id DESC LIMIT 1').get(affId, at)
+      || db.prepare('SELECT share_bp, months FROM affiliate_rates WHERE affiliate_id = ? ORDER BY effective_at, id LIMIT 1').get(affId);
+  }
+
+  // What the referrer should have earned on a payment: a paid direct (online) payment from a referred
+  // business, made on or after the referral and inside the share window, at the share in effect then.
+  function affiliateTarget(pay) {
+    if (!pay || pay.status !== 'paid' || pay.charge_type !== 'direct' || pay.method !== 'card' || !pay.paid_at) return null;
+    const t = getTenant(pay.tenant_id);
+    if (!t || !t.referred_by_affiliate_id || !t.referred_at || pay.paid_at < t.referred_at) return null;
+    const a = getAffiliate(t.referred_by_affiliate_id);
+    if (!a || a.tenant_id === t.id) return null;
+    const rate = rateAt(a.id, pay.paid_at);
+    if (!rate) return null;
+    if (rate.months != null && pay.paid_at >= sqlTime(t.created_at, `+${rate.months} months`)) return null;
+    const net = Math.max(0, (pay.fee_cents || 0) - (pay.fee_refunded_cents || 0));
+    return { affiliateId: a.id, cents: Math.floor((net * rate.share_bp) / 10000), shareBp: rate.share_bp };
+  }
+
+  // Idempotent: brings the ledger for one payment to its target with one earning (or reversal) for the
+  // difference. Runs whenever a direct payment is paid or its fee changes, and when a referral changes.
+  function syncAffiliateLedger(paymentId) {
+    try {
+      const pay = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+      if (!pay) return;
+      const target = affiliateTarget(pay);
+      const have = new Map(db.prepare(`SELECT affiliate_id, SUM(amount_cents) AS s, MAX(share_bp) AS bp FROM affiliate_ledger WHERE payment_id = ? AND type IN ('earning','reversal') GROUP BY affiliate_id`).all(pay.id).map((r) => [r.affiliate_id, r]));
+      if (target && !have.has(target.affiliateId)) have.set(target.affiliateId, { s: 0, bp: target.shareBp });
+      if (!have.size) return;
+      const ts = now();
+      const holdEnd = sqlTime(pay.paid_at || ts, `+${AFF.HOLD_DAYS} days`);
+      const ins = db.prepare('INSERT INTO affiliate_ledger (affiliate_id, tenant_id, payment_id, type, amount_cents, status, available_at, share_bp, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)');
+      for (const [affId, h] of have) {
+        const mine = target && target.affiliateId === affId;
+        const diff = (mine ? target.cents : 0) - (h.s || 0);
+        if (!diff) continue;
+        // A reversal is never available before the earning it reduces, and never later than now if that has passed.
+        const availableAt = diff > 0 || holdEnd > ts ? holdEnd : ts;
+        ins.run(affId, pay.tenant_id, pay.id, diff > 0 ? 'earning' : 'reversal', diff, availableAt <= ts ? 'available' : 'pending', availableAt,
+          mine ? target.shareBp : h.bp ?? null, diff > 0 ? null : mine ? 'Customer refund' : 'Referral changed', ts);
+      }
+    } catch (e) { console.error('Affiliate ledger sync failed for payment', paymentId, e.message); }
+  }
+  function resyncTenantLedger(tid) {
+    const ids = db.prepare(`SELECT id FROM payments WHERE tenant_id = ? AND status = 'paid' UNION SELECT payment_id FROM affiliate_ledger WHERE tenant_id = ? AND payment_id IS NOT NULL`).all(tid, tid);
+    for (const r of ids) syncAffiliateLedger(r.id);
+  }
+  // Pending earnings become available once the hold has passed.
+  const sweepAffiliateLedger = () => db.prepare(`UPDATE affiliate_ledger SET status = 'available' WHERE status = 'pending' AND available_at <= ?`).run(now());
+  const affiliateTotals = (affId) => db.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN type != 'payout' AND status = 'pending' THEN amount_cents END), 0) AS pending_cents,
+      COALESCE(SUM(CASE WHEN type != 'payout' AND status = 'available' THEN amount_cents END), 0) AS available_cents,
+      COALESCE(-SUM(CASE WHEN type = 'payout' THEN amount_cents END), 0) AS paid_cents
+    FROM affiliate_ledger WHERE affiliate_id = ?`).get(affId);
+  function clickStats(affId) {
+    const since = sqlTime(now(), '-29 days').slice(0, 10);
+    return db.prepare(`SELECT COALESCE(SUM(clicks), 0) AS all_clicks, COALESCE(SUM(uniques), 0) AS all_uniques,
+      COALESCE(SUM(CASE WHEN day >= ? THEN clicks END), 0) AS clicks_30, COALESCE(SUM(CASE WHEN day >= ? THEN uniques END), 0) AS uniques_30
+      FROM affiliate_clicks WHERE affiliate_id = ?`).get(since, since, affId);
+  }
+  const referralState = (t) => (t.status !== 'active' ? 'inactive' : isMerchant(t) && t.stripe_payouts_enabled && latestTerms(t.id) ? 'taking_payments' : 'setting_up');
+  function referralsOf(a) {
+    return db.prepare(`SELECT t.*, (SELECT COALESCE(SUM(l.amount_cents), 0) FROM affiliate_ledger l WHERE l.affiliate_id = ? AND l.tenant_id = t.id AND l.type IN ('earning','reversal')) AS earned_cents
+      FROM tenants t WHERE t.referred_by_affiliate_id = ? ORDER BY t.created_at DESC, t.id DESC`).all(a.id, a.id)
+      .map((t) => ({ id: t.id, name: t.name, joined: t.created_at, referred_at: t.referred_at, how: t.referred_how, state: referralState(t), earned_cents: t.earned_cents, share_ends: a.months == null ? null : sqlTime(t.created_at, `+${a.months} months`) }));
+  }
+  // shown_at: the day a row is about (an earning: when the customer paid; a payout: when it was paid).
+  const ledgerOf = (affId) => db.prepare(`SELECT l.*, t.name AS business, p.method AS payout_method, p.reference AS payout_reference, p.paid_at AS payout_paid_at,
+      CASE WHEN l.type = 'payout' THEN COALESCE(p.paid_at, l.created_at) WHEN l.type = 'earning' THEN COALESCE(pm.paid_at, l.created_at) ELSE l.created_at END AS shown_at
+    FROM affiliate_ledger l LEFT JOIN tenants t ON t.id = l.tenant_id LEFT JOIN affiliate_payouts p ON p.id = l.payout_id AND l.type = 'payout' LEFT JOIN payments pm ON pm.id = l.payment_id
+    WHERE l.affiliate_id = ? ORDER BY shown_at DESC, l.id DESC LIMIT 2000`).all(affId);
+  // What the affiliate sees for a ledger row: its own amounts only, never the payment behind it.
+  const ownerLedgerRow = (l) => ({
+    date: l.shown_at, business: l.business || '', type: l.type,
+    note: ['reversal', 'adjustment'].includes(l.type) ? l.note || '' : '', method: l.payout_method || '', reference: l.payout_reference || '',
+    amount_cents: l.amount_cents, status: l.status, available_at: l.type === 'payout' ? null : l.available_at,
+  });
+
+  function ownerAffiliate(req, a) {
+    sweepAffiliateLedger();
+    const accepted = Boolean(a.terms_accepted_at);
+    const affiliate = {
+      code: a.code, status: a.status, share_bp: a.share_bp, months: a.months, w9_on_file: Boolean(a.w9_on_file), link: accepted ? affiliateLink(req, a) : null,
+      terms: { url: '/legal/affiliate-terms', version: AFF.AFFILIATE_TERMS_VERSION, accepted_at: a.terms_accepted_at, accepted_version: a.terms_version, needs_accept: a.terms_version !== AFF.AFFILIATE_TERMS_VERSION },
+      hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS, platform_fee_bp: platformSettings(db).fee_bp,
+    };
+    if (!accepted) return { affiliate };
+    const c = clickStats(a.id);
+    return {
+      affiliate,
+      clicks: { last_30_days: c.clicks_30, all_time: c.all_clicks },
+      totals: affiliateTotals(a.id),
+      // Names and earnings only: never a referred business's payment volume or revenue.
+      referrals: referralsOf(a).map(({ name, joined, state, earned_cents, share_ends }) => ({ name, joined, state, earned_cents, share_ends })),
+      ledger: ledgerOf(a.id).map(ownerLedgerRow),
+    };
+  }
+  function superAffiliateRow(a) {
+    const t = getTenant(a.tenant_id);
+    return {
+      id: a.id, tenant_id: a.tenant_id, name: t?.name || '', tenant_status: t?.status || '', code: a.code, share_bp: a.share_bp, months: a.months, status: a.status,
+      w9_on_file: Boolean(a.w9_on_file), w9_on_file_at: a.w9_on_file_at, terms_accepted_at: a.terms_accepted_at, terms_version: a.terms_version,
+      terms_current: a.terms_version === AFF.AFFILIATE_TERMS_VERSION, created_at: a.created_at,
+      referrals: db.prepare('SELECT COUNT(*) AS n FROM tenants WHERE referred_by_affiliate_id = ?').get(a.id).n,
+      ...affiliateTotals(a.id), clicks: clickStats(a.id),
+    };
+  }
+  function payoutBlock(a, available) {
+    if (!a.terms_accepted_at) return 'They haven’t accepted the Affiliate Program Terms yet. Ask them to accept on their referral page.';
+    if (!a.w9_on_file) return 'Mark the W-9 as on file before recording a payout.';
+    if (available < AFF.MIN_PAYOUT_CENTS) return `The available balance is ${usd(available)}. Payouts start at ${usd(AFF.MIN_PAYOUT_CENTS)}.`;
+    return '';
+  }
+  function superAffiliateDetail(req, a) {
+    sweepAffiliateLedger();
+    const row = superAffiliateRow(a);
+    return {
+      affiliate: { ...row, link: affiliateLink(req, a), owner_email: db.prepare(`SELECT email FROM users WHERE tenant_id = ? AND role = 'owner' ORDER BY id LIMIT 1`).get(a.tenant_id)?.email || '' },
+      referrals: referralsOf(a),
+      ledger: ledgerOf(a.id).map((l) => ({ id: l.id, date: l.shown_at, created_at: l.created_at, business: l.business || '', tenant_id: l.tenant_id, payment_id: l.payment_id, type: l.type, amount_cents: l.amount_cents, status: l.status, available_at: l.available_at, share_bp: l.share_bp, note: l.note || '', payout_id: l.payout_id, payout_method: l.payout_method || '', reference: l.payout_reference || '' })),
+      payouts: db.prepare('SELECT p.id, p.amount_cents, p.method, p.reference, p.paid_at, p.created_at, u.email AS created_by FROM affiliate_payouts p LEFT JOIN users u ON u.id = p.created_by WHERE p.affiliate_id = ? ORDER BY p.paid_at DESC, p.id DESC').all(a.id),
+      rates: db.prepare('SELECT share_bp, months, effective_at FROM affiliate_rates WHERE affiliate_id = ? ORDER BY effective_at DESC, id DESC').all(a.id),
+      payout_block: payoutBlock(a, row.available_cents), min_payout_cents: AFF.MIN_PAYOUT_CENTS, methods: AFF.PAYOUT_METHODS,
+    };
+  }
+
+  // Input checks for the super admin forms.
+  function cleanShare(v) {
+    const n = Number(v);
+    if (v === '' || v == null || !Number.isInteger(n) || n < 0 || n > 10000) throw new HttpError(400, 'Enter a share between 0% and 100%, like 20.');
+    return n;
+  }
+  function cleanMonths(v) {
+    if (v === null || v === undefined || String(v).trim() === '') return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > 600) throw new HttpError(400, 'Enter a whole number of months, like 12. Leave it empty for as long as they stay.');
+    return n;
+  }
+  function cleanCode(v, selfId = 0) {
+    const c = AFF.normalizeCode(v);
+    if (!AFF.CODE_RE.test(c)) throw new HttpError(400, 'Use 3 to 40 lowercase letters, numbers or dashes for the code, like mike-stevens.');
+    if (db.prepare('SELECT 1 FROM affiliates WHERE code = ? AND id != ?').get(c, selfId)) throw new HttpError(409, 'Another affiliate already uses that code. Try a different one.');
+    return c;
+  }
+  function uniqueCode(base) {
+    let c = base, i = 2;
+    while (db.prepare('SELECT 1 FROM affiliates WHERE code = ?').get(c)) { const s = `-${i++}`; c = base.slice(0, 40 - s.length).replace(/-+$/, '') + s; }
+    return c;
+  }
+  // A past or present date typed as YYYY-MM-DD.
+  function pastDay(v, label) {
+    const s = String(v ?? '').trim();
+    if (!s) return '';
+    const d = new Date(s + 'T00:00:00Z');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) throw new HttpError(400, `Enter the ${label} as a date, like 2026-11-02.`);
+    if (s > now().slice(0, 10)) throw new HttpError(400, `The ${label} can’t be in the future. Pick today or an earlier day.`);
+    return s;
+  }
+
+  // Link clicks: daily counts, plus a keyed hash of the IP kept only for the current day (unique visitors).
+  const pruneClickVisitors = () => db.prepare('DELETE FROM affiliate_click_visitors WHERE day < ?').run(now().slice(0, 10));
+  pruneClickVisitors();
+  setInterval(() => { try { pruneClickVisitors(); sweepAffiliateLedger(); } catch { /* database closed */ } }, 3600_000).unref();
+  function recordClick(affId, ip) {
+    const day = now().slice(0, 10);
+    const hash = crypto.createHmac('sha256', secret).update(`affiliate-click|${day}|${ip}`).digest('hex').slice(0, 32);
+    pruneClickVisitors();
+    const fresh = db.prepare('INSERT OR IGNORE INTO affiliate_click_visitors (affiliate_id, day, ip_hash) VALUES (?,?,?)').run(affId, day, hash).changes;
+    db.prepare(`INSERT INTO affiliate_clicks (affiliate_id, day, clicks, uniques) VALUES (?, ?, 1, ?)
+      ON CONFLICT (affiliate_id, day) DO UPDATE SET clicks = clicks + 1, uniques = uniques + excluded.uniques`).run(affId, day, fresh ? 1 : 0);
+  }
+  // GET /a/<code>: count the click, remember the code for 90 days (first click wins), go to the landing page.
+  function affiliateClick(req, res, raw) {
+    const a = liveAffiliate(raw);
+    if (!a) { res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' }); return res.end(); }
+    const headers = { Location: `/?ref=${a.code}`, 'Cache-Control': 'no-store' };
+    if (!liveAffiliate(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE))) {
+      const secure = baseUrl(req).startsWith('https') ? '; Secure' : '';
+      headers['Set-Cookie'] = `${AFF.REF_COOKIE}=${a.code}; Max-Age=${AFF.REF_COOKIE_DAYS * 86400}; Path=/; SameSite=Lax; HttpOnly${secure}`;
+    }
+    const ip = clientIp(req);
+    if (req.method === 'GET' && !AFF.isBot(req.headers['user-agent']) && !limited('aff-click:' + ip, AFF.CLICKS_PER_IP_HOUR, 3600_000)) recordClick(a.id, ip);
+    res.writeHead(302, headers);
+    res.end();
+  }
+
+  // Sign-up credit: a code typed on the form wins, then the link cookie. An affiliate can't refer itself.
+  function selfReferral(a, { email, phone }) {
+    const t = getTenant(a.tenant_id);
+    if (!t) return false;
+    const emails = new Set(db.prepare('SELECT email FROM users WHERE tenant_id = ?').all(t.id).map((u) => normEmail(u.email)));
+    if (t.email) emails.add(normEmail(t.email));
+    if (email && emails.has(normEmail(email))) return true;
+    const k = phoneKey(phone);
+    return Boolean(k && [t.phone, t.notify_phone].some((x) => phoneKey(x) === k));
+  }
+  function signupReferral(req, b, who) {
+    const typed = AFF.normalizeCode(b.referral_code);
+    const fromCookie = AFF.normalizeCode(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE));
+    if (typed) {
+      const a = liveAffiliate(typed);
+      if (!a) throw new HttpError(400, 'We don’t recognize that referral code. Check it, or leave the box empty.');
+      if (selfReferral(a, who)) throw new HttpError(400, 'You can’t use your own referral code. Leave the box empty to continue.');
+      return { affiliate: a, how: typed === fromCookie ? 'link' : 'code' };
+    }
+    const a = liveAffiliate(fromCookie);
+    return a && !selfReferral(a, who) ? { affiliate: a, how: 'link' } : null;
+  }
+  // Super admin adding a business with a referral code (for owners an affiliate signs up in person).
+  function adminReferralCode(code) {
+    if (!AFF.normalizeCode(code)) return null;
+    const a = affiliateByCode(code);
+    if (!a) throw new HttpError(400, 'No affiliate has that referral code. Check it on the Affiliates page, or leave it empty.');
+    return a;
+  }
+  const setReferral = (tid, affId, how, at = now()) => db.prepare('UPDATE tenants SET referred_by_affiliate_id = ?, referred_at = ?, referred_how = ? WHERE id = ?')
+    .run(affId || null, affId ? at : null, affId ? how : null, tid);
+
+  // Sign-up form: who referred this visitor (the link cookie first, then ?ref / a code being checked).
+  route('GET', '/api/public/referral', async (req, res, p, url) => {
+    if (limited('ref-lookup:' + clientIp(req), 120, 3600_000)) throw new HttpError(429, 'Too many requests. Try again in a few minutes.');
+    const a = liveAffiliate(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE)) || liveAffiliate(url.searchParams.get('code'));
+    send(res, 200, a ? { code: a.code, name: getTenant(a.tenant_id).name } : { code: null });
+  });
+
+  // The business owner's referral page.
+  const ownAffiliate = ({ tenant: t, user, isSuper }) => {
+    if (!isSuper && user.role !== 'owner') throw new HttpError(403, 'Only the business owner can see the referral program.');
+    return affiliateOfTenant(t.id);
+  };
+  route('GET', '/api/affiliate', async (req, res, p, url, ctx) => {
+    const a = ownAffiliate(ctx);
+    send(res, 200, a ? ownerAffiliate(req, a) : { affiliate: null });
+  }, { auth: 'tenant' });
+  route('POST', '/api/affiliate/terms', async (req, res, p, url, ctx) => {
+    if (ctx.isSuper) throw new HttpError(403, 'Only the business owner can accept the Affiliate Program Terms.');
+    const a = ownAffiliate(ctx);
+    if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.');
+    const ts = now();
+    db.prepare('UPDATE affiliates SET terms_accepted_at = ?, terms_version = ?, updated_at = ? WHERE id = ?').run(ts, AFF.AFFILIATE_TERMS_VERSION, ts, a.id);
+    db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(ctx.user.id, ctx.tenant.id, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+    send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
+  }, { auth: 'tenant' });
+  route('GET', '/api/affiliate/ledger.csv', async (req, res, p, url, ctx) => {
+    const a = ownAffiliate(ctx);
+    if (!a) throw new HttpError(404, 'Not found');
+    sweepAffiliateLedger();
+    const method = { ach: 'ACH', check: 'check', stripe: 'Stripe', other: 'other' };
+    const what = (l) => ({
+      earning: `Your share of ${platformName}’s fee`, reversal: `Taken back: ${(l.note || 'correction').toLowerCase()}`, adjustment: `Adjustment${l.note ? ': ' + l.note : ''}`,
+      payout: `Paid to you by ${method[l.method] || 'payout'}${l.reference ? ` (${l.reference})` : ''}`,
+    }[l.type] || l.type);
+    const rows = ledgerOf(a.id).map(ownerLedgerRow).map((l) => AFF.csvLine([(l.date || '').slice(0, 10), l.business, what(l), { usd: l.amount_cents }, l.status, (l.available_at || '').slice(0, 10)]));
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="referral-earnings.csv"', 'Cache-Control': 'no-store' });
+    res.end([AFF.csvLine(['Date', 'Business', 'What it is', 'Amount', 'Status', 'Available on']), ...rows].join('\n') + '\n');
+  }, { auth: 'tenant' });
+
+  // Super admin: affiliates, referrals, payouts.
+  route('GET', '/api/super/affiliates', async (req, res) => {
+    sweepAffiliateLedger();
+    const affiliates = db.prepare('SELECT a.* FROM affiliates a JOIN tenants t ON t.id = a.tenant_id ORDER BY t.name COLLATE NOCASE').all().map(superAffiliateRow);
+    const businesses = db.prepare('SELECT id, name, slug FROM tenants WHERE id NOT IN (SELECT tenant_id FROM affiliates) ORDER BY name COLLATE NOCASE').all();
+    const years = db.prepare(`SELECT DISTINCT substr(paid_at, 1, 4) AS y FROM affiliate_payouts ORDER BY y DESC`).all().map((r) => r.y);
+    send(res, 200, { affiliates, businesses, years: [...new Set([now().slice(0, 4), ...years])], min_payout_cents: AFF.MIN_PAYOUT_CENTS });
+  }, { auth: 'super' });
+  route('POST', '/api/super/affiliates', async (req, res) => {
+    const b = await json(req);
+    const t = getTenant(Number(b.tenant_id));
+    if (!t) throw new HttpError(400, 'Pick the business to make an affiliate.');
+    if (affiliateOfTenant(t.id)) throw new HttpError(409, 'That business is already an affiliate. Open it from the list to make changes.');
+    const share = cleanShare(b.share_bp), months = cleanMonths(b.months);
+    const code = AFF.normalizeCode(b.code) ? cleanCode(b.code) : uniqueCode(AFF.codeFromSlug(t.slug));
+    const ts = now();
+    const r = db.prepare('INSERT INTO affiliates (tenant_id, code, share_bp, months, created_at, updated_at) VALUES (?,?,?,?,?,?)').run(t.id, code, share, months, ts, ts);
+    const a = getAffiliate(Number(r.lastInsertRowid));
+    logRate(a);
+    send(res, 201, superAffiliateDetail(req, a));
+  }, { auth: 'super' });
+  route('GET', '/api/super/affiliate-payouts.csv', async (req, res, p, url) => {
+    const year = /^\d{4}$/.test(url.searchParams.get('year') || '') ? url.searchParams.get('year') : now().slice(0, 4);
+    const rows = db.prepare(`SELECT a.code, a.w9_on_file, a.w9_on_file_at, t.name, t.legal_profile,
+        (SELECT email FROM users u WHERE u.tenant_id = t.id AND u.role = 'owner' ORDER BY u.id LIMIT 1) AS owner_email,
+        COUNT(p.id) AS payouts, SUM(p.amount_cents) AS total
+      FROM affiliate_payouts p JOIN affiliates a ON a.id = p.affiliate_id JOIN tenants t ON t.id = a.tenant_id
+      WHERE substr(p.paid_at, 1, 4) = ? GROUP BY a.id ORDER BY t.name COLLATE NOCASE`).all(year);
+    const lines = rows.map((r) => {
+      const lp = customerTerms.parseProfile(r.legal_profile) || {};
+      const address = [lp.addressLine1, lp.addressLine2, lp.city, [lp.state, lp.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+      return AFF.csvLine([year, r.name, lp.legalName || '', address, r.owner_email || '', r.code, r.w9_on_file ? `yes (${(r.w9_on_file_at || '').slice(0, 10)})` : 'no', String(r.payouts), { usd: r.total }]);
+    });
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="affiliate-payouts-${year}.csv"`, 'Cache-Control': 'no-store' });
+    res.end([AFF.csvLine(['Year', 'Business', 'Legal name', 'Address on file', 'Owner email', 'Affiliate code', 'W-9 on file', 'Payouts', 'Total paid']), ...lines].join('\n') + '\n');
+  }, { auth: 'super' });
+  route('GET', '/api/super/affiliates/:id', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    send(res, 200, superAffiliateDetail(req, a));
+  }, { auth: 'super' });
+  route('PATCH', '/api/super/affiliates/:id', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const code = b.code !== undefined ? cleanCode(b.code, a.id) : a.code;
+    const share = b.share_bp !== undefined ? cleanShare(b.share_bp) : a.share_bp;
+    const months = b.months !== undefined ? cleanMonths(b.months) : a.months;
+    const status = ['active', 'paused'].includes(b.status) ? b.status : a.status;
+    const w9 = b.w9_on_file !== undefined ? (b.w9_on_file ? 1 : 0) : a.w9_on_file;
+    const w9Day = w9 && b.w9_date !== undefined ? pastDay(b.w9_date, 'W-9 date') : '';
+    const w9At = !w9 ? null : w9Day ? `${w9Day} 00:00:00` : a.w9_on_file_at || now();
+    db.prepare('UPDATE affiliates SET code = ?, share_bp = ?, months = ?, status = ?, w9_on_file = ?, w9_on_file_at = ?, updated_at = ? WHERE id = ?').run(code, share, months, status, w9, w9At, now(), a.id);
+    if (share !== a.share_bp || months !== a.months) logRate(getAffiliate(a.id));
+    send(res, 200, superAffiliateDetail(req, getAffiliate(a.id)));
+  }, { auth: 'super' });
+  // Record a payout of the whole available balance (paid outside the app: ACH, check, Stripe or other).
+  route('POST', '/api/super/affiliates/:id/payouts', async (req, res, p, url, ctx) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    if (!AFF.PAYOUT_METHODS.includes(b.method)) throw new HttpError(400, 'Choose how you paid them: ACH, check, Stripe or other.');
+    const day = pastDay(b.paid_on, 'payout date');
+    const paidAt = day ? `${day} 12:00:00` : now();
+    sweepAffiliateLedger();
+    const available = affiliateTotals(a.id).available_cents;
+    const blocked = payoutBlock(a, available);
+    if (blocked) throw new HttpError(409, blocked);
+    // Synchronous from here: nothing else can touch the ledger between the total and the update.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const pid = Number(db.prepare('INSERT INTO affiliate_payouts (affiliate_id, amount_cents, method, reference, paid_at, created_by) VALUES (?,?,?,?,?,?)').run(a.id, available, b.method, clean(b.reference, 120) || null, paidAt, ctx.user.id).lastInsertRowid);
+      const marked = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS s FROM affiliate_ledger WHERE affiliate_id = ? AND status = 'available' AND type != 'payout'`).get(a.id).s;
+      if (marked !== available) throw new Error('Affiliate balance changed while recording the payout');
+      db.prepare(`UPDATE affiliate_ledger SET status = 'paid', payout_id = ? WHERE affiliate_id = ? AND status = 'available' AND type != 'payout'`).run(pid, a.id);
+      db.prepare(`INSERT INTO affiliate_ledger (affiliate_id, type, amount_cents, status, available_at, payout_id, note, created_at) VALUES (?, 'payout', ?, 'paid', ?, ?, ?, ?)`).run(a.id, -available, paidAt, pid, clean(b.reference, 120) || null, now());
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+    send(res, 201, superAffiliateDetail(req, getAffiliate(a.id)));
+  }, { auth: 'super' });
+  // A manual credit (+) or debit (-), available right away. The affiliate sees the note.
+  route('POST', '/api/super/affiliates/:id/adjustments', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const amount = Number(b.amount_cents), note = clean(b.note, 300);
+    if (!Number.isInteger(amount) || amount === 0 || Math.abs(amount) > 10_000_000) throw new HttpError(400, 'Enter an amount, like 10.00 to add or -10.00 to take away.');
+    if (note.length < 3) throw new HttpError(400, 'Add a short note. The affiliate sees it.');
+    const ts = now();
+    db.prepare(`INSERT INTO affiliate_ledger (affiliate_id, type, amount_cents, status, available_at, note, created_at) VALUES (?, 'adjustment', ?, 'available', ?, ?, ?)`).run(a.id, amount, ts, note, ts);
+    send(res, 201, superAffiliateDetail(req, a));
+  }, { auth: 'super' });
+
+  // Super admin: who referred a business. Changing it recalculates that business's earnings.
+  function tenantReferral(t) {
+    const a = t.referred_by_affiliate_id ? getAffiliate(t.referred_by_affiliate_id) : null;
+    return {
+      referred_by: a ? { id: a.id, code: a.code, name: getTenant(a.tenant_id)?.name || '' } : null,
+      referred_at: t.referred_at, how: t.referred_how, joined: t.created_at, own_affiliate_id: affiliateOfTenant(t.id)?.id ?? null,
+      affiliates: db.prepare('SELECT a.id, a.code, a.status, t.name FROM affiliates a JOIN tenants t ON t.id = a.tenant_id WHERE a.tenant_id != ? ORDER BY t.name COLLATE NOCASE').all(t.id),
+    };
+  }
+  route('GET', '/api/super/tenants/:id/referral', async (req, res, p) => {
+    const t = getTenant(p.id); if (!t) throw new HttpError(404, 'Not found');
+    send(res, 200, tenantReferral(t));
+  }, { auth: 'super' });
+  route('PUT', '/api/super/tenants/:id/referral', async (req, res, p) => {
+    const t = getTenant(p.id); if (!t) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const affId = Number(b.affiliate_id) || null;
+    if (affId) {
+      const a = getAffiliate(affId);
+      if (!a) throw new HttpError(404, 'That affiliate doesn’t exist. Reload the page and pick again.');
+      if (a.tenant_id === t.id) throw new HttpError(400, 'A business can’t refer itself. Pick a different affiliate.');
+      // Payments from this day on count (never before the business signed up).
+      const day = pastDay(b.from, 'start date');
+      const at = day ? (`${day} 00:00:00` < t.created_at ? t.created_at : `${day} 00:00:00`) : now();
+      if (affId !== t.referred_by_affiliate_id || day) setReferral(t.id, affId, 'admin', at);
+    } else setReferral(t.id, null);
+    resyncTenantLedger(t.id);
+    send(res, 200, tenantReferral(getTenant(t.id)));
+  }, { auth: 'super' });
+
   // Team
   route('GET', '/api/team', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, db.prepare('SELECT id, name, email, role, last_login_at, created_at FROM users WHERE tenant_id = ? ORDER BY id').all(t.id));
@@ -1246,8 +1651,10 @@ export function createApp(env = process.env) {
     const business = clean(b.business_name, 120), email = clean(b.owner_email, 200).toLowerCase();
     if (!business || !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Business name and owner email are required.');
     if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) throw new HttpError(409, 'That email already has an account.');
+    const ref = adminReferralCode(b.referral_code);
     const t = db.prepare(`INSERT INTO tenants (slug, name, email, phone, notify_phone) VALUES (?,?,?,?,?)`).run(uniqueSlug(business), business, email, clean(b.phone, 40), clean(b.phone, 40));
     const tid = Number(t.lastInsertRowid);
+    if (ref) setReferral(tid, ref.id, 'admin');
     const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role) VALUES (?,?,?,?, 'owner')`).run(tid, email, clean(b.owner_name, 120), hashPassword(randomToken(24)));
     const tok = randomToken(24);
     db.prepare('INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?,?,?)').run(sha256(tok), Number(u.lastInsertRowid), Date.now() + 7 * 864e5);
@@ -1475,6 +1882,10 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders });
         return res.end(renderReceipt({ t, pay, quote: q, items, totals: q ? quoteTotals(q, items) : null, proposalUrl: q ? `/p/${q.token}` : '' }));
       }
+      // Affiliate referral links, sign-up links that carry a code, and the Affiliate Program Terms.
+      if ((um = /^\/a\/([^/]{1,80})\/?$/.exec(pathname))) return affiliateClick(req, res, um[1]);
+      if (pathname === '/signup' && AFF.CODE_RE.test(AFF.normalizeCode(url.searchParams.get('ref')))) { res.writeHead(302, { Location: `/admin/?ref=${AFF.normalizeCode(url.searchParams.get('ref'))}#/signup`, 'Cache-Control': 'no-store' }); return res.end(); }
+      if (pathname === '/legal/affiliate-terms' && serveFile(res, 'legal/affiliate-terms.html')) return;
 
       const host = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
       // Send www.<platform domain> to the bare domain so search engines see one site.

@@ -87,7 +87,7 @@
     const tenantMode = Boolean(me.tenant);
     const items = tenantMode
       ? [['requests', 'Requests', 'requests'], ['quotes', 'Quotes', 'quotes'], ['products', 'Products', 'products'], ['business', 'Business', 'business'], ['settings', 'Settings', 'settings']]
-      : [['super', 'Businesses', 'grid'], ['leads', 'Leads', 'requests'], ['platform', 'Platform', 'settings']];
+      : [['super', 'Businesses', 'grid'], ['leads', 'Leads', 'requests'], ['affiliates', 'Affiliates', 'share'], ['platform', 'Platform', 'settings']];
     const badge = (k) => (k === 'requests' ? '<span class="badge" data-newcount hidden></span>' : '');
     document.getElementById('topnav').innerHTML = items.map(([k, l]) => `<a href="#/${k}" data-nav="${k}">${l} ${badge(k)}</a>`).join('');
     const bn = document.getElementById('bottomnav');
@@ -137,6 +137,7 @@
           <div><label for="a-email">Email</label><input id="a-email" name="email" type="email" required autocomplete="email"></div>
           <div><label for="a-phone">Mobile phone (for request alerts)</label><input id="a-phone" name="phone" type="tel" autocomplete="tel"></div>
           <div><label for="a-pw">Password (10+ characters)</label><input id="a-pw" name="password" type="password" minlength="10" required autocomplete="new-password"></div>
+          <div><label for="a-ref">Referral code (optional)</label><input id="a-ref" name="referral_code" maxlength="40" autocomplete="off" autocapitalize="none" spellcheck="false"><p class="small muted" id="a-ref-note" hidden></p></div>
           <label class="check"><input type="checkbox" name="agree" required> <span>I agree to the ${LEGAL}, including the Processing Fee on online payments (Stripe’s fee, billed by Stripe, plus ${PLATFORM}’s 3%). My business is the seller and merchant of record for its own sales.</span></label>
           <p class="alert err" id="a-err" hidden></p>
           <button class="btn primary block" type="submit">Create account</button>
@@ -176,6 +177,7 @@
     }
     const f = document.getElementById('af');
     const err = document.getElementById('a-err');
+    if (mode === 'signup') prefillReferral();
     (f.querySelector('input') || {}).focus?.();
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -753,6 +755,7 @@
         <div class="list">${team.map((u) => `<div class="row between" style="padding:12px 14px;border-bottom:1px solid var(--line)"><div><strong>${esc(u.name || u.email)}</strong> <span class="tag">${u.role === 'owner' ? 'Owner' : 'Staff'}</span><div class="small muted">${esc(u.email)}${u.last_login_at ? ' · last in ' + when(u.last_login_at) : ''}</div></div>${u.role === 'staff' && isOwner() ? `<button class="btn ghost sm" type="button" data-rm="${u.id}">Remove</button>` : ''}</div>`).join('')}</div>
         ${isOwner() ? `<form class="stack" id="tf"><h3>Add a team member</h3><div class="grid2"><div><label for="t-name">Name</label><input id="t-name" name="name"></div><div><label for="t-email">Email</label><input id="t-email" name="email" type="email" required></div><div><label for="t-pw">Temporary password</label><input id="t-pw" name="password" minlength="10" required></div></div><p class="alert" id="t-msg" hidden></p><button class="btn" type="submit">Add team member</button></form>` : ''}
       </section>`;
+    if (isOwner()) affiliateCard();
     const f = document.getElementById('bf'), msg = document.getElementById('b-msg');
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1001,6 +1004,307 @@
         flash(dm, 'Uploaded. It’s on your website now.');
       } catch (err) { flash(dm, err.message, 'err'); }
       up.disabled = false; up.textContent = 'Upload PDF';
+    });
+  }
+
+  // ---------- affiliates (referral revenue share) ----------
+  ICON.share = '<circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>';
+  // Dates are kept in UTC on the server (holds and click days count in UTC), so they're shown in UTC too.
+  const affDate = (s) => (s ? new Date(String(s).replace(' ', 'T') + (/Z$/.test(s) ? '' : 'Z')).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }) : '');
+  const todayIso = () => new Date().toISOString().slice(0, 10);
+  const smoney = (c) => (c < 0 ? '-' : '') + money(Math.abs(c || 0));
+  const signedCents = (v) => { const n = Math.round(parseFloat(String(v).replace(/[^0-9.-]/g, '')) * 100); return Number.isFinite(n) ? n : 0; };
+  const shareLine = (a, lead = 'You earn') => `${lead} ${pct(a.share_bp)} of the fee ${PLATFORM} keeps on card payments from each business you refer, ${a.months ? `for ${a.months} month${a.months === 1 ? '' : 's'} after it signs up` : `for as long as it uses ${PLATFORM}`}.`;
+  const affStat = (label, value, sub = '') => `<section class="card"><p class="muted small">${label}</p><p class="big-num">${value}</p>${sub ? `<p class="small muted">${sub}</p>` : ''}</section>`;
+  // A table that becomes stacked rows on phones. cols: [label, className?]; rows: arrays of cell HTML.
+  const affTable = (cols, rows, empty) => rows.length
+    ? `<table class="items stack-sm"><thead><tr>${cols.map(([l, c]) => `<th scope="col"${c ? ` class="${c}"` : ''}>${l}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((cell, i) => `<td data-label="${esc(cols[i][0])}"${cols[i][1] ? ` class="${cols[i][1]}"` : ''}><div>${cell}</div></td>`).join('')}</tr>`).join('')}</tbody></table>`
+    : `<p class="small muted">${empty}</p>`;
+  const REF_STATE = { taking_payments: '<span class="tag paid">Taking payments</span>', setting_up: '<span class="tag">Setting up</span>', inactive: '<span class="tag void">Not active</span>' };
+  const PAY_METHOD = { ach: 'ACH', check: 'check', stripe: 'Stripe', other: 'other' };
+  const ledgerWhat = (l) => ({
+    earning: `Your share of ${PLATFORM}’s fee`,
+    reversal: `Taken back: ${(l.note || 'correction').toLowerCase()}`,
+    adjustment: `Adjustment${l.note ? ': ' + l.note : ''}`,
+    payout: `Paid to you by ${PAY_METHOD[l.method || l.payout_method] || 'payout'}${l.reference ? ` (${l.reference})` : ''}`,
+  }[l.type] || l.type);
+  const ledgerStatus = (l) => (l.type === 'payout' ? '<span class="tag">Paid out</span>'
+    : l.status === 'paid' ? '<span class="tag">Paid</span>'
+      : l.status === 'available' ? '<span class="tag paid">Available</span>'
+        : `<span class="tag">Pending</span><div class="small muted">until ${esc(affDate(l.available_at))}</div>`);
+
+  // Sign-up form: fill in the referral code from the link cookie or ?ref.
+  async function prefillReferral() {
+    const box = document.getElementById('a-ref'), note = document.getElementById('a-ref-note');
+    if (!box) return;
+    box.addEventListener('input', () => { note.hidden = true; });
+    const q = new URLSearchParams(location.search).get('ref') || '';
+    const d = await api('/api/public/referral' + (q ? '?code=' + encodeURIComponent(q) : ''), { quiet: true }).catch(() => null);
+    if (!d || !d.code || box.value) return;
+    box.value = d.code;
+    note.textContent = `Referred by ${d.name}`; note.hidden = false;
+  }
+
+  // Business page: a card for businesses in the referral program.
+  async function affiliateCard() {
+    const d = await api('/api/affiliate', { quiet: true }).catch(() => null);
+    const h1 = view.querySelector('h1');
+    if (!d || !d.affiliate || !h1 || !/^#\/business\b/.test(location.hash)) return;
+    h1.insertAdjacentHTML('afterend', `<section class="card stack"><h2>Refer businesses, earn a share</h2><p>${esc(shareLine(d.affiliate, 'Earn'))}</p><div><a class="btn primary" href="#/affiliate">${d.affiliate.link ? 'Open your referral page' : 'Get your referral link'}</a></div></section>`);
+  }
+
+  function affTermsCard(A, first) {
+    const body = isSuper() ? '<p class="small muted">Only the business owner can accept these terms.</p>' : `
+      <label class="check"><input type="checkbox" id="aff-agree"> <span>I have read and agree to the <a href="${esc(A.terms.url)}" target="_blank" rel="noopener">Affiliate Program Terms</a> for my business.</span></label>
+      <p class="alert err" id="aff-terms-err" hidden></p>
+      <div><button class="btn primary" type="button" id="aff-accept">${first ? 'Accept and get my link' : 'Accept the new terms'}</button></div>`;
+    return `<section class="card stack">
+      <h2>${first ? 'Before you start' : 'We updated the Affiliate Program Terms'}</h2>
+      ${first ? `<p>${esc(shareLine(A))}</p>
+      <ul class="stack small" style="margin:0;padding-left:20px;gap:4px">
+        <li>New earnings are held for ${A.hold_days} days in case of refunds.</li>
+        <li>We pay monthly once you have ${money(A.min_payout_cents)} or more and we have your W-9.</li>
+        <li>When you share your link, tell people you earn a share.</li>
+        <li>No spam texts or emails, and no ads on the ${PLATFORM} name.</li>
+      </ul>` : '<p>Please read and accept them to keep earning.</p>'}
+      ${body}
+    </section>`;
+  }
+  function wireTermsCard() {
+    const btn = document.getElementById('aff-accept');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const err = document.getElementById('aff-terms-err');
+      if (!document.getElementById('aff-agree').checked) return flash(err, 'Check the box to accept the terms.', 'err');
+      btn.disabled = true;
+      try { await api('/api/affiliate/terms', { method: 'POST', body: { agree: true } }); await affiliateView(); }
+      catch (e) { flash(err, e.message, 'err'); btn.disabled = false; }
+    });
+  }
+
+  // The business owner's referral page.
+  async function affiliateView() {
+    setNav('business');
+    const back = '<a href="#/business" class="small">← Business</a>';
+    if (!isOwner()) { view.innerHTML = `${back}<h1>Refer businesses, earn a share</h1><p class="muted">Only the business owner can see this page.</p>`; return; }
+    const d = await api('/api/affiliate');
+    const A = d.affiliate;
+    if (!A) { view.innerHTML = `${back}<h1>Refer businesses, earn a share</h1><section class="card stack"><p>Your business isn’t in the referral program yet. To ask about joining, email <a href="mailto:support@gethitchpoint.com">support@gethitchpoint.com</a>.</p></section>`; return; }
+    if (!A.link) { view.innerHTML = `${back}<h1>Refer businesses, earn a share</h1>${affTermsCard(A, true)}`; return wireTermsCard(); }
+    const fee = Math.round((50000 * A.platform_fee_bp) / 10000), cut = Math.floor((fee * A.share_bp) / 10000);
+    const line = `I use ${PLATFORM} to run my business. If you sign up with my link, I earn a share of ${PLATFORM}’s fee. It costs you nothing extra.`;
+    const T = d.totals;
+    view.innerHTML = `
+      ${back}
+      <h1>Refer businesses, earn a share</h1>
+      ${A.terms.needs_accept ? affTermsCard(A, false) : ''}
+      ${A.status === 'paused' ? '<p class="alert err">Your referral link is paused, so new sign-ups aren’t credited to you right now. Businesses you already referred still earn you a share. Questions? Email support@gethitchpoint.com.</p>' : ''}
+      <section class="card stack">
+        <h2>Your referral link</h2>
+        <div class="aff-link"><input readonly id="aff-url" value="${esc(A.link)}" aria-label="Your referral link"><button class="btn primary" type="button" id="aff-copy">Copy link</button></div>
+        <p>${esc(shareLine(A))}</p>
+        <p class="small muted">For example, on a $500.00 card payment ${PLATFORM} keeps ${money(fee)} and you earn ${money(cut)}. Businesses can also type your code, <code>${esc(A.code)}</code>, when they sign up.</p>
+      </section>
+      <section class="card stack">
+        <h2>Tell people you earn a share</h2>
+        <p>When you share your link, say that you get paid if they sign up. The law requires it, and it builds trust. You can copy this line:</p>
+        <blockquote class="aff-quote">${esc(line)}</blockquote>
+        <div><button class="btn ghost sm" type="button" id="aff-copy-line">Copy this line</button></div>
+        <p class="small muted">Only text or email people who asked to hear from you, and don’t buy ads on the ${PLATFORM} name. <a href="${esc(A.terms.url)}" target="_blank" rel="noopener">Affiliate Program Terms</a></p>
+      </section>
+      <div class="aff-stats">
+        ${affStat('Clicks, last 30 days', d.clicks.last_30_days.toLocaleString('en-US'))}
+        ${affStat('Clicks, all time', d.clicks.all_time.toLocaleString('en-US'))}
+        ${affStat('Pending', smoney(T.pending_cents))}
+        ${affStat('Available to be paid', smoney(T.available_cents))}
+        ${affStat('Paid to date', smoney(T.paid_cents))}
+      </div>
+      <p class="small muted">New earnings are pending for ${A.hold_days} days in case of refunds, then become available. We pay monthly once you have ${money(A.min_payout_cents)} or more available. ${A.w9_on_file ? 'We have your W-9.' : 'Before your first payout we need a W-9 from you. We’ll contact you to collect it safely.'}</p>
+      <section class="card stack">
+        <h2>Businesses you referred</h2>
+        ${affTable([['Business'], ['Joined', 'nowrap'], ['Status'], ['You’ve earned', 'num'], ['Share ends', 'nowrap']],
+          d.referrals.map((r) => [esc(r.name), esc(affDate(r.joined)), REF_STATE[r.state] || '', smoney(r.earned_cents), r.share_ends ? esc(affDate(r.share_ends)) : 'As long as they stay']),
+          'No businesses yet. Share your link to get started.')}
+      </section>
+      <section class="card stack">
+        <div class="row between"><h2>Earnings and payouts</h2>${d.ledger.length ? '<a class="btn ghost sm" href="/api/affiliate/ledger.csv">Download CSV</a>' : ''}</div>
+        ${affTable([['Date', 'nowrap'], ['Business'], ['What it is'], ['Amount', 'num'], ['Status']],
+          d.ledger.map((l) => [esc(affDate(l.date)), esc(l.business || ''), esc(ledgerWhat(l)), smoney(l.amount_cents), ledgerStatus(l)]),
+          'Nothing yet. You earn a share when a business you referred takes a card payment.')}
+      </section>`;
+    wireTermsCard();
+    document.getElementById('aff-copy').addEventListener('click', (e) => copy(A.link, e.currentTarget));
+    document.getElementById('aff-copy-line').addEventListener('click', (e) => copy(`${line} ${A.link}`, e.currentTarget));
+  }
+
+  // Super admin: who referred this business (tenant detail page).
+  async function referredByCard(tid) {
+    const d = await api(`/api/super/tenants/${tid}/referral`).catch(() => null);
+    const grid = view.querySelector('.grid2');
+    if (!d || !grid || document.getElementById('ref-card')) return;
+    const HOW = { link: 'their referral link', code: 'their code at sign-up', admin: 'an Agilities admin' };
+    const from = (d.referred_at || '').slice(0, 10);
+    grid.insertAdjacentHTML('afterend', `<section class="card stack" id="ref-card">
+      <h2>Referred by</h2>
+      ${d.referred_by ? `<p><strong>${esc(d.referred_by.name)}</strong> (code <code>${esc(d.referred_by.code)}</code>). Set by ${HOW[d.how] || 'unknown'}. Payments count from ${esc(affDate(d.referred_at))}.</p>` : '<p class="muted">No one. This business wasn’t referred.</p>'}
+      ${d.affiliates.length ? `<form class="stack" id="ref-form">
+        <div class="grid2">
+          <div><label for="rf-aff">Referrer</label><select id="rf-aff" name="affiliate_id"><option value="">No one</option>${d.affiliates.map((a) => `<option value="${a.id}" ${d.referred_by && d.referred_by.id === a.id ? 'selected' : ''}>${esc(a.name)} (${esc(a.code)})${a.status === 'paused' ? ', paused' : ''}</option>`).join('')}</select></div>
+          <div><label for="rf-from">Count payments from</label><input id="rf-from" name="from" type="date" min="${esc((d.joined || '').slice(0, 10))}" max="${todayIso()}" value="${esc(from || todayIso())}"></div>
+        </div>
+        <p class="small muted">Payments before this day earn the referrer nothing. Changing or removing the referrer takes back what the old referrer earned from this business.</p>
+        <p class="alert" id="rf-msg" hidden></p>
+        <div><button class="btn sm" type="submit">Save referrer</button></div>
+      </form>` : '<p class="small muted">No affiliates yet. Add one on the <a href="#/affiliates">Affiliates</a> page.</p>'}
+      ${d.own_affiliate_id ? `<p class="small">This business is an affiliate too. <a href="#/affiliates/${d.own_affiliate_id}">See its referrals and earnings</a>.</p>` : ''}
+    </section>`);
+    const f = document.getElementById('ref-form');
+    if (!f) return;
+    const startAff = f.elements.affiliate_id.value, startFrom = f.elements.from.value;
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const el = f.elements, affId = el.affiliate_id.value;
+      if (!affId && d.referred_by && !confirm(`Remove ${d.referred_by.name} as the referrer? This takes back what they earned from this business.`)) return;
+      const changed = affId !== startAff || el.from.value !== startFrom;
+      try {
+        await api(`/api/super/tenants/${tid}/referral`, { method: 'PUT', body: { affiliate_id: affId || null, from: changed && affId ? el.from.value : '' } });
+        document.getElementById('ref-card').remove(); await referredByCard(tid);
+        flash(document.getElementById('rf-msg'), 'Saved.');
+      } catch (err) { flash(document.getElementById('rf-msg'), err.message, 'err'); }
+    });
+  }
+
+  // Super admin: all affiliates, or one affiliate's settings, referrals, ledger and payouts.
+  async function superAffiliatesView(id) {
+    setNav('affiliates');
+    if (id) return superAffiliateView(id);
+    const d = await api('/api/super/affiliates');
+    const chips = (a) => `${a.status === 'active' ? '<span class="tag paid">Active</span>' : '<span class="tag new">Paused</span>'}${a.w9_on_file ? '<span class="tag">W-9 on file</span>' : '<span class="tag void">No W-9</span>'}${!a.terms_accepted_at ? '<span class="tag void">Terms not accepted</span>' : a.terms_current ? '' : '<span class="tag void">Old terms</span>'}`;
+    view.innerHTML = `
+      <div class="row between"><h1>Affiliates</h1>
+        <div class="row" style="gap:8px"><select id="aff-year" aria-label="Year for the 1099 export" style="width:auto">${d.years.map((y) => `<option>${esc(y)}</option>`).join('')}</select><a class="btn ghost sm" id="aff-1099" href="/api/super/affiliate-payouts.csv?year=${esc(d.years[0])}">Download payouts for 1099s</a></div></div>
+      <p class="muted">Affiliates earn a share of ${PLATFORM}’s fee on card payments from businesses they refer. New earnings are pending for 30 days, then available. Pay them by ACH or check, then record the payout on their page.</p>
+      <form class="card stack" id="aff-new">
+        <h2>Make a business an affiliate</h2>
+        <div class="grid2">
+          <div><label for="an-biz">Business</label><select id="an-biz" name="tenant_id" required><option value="">Choose a business…</option>${d.businesses.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></div>
+          <div><label for="an-share">Their share of ${PLATFORM}’s fee (%)</label><input id="an-share" name="share" inputmode="decimal" required placeholder="20"></div>
+          <div><label for="an-months">Months per referred business</label><input id="an-months" name="months" inputmode="numeric" placeholder="Empty: as long as they stay"></div>
+          <div><label for="an-code">Referral code</label><input id="an-code" name="code" autocapitalize="none" spellcheck="false" placeholder="Empty: their web address name"></div>
+        </div>
+        <p class="alert" id="an-msg" hidden></p>
+        <div><button class="btn primary" type="submit">Make affiliate</button></div>
+      </form>
+      <div class="list">${d.affiliates.map((a) => `
+        <a class="item aff-item" href="#/affiliates/${a.id}">
+          <div class="grow stack" style="gap:4px">
+            <div class="row" style="gap:8px"><span class="item-title">${esc(a.name)}</span>${chips(a)}</div>
+            <div class="small muted">Code ${esc(a.code)} · ${pct(a.share_bp)} ${a.months ? `for ${a.months} months` : 'while they stay'} · ${a.referrals} referred · ${a.clicks.clicks_30} clicks in 30 days</div>
+          </div>
+          <div class="stack aff-sum"><strong>${smoney(a.available_cents)}</strong><span class="small muted">available · ${smoney(a.pending_cents)} pending · ${smoney(a.paid_cents)} paid</span></div>
+        </a>`).join('') || '<p class="empty">No affiliates yet.</p>'}</div>`;
+    const yr = document.getElementById('aff-year');
+    yr.addEventListener('change', () => { document.getElementById('aff-1099').href = '/api/super/affiliate-payouts.csv?year=' + encodeURIComponent(yr.value); });
+    const f = document.getElementById('aff-new'), el = f.elements;
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        const r = await api('/api/super/affiliates', { method: 'POST', body: { tenant_id: Number(el.tenant_id.value), share_bp: el.share.value.trim() === '' ? '' : toCents(el.share.value), months: el.months.value.trim(), code: el.code.value } });
+        location.hash = '#/affiliates/' + r.affiliate.id;
+      } catch (err) { flash(document.getElementById('an-msg'), err.message, 'err'); }
+    });
+  }
+
+  async function superAffiliateView(id) {
+    const d = await api('/api/super/affiliates/' + id);
+    const a = d.affiliate;
+    const HOW = { link: 'Link', code: 'Code', admin: 'Admin' };
+    const opt = (v, l, cur) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`;
+    view.innerHTML = `
+      <a href="#/affiliates" class="small">← Affiliates</a>
+      <div class="row between"><h1>${esc(a.name)}</h1><a class="btn ghost sm" href="#/super/${a.tenant_id}">Open business</a></div>
+      <p class="small">Link: <a href="${esc(a.link)}" target="_blank" rel="noopener">${esc(a.link)}</a> · Owner: ${esc(a.owner_email)}</p>
+      ${!a.terms_accepted_at ? '<p class="alert err">They haven’t accepted the Affiliate Program Terms yet, so their link and code don’t work. Ask the owner to open Business → Refer businesses.</p>' : ''}
+      <p class="alert" id="ad-msg" hidden></p>
+      <div class="aff-stats">
+        ${affStat('Pending', smoney(a.pending_cents))}${affStat('Available', smoney(a.available_cents))}${affStat('Paid to date', smoney(a.paid_cents))}
+        ${affStat('Clicks, 30 days', a.clicks.clicks_30, `${a.clicks.uniques_30} daily visitors`)}${affStat('Clicks, all time', a.clicks.all_clicks, `${a.referrals} businesses referred`)}
+      </div>
+      <div class="grid2">
+        <form class="card stack" id="ad-form">
+          <h2>Settings</h2>
+          <div><label for="ad-code">Referral code</label><input id="ad-code" name="code" value="${esc(a.code)}" autocapitalize="none" spellcheck="false"><p class="small muted">Changing the code stops old links and saved codes from working.</p></div>
+          <div class="grid2">
+            <div><label for="ad-share">Share of ${PLATFORM}’s fee (%)</label><input id="ad-share" name="share" inputmode="decimal" value="${a.share_bp / 100}"></div>
+            <div><label for="ad-months">Months per referred business</label><input id="ad-months" name="months" inputmode="numeric" value="${a.months == null ? '' : a.months}" placeholder="Empty: as long as they stay"></div>
+          </div>
+          <p class="small muted">Changes apply to payments from now on. Earlier earnings keep the share they had.</p>
+          <div><label for="ad-status">Status</label><select id="ad-status" name="status">${opt('active', 'Active', a.status)}${opt('paused', 'Paused: link and code stop working for new sign-ups', a.status)}</select></div>
+          <label class="check"><input type="checkbox" name="w9" ${a.w9_on_file ? 'checked' : ''}> <span>W-9 on file</span></label>
+          <div style="max-width:260px"><label for="ad-w9">W-9 received on</label><input id="ad-w9" name="w9_date" type="date" max="${todayIso()}" value="${esc((a.w9_on_file_at || '').slice(0, 10))}"></div>
+          <p class="small muted">${a.terms_accepted_at ? `Accepted the Affiliate Program Terms (version ${esc(a.terms_version)}) on ${esc(affDate(a.terms_accepted_at))}.` : 'Hasn’t accepted the Affiliate Program Terms.'}</p>
+          <div><button class="btn primary" type="submit">Save</button></div>
+        </form>
+        <section class="card stack">
+          <h2>Record a payout</h2>
+          ${d.payout_block ? `<p class="alert err">${esc(d.payout_block)}</p>` : `<p>Pay them ${smoney(a.available_cents)} by ACH, check or Stripe first. Then record it here, and those earnings are marked paid.</p>`}
+          <form class="stack" id="ad-pay" ${d.payout_block ? 'hidden' : ''}>
+            <div class="grid2">
+              <div><label for="ap-method">How you paid</label><select id="ap-method" name="method">${d.methods.map((m) => `<option value="${m}">${{ ach: 'ACH', check: 'Check', stripe: 'Stripe', other: 'Other' }[m] || esc(m)}</option>`).join('')}</select></div>
+              <div><label for="ap-date">Date paid</label><input id="ap-date" name="paid_on" type="date" max="${todayIso()}" value="${todayIso()}"></div>
+            </div>
+            <div><label for="ap-ref">Reference</label><input id="ap-ref" name="reference" maxlength="120" placeholder="Check number or transfer ID"></div>
+            <div><button class="btn primary" type="submit">Record payout of ${smoney(a.available_cents)}</button></div>
+          </form>
+          <details><summary class="small" style="cursor:pointer;min-height:44px;display:flex;align-items:center">Add an adjustment</summary>
+            <form class="stack" id="ad-adj">
+              <div class="grid2"><div><label for="aj-amt">Amount ($)</label><input id="aj-amt" name="amount" inputmode="decimal" placeholder="10.00, or -10.00 to take away"></div><div><label for="aj-note">Note (they see it)</label><input id="aj-note" name="note" maxlength="300"></div></div>
+              <div><button class="btn sm" type="submit">Add adjustment</button></div>
+            </form>
+          </details>
+        </section>
+      </div>
+      <section class="card stack">
+        <h2>Businesses they referred</h2>
+        ${affTable([['Business'], ['Joined', 'nowrap'], ['How'], ['Counts from', 'nowrap'], ['Status'], ['Earned', 'num'], ['Share ends', 'nowrap']],
+          d.referrals.map((r) => [`<a href="#/super/${r.id}">${esc(r.name)}</a>`, esc(affDate(r.joined)), HOW[r.how] || '', esc(affDate(r.referred_at)), REF_STATE[r.state] || '', smoney(r.earned_cents), r.share_ends ? esc(affDate(r.share_ends)) : 'While they stay']),
+          'No referrals yet.')}
+      </section>
+      <section class="card stack">
+        <h2>Ledger</h2>
+        ${affTable([['Date', 'nowrap'], ['Business'], ['What it is'], ['Share'], ['Amount', 'num'], ['Status']],
+          d.ledger.map((l) => [esc(affDate(l.date)), esc(l.business), esc(ledgerWhat(l).replace(/^Your share/, 'Share').replace(/^Paid to you/, 'Paid')) + (l.payment_id ? `<div class="small muted">Payment #${l.payment_id}</div>` : ''), l.share_bp != null ? pct(l.share_bp) : '', smoney(l.amount_cents), ledgerStatus(l)]),
+          'No earnings yet.')}
+      </section>
+      <section class="card stack">
+        <h2>Payouts</h2>
+        ${affTable([['Date paid', 'nowrap'], ['Amount', 'num'], ['Method'], ['Reference'], ['Recorded by']],
+          d.payouts.map((p) => [esc(affDate(p.paid_at)), smoney(p.amount_cents), esc(PAY_METHOD[p.method] || p.method), esc(p.reference || ''), esc(p.created_by || '')]),
+          'No payouts yet.')}
+        <p class="small muted">Share history: ${d.rates.map((r) => `${pct(r.share_bp)} ${r.months ? `for ${r.months} months` : 'while they stay'} from ${esc(affDate(r.effective_at))}`).join('; ')}</p>
+      </section>`;
+    const msg = document.getElementById('ad-msg');
+    const done = async (text) => { await superAffiliateView(id); flash(document.getElementById('ad-msg'), text); };
+    const f = document.getElementById('ad-form'), el = f.elements;
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api('/api/super/affiliates/' + id, { method: 'PATCH', body: { code: el.code.value, share_bp: el.share.value.trim() === '' ? '' : toCents(el.share.value), months: el.months.value.trim(), status: el.status.value, w9_on_file: el.w9.checked, w9_date: el.w9_date.value } });
+        await done('Saved.');
+      } catch (err) { flash(msg, err.message, 'err'); }
+    });
+    const pf = document.getElementById('ad-pay');
+    pf.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!confirm(`Record a payout of ${smoney(a.available_cents)} to ${a.name}? Only do this after you’ve sent the money.`)) return;
+      try { await api(`/api/super/affiliates/${id}/payouts`, { method: 'POST', body: { method: pf.elements.method.value, reference: pf.elements.reference.value, paid_on: pf.elements.paid_on.value } }); await done('Payout recorded.'); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    });
+    const af = document.getElementById('ad-adj');
+    af.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try { await api(`/api/super/affiliates/${id}/adjustments`, { method: 'POST', body: { amount_cents: signedCents(af.elements.amount.value), note: af.elements.note.value } }); await done('Adjustment added.'); }
+      catch (err) { flash(msg, err.message, 'err'); }
     });
   }
 
@@ -1260,6 +1564,7 @@
         <h2>Add a business</h2>
         <p class="small muted">Creates the account and gives you a setup link to send the owner. Owners can also sign up themselves at <a href="/signup">${esc(location.origin)}/signup</a>.</p>
         <div class="grid2"><div><label for="nb-biz">Business name</label><input id="nb-biz" name="business_name" required></div><div><label for="nb-name">Owner name</label><input id="nb-name" name="owner_name"></div><div><label for="nb-email">Owner email</label><input id="nb-email" name="owner_email" type="email" required></div><div><label for="nb-phone">Owner mobile</label><input id="nb-phone" name="phone" type="tel"></div></div>
+        <div style="max-width:420px"><label for="nb-ref">Referral code (optional)</label><input id="nb-ref" name="referral_code" autocapitalize="none" spellcheck="false" placeholder="The affiliate who brought them in"></div>
         <p class="alert" id="nb-msg" hidden></p>
         <button class="btn primary" type="submit">Create business</button>
       </form>
@@ -1313,6 +1618,7 @@
         <h2>Payments</h2>
         ${d.payments.length ? `<div style="overflow-x:auto"><table class="items"><thead><tr><th>Date</th><th>For</th><th>Method</th><th class="num">Paid</th><th class="num">Stripe fee</th><th class="num">Platform</th><th class="num">To business</th><th>Status</th></tr></thead><tbody>${d.payments.map((p) => `<tr><td>${esc((p.paid_at || p.created_at).slice(0, 10))}${p.status === 'paid' ? '' : ' <span class="tag">' + esc(p.status) + '</span>'}</td><td>${esc(p.description)}</td><td>${esc(p.method)}</td><td class="num">${money(p.amount_cents)}</td><td class="num">${money(p.stripe_fee_cents)}</td><td class="num">${money(p.fee_cents)}</td><td class="num">${money(p.payout_cents)}</td><td>${p.method === 'card' && p.status === 'paid' ? `${esc(p.transfer_status || 'pending')}${p.transfer_error ? `<div class="small muted">${esc(p.transfer_error)}</div>` : ''}${!['sent', 'direct'].includes(p.transfer_status) ? ` <button class="btn ghost sm" type="button" data-settle="${p.id}">Retry</button>` : ''}` : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">No payments yet.</p>'}
       </section>`;
+    referredByCard(t.id);
     const msg = document.getElementById('st-msg');
     document.getElementById('open').addEventListener('click', async () => { await api('/api/super/view-as', { method: 'POST', body: { tenant_id: t.id } }); await loadMe(); location.hash = '#/requests'; route(); });
     const f = document.getElementById('tf'), el = f.elements;
@@ -1412,6 +1718,7 @@
         if (a === 'super' && b) await superTenantView(b);
         else if (a === 'platform') await platformView();
         else if (a === 'leads') await leadsView();
+        else if (a === 'affiliates') await superAffiliatesView(b);
         else await superView();
       } else if (a === 'requests' && b === 'new') newRequestView();
       else if (a === 'requests' && b) await requestView(b);
@@ -1424,6 +1731,7 @@
       else if (a === 'website') await websiteView();
       else if (a === 'settings') await settingsView(b);
       else if (a === 'terms') await termsView();
+      else if (a === 'affiliate') await affiliateView();
       else await requestsView();
       window.scrollTo(0, 0);
     } catch (err) {
