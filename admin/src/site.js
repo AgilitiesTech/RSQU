@@ -89,7 +89,7 @@ function businessSchema(t, profile, products, u, mediaAbs) {
   if (services.length) {
     o.hasOfferCatalog = {
       '@type': 'OfferCatalog', name: 'Services',
-      itemListElement: services.map((p) => ({ '@type': 'Offer', itemOffered: { '@type': 'Service', name: p.name, ...(p.description ? { description: clip(p.description, 300) } : {}) }, ...(p.bookable ? { price: (p.price_cents / 100).toFixed(2), priceCurrency: 'USD' } : {}) })),
+      itemListElement: services.map((p) => ({ '@type': 'Offer', itemOffered: { '@type': 'Service', name: p.name, ...(p.description ? { description: clip(p.description, 300) } : {}) }, ...(p.bookable && p.price_cents ? { price: (p.price_cents / 100).toFixed(2), priceCurrency: 'USD' } : {}) })),
     };
   }
   return o;
