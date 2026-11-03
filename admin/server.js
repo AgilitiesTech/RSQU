@@ -1842,7 +1842,10 @@ export function createApp(env = process.env) {
   function checkPayout(b = {}) {
     const method = ['ach', 'check'].includes(b.method) ? b.method : '';
     if (!method) throw new HttpError(400, 'Choose how you want to be paid: direct deposit or a mailed check.', 'payout_method');
-    return { method, bank: method === 'ach' ? formCheck(() => W9.checkBank(b.bank || {})) : null };
+    const bank = method === 'ach' ? formCheck(() => W9.checkBank(b.bank || {})) : null;
+    // NACHA: the account holder authorizes the deposits (kept as an agreements row; see savePayout).
+    if (method === 'ach' && !b.authorize) throw new HttpError(400, 'Check the box to authorize direct deposits to this account.', 'authorize');
+    return { method, bank };
   }
   const logSensitive = (req, user, affId, what) => db.prepare('INSERT INTO sensitive_access_log (user_id, user_email, affiliate_id, what, ip, ua, at) VALUES (?,?,?,?,?,?,?)')
     .run(user?.id ?? null, user?.email ?? null, affId, what, clientIp(req), clean(req.headers['user-agent'], 400), now());
@@ -1863,8 +1866,13 @@ export function createApp(env = process.env) {
     const box = pay.bank ? sealed.seal(JSON.stringify(pay.bank), bankContext(a.id)) : null;
     db.prepare('UPDATE affiliates SET payout_method = ?, payout_sealed = ?, payout_last4 = ?, payout_updated_at = ?, updated_at = ? WHERE id = ?')
       .run(pay.method, box, pay.bank ? pay.bank.account.slice(-4) : null, now(), now(), a.id);
+    if (pay.bank) recordAcceptance(req, user, a, 'ach-authorization', `${AFF.ACH_AUTH_VERSION}:x${pay.bank.account.slice(-4)}`);
     logSensitive(req, user, a.id, 'payout_changed');
   }
+  // Proof of what an affiliate agreed to, when, from where: the terms, the privacy policy, and
+  // direct deposit authorizations (with the account's last 4 digits).
+  const recordAcceptance = (req, user, a, doc, version) => db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)')
+    .run(user.id, a.tenant_id ?? null, doc, version, clientIp(req), clean(req.headers['user-agent'], 400));
   // What the affiliate (and the admin list) sees: never a full tax ID or bank number.
   function taxSummary(a) {
     const w = latestW9(a.id);
@@ -2055,10 +2063,11 @@ export function createApp(env = process.env) {
     const a = ownAffiliate(ctx);
     if (!a) throw new HttpError(404, 'Not found');
     const b = await json(req);
-    if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.');
+    if (!b.agree) throw new HttpError(400, 'Check the box to confirm you’re 18 or older and accept the Affiliate Program Terms and Privacy Policy.');
     const ts = now();
     db.prepare('UPDATE affiliates SET terms_accepted_at = ?, terms_version = ?, updated_at = ? WHERE id = ?').run(ts, AFF.AFFILIATE_TERMS_VERSION, ts, a.id);
-    db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(ctx.user.id, ctx.tenant?.id ?? null, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+    recordAcceptance(req, ctx.user, a, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION);
+    recordAcceptance(req, ctx.user, a, 'privacy', AGREEMENT_VERSION);
     send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
   }, { auth: 'affiliate' });
   route('GET', '/api/affiliate/ledger.csv', async (req, res, p, url, ctx) => {
@@ -2138,7 +2147,7 @@ export function createApp(env = process.env) {
   async function sendInvite(req, inv, token) {
     const link = inviteLink(req, token);
     const emailed = await notify.email(inv.email, `You’re invited to the ${platformName} referral program`,
-      `Hi,\n\n${platformName} helps mobile RV repair businesses run their jobs, quotes and payments. You’re invited to refer businesses to it and earn ${inv.share_bp / 100}% of the fee ${platformName} keeps on their card payments, ${shareSpan(inv.months)}.\n\n`
+      `Hi,\n\n${platformName} helps mobile RV repair businesses run their jobs, quotes and payments. You’re invited to refer businesses to it and earn ${inv.share_bp / 100}% of the fee ${platformName} keeps on their online payments (card or bank), ${shareSpan(inv.months)}.\n\n`
       + `Set up your account, fill out a W-9 tax form, and get your referral link here. It takes about 10 minutes:\n${link}\n\n`
       + `Have your Social Security number or EIN ready, and your bank’s routing and account numbers if you want direct deposit. The link works for ${INVITE_DAYS} days and is just for you.\n\nQuestions? Reply to this email.\n\n${platformName}`,
       { replyTo: platformEmail });
@@ -2239,7 +2248,7 @@ export function createApp(env = process.env) {
     if (!cc.code || !cc.ok) throw new HttpError(400, cc.message || 'Choose your link name.', 'code');
     const w = formCheck(() => W9.checkW9(b.w9 || {}));
     const pay = checkPayout(b.payout || {});
-    if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.', 'agree');
+    if (!b.agree) throw new HttpError(400, 'Check the box to confirm you’re 18 or older and accept the Affiliate Program Terms and Privacy Policy.', 'agree');
     if (acct.kind === 'business' && affiliateOfTenant(acct.tenant.id)) throw new HttpError(409, `${acct.tenant.name} is already in the referral program. Log in to see your link.`);
     let user = acct.user, a;
     const ts = now();
@@ -2257,14 +2266,15 @@ export function createApp(env = process.env) {
       a = getAffiliate(Number(r.lastInsertRowid));
       logRate(a);
       db.prepare('UPDATE affiliate_invites SET affiliate_id = ? WHERE id = ?').run(a.id, inv.id);
-      db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(user.id, isBiz ? acct.tenant.id : null, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+      recordAcceptance(req, user, a, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION);
+      recordAcceptance(req, user, a, 'privacy', AGREEMENT_VERSION);
       saveW9(req, a, w, user);
       savePayout(req, a, pay, user);
       db.exec('COMMIT');
     } catch (e) { db.exec('ROLLBACK'); throw e; }
     a = getAffiliate(a.id);
     const link = affiliateLink(req, a);
-    notify.email(inv.email, `Your ${platformName} referral link`, `You’re in. Here’s your referral link:\n${link}\n\nYou earn ${a.share_bp / 100}% of the fee ${platformName} keeps on card payments from each business that signs up through it, ${shareSpan(a.months)}. Businesses can also type your code, ${a.code}, when they sign up.\n\nWhen you share your link, say that you earn a share if they sign up.\n\nSee your clicks, referrals and earnings any time: ${siteOrigin(req)}/admin/\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(inv.email, `Your ${platformName} referral link`, `You’re in. Here’s your referral link:\n${link}\n\nYou earn ${a.share_bp / 100}% of the fee ${platformName} keeps on online payments (card or bank) from each business that signs up through it, ${shareSpan(a.months)}. Businesses can also type your code, ${a.code}, when they sign up.\n\nWhen you share your link, say that you earn a share if they sign up.\n\nSee your clicks, referrals and earnings any time: ${siteOrigin(req)}/admin/\n\n${platformName}`, { replyTo: platformEmail });
     notify.email(platformEmail, `New affiliate: ${affiliateName(a)}`, `${affiliateName(a)} <${inv.email}> accepted the invitation and joined the referral program (code ${a.code}, ${a.share_bp / 100}%${a.months ? `, ${a.months} months` : ''}). W-9 received; payouts by ${a.payout_method === 'ach' ? 'ACH' : 'check'}.\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
     send(res, 201, { link, code: a.code, name: affiliateName(a), share_bp: a.share_bp, months: a.months }, { 'Set-Cookie': cookie(req, sess.create(user.id), sess.maxAge) });
   });

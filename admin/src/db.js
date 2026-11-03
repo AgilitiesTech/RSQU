@@ -6,7 +6,8 @@ import path from 'node:path';
 // 2026-11-02.2: businesses become the merchant of record (direct charges on their own Stripe account).
 // 2026-11-02.3: Terms of Service say a referring business may get a share of HitchPoint's fees.
 // 2026-11-03.1: Privacy Policy covers affiliates' tax forms and bank details.
-export const AGREEMENT_VERSION = '2026-11-03.1';
+// 2026-11-03.2: Privacy Policy: how affiliates' phone numbers are used; tax IDs never sold or shown; secure disposal.
+export const AGREEMENT_VERSION = '2026-11-03.2';
 export const BUSINESS_AGREEMENTS = ['terms', 'privacy', 'payment-terms'];
 
 export function openDb(dataDir) {

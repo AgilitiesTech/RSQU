@@ -4,8 +4,11 @@
 
 // Bump when public/legal/affiliate-terms.html changes: affiliates are asked to accept again.
 // 2026-11-02.2: earnings are shown by month. 2026-11-03.1: people and groups can join by invitation;
-// W-9s and payout details are taken online and encrypted.
-export const AFFILIATE_TERMS_VERSION = '2026-11-03.1';
+// W-9s and payout details are taken online and encrypted. 2026-11-03.2: direct deposit authorization,
+// tax forms by mail, electronic records, account security.
+export const AFFILIATE_TERMS_VERSION = '2026-11-03.2';
+// The direct deposit authorization wording on the payout form (bump when it changes).
+export const ACH_AUTH_VERSION = '2026-11-03';
 
 export const CODE_RE = /^[a-z0-9-]{3,40}$/;
 export const HOLD_DAYS = 30; // earnings wait this long after the payment (refunds and disputes)
