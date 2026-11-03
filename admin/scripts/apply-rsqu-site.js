@@ -8,7 +8,7 @@
 //                                                                  business, else mike-stevens from seed-mike.js)
 //                       node scripts/apply-rsqu-site.js other-slug
 //                       node scripts/apply-rsqu-site.js --copy     (already moved: update only the
-//                                                                  service-area copy below)
+//                                                                  service-area copy and town pages below)
 //                       node scripts/apply-rsqu-site.js --force
 import fs from 'node:fs';
 import path from 'node:path';
@@ -82,12 +82,12 @@ function ensureWinter(sort) {
 // What the site says about where Mike works and what he works on: Northern Utah, by county, RVs and
 // trailers, repair and maintenance (for local and AI search). --copy updates only these on a site
 // that has already moved, leaving everything else Mike changed alone.
-const COUNTIES = 'Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties';
+const COUNTIES = 'Box Elder, Weber, Davis, Salt Lake, Morgan, Summit and Wasatch counties';
 const COPY = {
   hero_headline: 'Mobile RV and trailer repair in Northern Utah',
   tagline: `Mobile RV and trailer repair and maintenance in Northern Utah’s ${COUNTIES}. Mike Stevens comes to your campsite, storage lot, driveway or roadside, with the calm of 30 years in the fire service.`,
-  service_area: `Northern Utah: ${COUNTIES}. South Salt Lake to North Ogden, plus Park City, Heber Valley, Morgan and Ogden Valley`,
-  about: 'RSQU Mobile RV Service is Mike Stevens’s mobile repair and maintenance service for RVs and trailers across Northern Utah: motorhomes, travel trailers, fifth wheels, toy haulers, and cargo, utility, horse and boat trailers, whether they’re parked at home, at a campsite or broken down on the road. Mike covers Salt Lake, Davis, Weber, Morgan, Summit and Wasatch counties.\n\nMike has served 30 years as a firefighter in Salt Lake City, Utah. He brings the same habits to every call: scene safety first, a size-up by phone before he rolls so he shows up ready, and straight answers. If it can be fixed on the spot, he fixes it. If it can’t, he tells you and helps you plan the next move.',
+  service_area: `Northern Utah: ${COUNTIES}. Tremonton and Brigham City south to South Salt Lake, plus Park City, Heber Valley, Morgan and Ogden Valley`,
+  about: `RSQU Mobile RV Service is Mike Stevens’s mobile repair and maintenance service for RVs and trailers across Northern Utah: motorhomes, travel trailers, fifth wheels, toy haulers, and cargo, utility, horse and boat trailers, whether they’re parked at home, at a campsite or broken down on the road. Mike covers ${COUNTIES}, from Tremonton and Brigham City to Salt Lake City, Park City and Heber.\n\nMike has served 30 years as a firefighter in Salt Lake City, Utah. He brings the same habits to every call: scene safety first, a size-up by phone before he rolls so he shows up ready, and straight answers. If it can be fixed on the spot, he fixes it. If it can’t, he tells you and helps you plan the next move.`,
   highlights: {
     'All RV types': { icon: 'gear', title: 'RVs and trailers', text: 'Motorhomes · travel trailers · 5th wheels · toy haulers · utility trailers' },
     'RVs and trailers': { icon: 'gear', title: 'RVs and trailers', text: 'Motorhomes · travel trailers · 5th wheels · toy haulers · utility trailers' },
@@ -95,9 +95,47 @@ const COPY = {
   },
   faqs: {
     'Does Mike come to me?': 'Yes. Mike is fully mobile for RV and trailer repair and maintenance. He works on highway shoulders, at campgrounds and RV parks, in storage lots and in driveways across Northern Utah.',
-    'What area does Mike cover?': `Northern Utah: ${COUNTIES}. That’s South Salt Lake north to North Ogden (Salt Lake City, Bountiful, Farmington, Layton, Ogden), plus the back side of the Wasatch: Park City, Heber Valley, Morgan and Ogden Valley. That includes breakdowns on I-15, I-80 and I-84.`,
+    'What area does Mike cover?': `Northern Utah: ${COUNTIES}. That’s Tremonton and Brigham City south through Ogden, Layton, Farmington and Bountiful to Salt Lake City and South Salt Lake, plus the back side of the Wasatch: Park City, Heber Valley, Morgan and Ogden Valley. That includes breakdowns on I-15, I-80 and I-84.`,
   },
 };
+
+// Mike's towns, each with its own page. The text names real campgrounds, RV parks and storage lots
+// there (checked Nov 3, 2026; places that had closed, been renamed or stopped taking RVs were left
+// out). A town's page is offered to search engines once it has text, so each one is written for
+// that town rather than repeated with the name swapped.
+const TOWNS = ['South Salt Lake', 'Salt Lake City', 'Bountiful', 'Farmington', 'Layton', 'Ogden', 'North Ogden', 'Park City', 'Heber City', 'Morgan', 'Huntsville', 'Brigham City', 'Tremonton'];
+const TOWN_TEXT = {
+  'South Salt Lake': 'Mike comes to RVs and trailers in South Salt Lake, Murray and West Valley City: in driveways, on side streets and at storage facilities such as CubeSmart on 300 West. With I-15, I-80, I-215 and SR-201 meeting nearby, he also reaches travelers who break down passing through, and campers at the Salt Lake City KOA on North Temple, about 10 minutes away. He handles dead house batteries and converters, trailer lights and 7-pin plugs, stuck tank valves, and plumbing that froze over the winter.',
+  'Salt Lake City': 'Mike covers Salt Lake City from the Avenues and Sugar House to Rose Park and Glendale, streets he knows from 30 years with Salt Lake City Fire. He comes to campers at the Salt Lake City KOA on North Temple, at Sun Outdoors Salt Lake City just north in North Salt Lake, and at Great Salt Lake State Park out on I-80, and to storage facilities near downtown such as Prime Storage on 500 West. Slide-outs that won’t move, awnings stuck open in the wind, furnaces, AC units and plumbing leaks get fixed where your RV is parked.',
+  Bountiful: 'Mike comes to RVs and trailers in Bountiful, Centerville, Woods Cross and North Salt Lake, from driveways on the east bench to storage lots like StorQuest on Center Street in North Salt Lake and Aspen Springs Storage & RV in Centerville. Travelers staying at Sun Outdoors Salt Lake City, off I-15 in North Salt Lake, are a few minutes away. Before a trip he can check brakes, wheel bearings, lights and tires; after a cold snap, he finds and repairs frozen water lines and fittings.',
+  Farmington: 'Mike comes to RVs and trailers across Farmington, from homes along the bench to campers at Lagoon RV Park & Campground during Lagoon’s season and storage lots on the west side near Legacy Parkway. Cherry Hill Camping Resort in Kaysville is about five minutes north. I-15, US-89, Legacy Parkway and the West Davis Highway all pass through town, so a breakdown on any of them is close by. He handles slide-outs, awnings, leveling jacks, water heaters and furnaces, plus trailer brakes and wiring.',
+  Layton: 'Mike covers Layton along with Kaysville, Syracuse and Clearfield. He comes to campers at Cherry Hill Camping Resort in Kaysville, Valley View RV Resort in north Layton and Bridger Bay Campground on Antelope Island, which stays open year-round, and to storage facilities such as Extra Space Storage on Fort Lane. He handles house batteries, converters, water pumps, tank sensors and leveling jacks, plus trailer lights and brakes, so you don’t have to tow the rig to a shop.',
+  Ogden: 'Mike comes to RVs and trailers in Ogden, Riverdale, Roy and South Ogden: in driveways, at storage lots and at RV parks, including Century RV Park on 2100 South and Riverside RV Resort in South Weber. I-15 and I-84 meet here, so he also reaches rigs stopped on the shoulder or at a truck stop with a hot wheel bearing, a blowout or a dead battery. Before a trip up Ogden Canyon on SR-39, he can check brakes, bearings, tires and the breakaway switch.',
+  'North Ogden': 'Mike comes to RVs and trailers in North Ogden, Pleasant View and Farr West, at home or at storage lots such as Bach Self Storage on 400 East. Willard Bay State Park is a short drive north, and he comes to campers at its Cottonwood, Willow Creek and South Marina campgrounds during the camping season. In spring he de-winterizes, tests the water heater and furnace, and goes over trailer brakes, bearings and lights before the first trip; in fall he winterizes before the first hard freeze.',
+  'Park City': 'Mike covers Park City, Kimball Junction and the Summit County side of I-80 out to Wanship and Coalville. He comes to campers at Park City RV Resort at I-80 exit 145, at Jordanelle State Park’s Hailstone campground, and at Rockport and Echo state parks. Park City sits around 7,000 feet and freezes well before the Salt Lake Valley, so RVs here need winterizing earlier in the fall. He also repairs furnaces, water heaters, slide-outs and wind-damaged awnings.',
+  'Heber City': 'Mike comes to RVs and trailers in Heber City, Midway and Daniel, including campers at Mountain Valley RV Resort on US-40, River’s Edge Resort north of town, Wasatch Mountain State Park in Midway, and the Deer Creek and Jordanelle state park campgrounds. He also comes to storage lots along US-40, such as Daniel Storage. Heber Valley winters run long and cold, so fall winterizing and frozen-line repairs come first, and in spring he de-winterizes and checks water heaters and furnaces before the first trip.',
+  Morgan: 'Mike covers Morgan, Mountain Green and Croydon along I-84 and Weber Canyon. He comes to campers at East Canyon State Park, where the Dixie Creek campground has hookup sites, and at Lost Creek State Park north of Croydon, and to storage lots in Mountain Green and Morgan. On the I-84 grades through Weber Canyon, hot hubs, worn wheel bearings and trailer brake trouble can stop a trip, and Mike can come to you at the shoulder or the nearest exit.',
+  Huntsville: 'Mike covers Huntsville, Eden and Liberty in Ogden Valley, coming up Ogden Canyon on SR-39 or over Trappers Loop. The valley sits higher and colder than Ogden, so RVs and trailers here usually need winterizing earlier. He comes to driveways, storage lots in Eden, and campers at Anderson Cove on Pineview and, in season, at the Perception Park and South Fork campgrounds up the South Fork of the Ogden River. He handles furnaces, water heaters, frozen lines, batteries, and trailer brakes and lights.',
+  'Brigham City': 'Mike covers Brigham City, Perry, Willard and Mantua in Box Elder County. He comes to campers at the Brigham City/Perry South KOA, Mantua Waterfront RV Resort, the Willard Bay State Park campgrounds (Cottonwood, Willow Creek and South Marina) and, in season, Box Elder Campground near Mantua. He also comes to storage lots such as Secure Storage of Brigham City and Aspen Springs Storage & RV in Willard. Before a trip over Sardine Canyon on US-89/91, he can check brakes, bearings, tires and lights.',
+  Tremonton: 'Mike covers Tremonton, Garland, Bear River City and the rest of the Bear River Valley, where I-15 and I-84 meet. He comes to campers at Aspen Grove RV Park on Main Street, Belmont Hot Springs RV Park near Fielding and the Brigham City/Perry South KOA, and to farms, shops and storage lots where RVs, horse trailers and utility trailers are parked. If you break down on I-84 toward Idaho or on I-15 north of Brigham City, call Mike before you call a tow.',
+};
+
+// Puts Mike's towns first (adding any that are missing) and fills in the page text for those that
+// have none. A town Mike added himself, and any text he wrote, stays as it is.
+function withTowns(current) {
+  const have = new Map(current.map((c) => [`${c.name}|${c.state}`, c]));
+  const added = [];
+  let written = 0;
+  const towns = TOWNS.map((name) => {
+    const c = have.get(`${name}|UT`);
+    if (!c) added.push(name);
+    if (c && c.intro) return { name, state: 'UT', intro: c.intro };
+    written++;
+    return { name, state: 'UT', intro: TOWN_TEXT[name] };
+  });
+  const others = current.filter((c) => !(c.state === 'UT' && TOWNS.includes(c.name)));
+  return { cities: towns.concat(others).slice(0, 20), added, written };
+}
 
 const before = parseProfile(t.site_profile);
 if (before.import && before.import.by === 'rsqu' && !force) {
@@ -110,8 +148,12 @@ if (before.import && before.import.by === 'rsqu' && !force) {
     const site = parseProfile(t.site_profile);
     site.highlights = site.highlights.map((h) => COPY.highlights[h.title] || h);
     site.faqs = site.faqs.map((f) => (COPY.faqs[f.q] ? { ...f, a: COPY.faqs[f.q] } : f));
+    const towns = withTowns(site.cities);
+    site.cities = towns.cities;
     db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(site), t.id);
     notes.push('Updated the headline, description, service area, About text, the “RVs and trailers” and “Service area” highlights and the two service-area FAQs.');
+    if (towns.added.length) notes.push(`Added ${towns.added.join(' and ')} to his towns.`);
+    if (towns.written) notes.push(`Wrote the page text for ${towns.written} towns (text Mike wrote himself is kept).`);
   }
   if (notes.length) { console.log(`${notes.join(' ')} Nothing else changed.`); process.exit(0); }
   console.log(`Already applied on ${before.import.at}. Nothing changed. Run with --force to apply it again (that replaces Mike's edits to these sections).`);
@@ -163,7 +205,6 @@ const resource = (file, title, description) => {
   const name = copy(file, 'doc');
   return { file: name, title, description, size: fs.statSync(path.join(uploads, name)).size, added_at: new Date().toISOString() };
 };
-const keepCities = new Map(profile.cities.map((c) => [`${c.name}|${c.state}`, c.intro]));
 const keepBanner = (kind) => (profile.banner[kind] && !ownFiles.has(profile.banner[kind]) ? profile.banner[kind] : '');
 const next = {
   ...profile,
@@ -190,11 +231,8 @@ const next = {
     { q: 'What if it can’t be fixed where it’s parked?', a: 'Mike will tell you on the spot and help you work out the next step, such as a tow to a repair shop.' },
     { q: 'Is Mike really a firefighter?', a: 'Yes. Mike Stevens has 30 years in the fire service in Salt Lake City, Utah, and he runs every repair call with a firefighter’s focus on scene safety.' },
   ],
-  // Cities from his service area. Each page goes to Google once Mike writes a few sentences for it.
-  cities: [['South Salt Lake', 'UT'], ['Salt Lake City', 'UT'], ['Bountiful', 'UT'], ['Farmington', 'UT'], ['Layton', 'UT'], ['Ogden', 'UT'], ['North Ogden', 'UT'], ['Park City', 'UT'], ['Heber City', 'UT'], ['Morgan', 'UT'], ['Huntsville', 'UT']]
-    .map(([name, state]) => ({ name, state, intro: keepCities.get(`${name}|${state}`) || '' }))
-    .concat(profile.cities.filter((c) => !['South Salt Lake', 'Salt Lake City', 'Bountiful', 'Farmington', 'Layton', 'Ogden', 'North Ogden', 'Park City', 'Heber City', 'Morgan', 'Huntsville'].includes(c.name)))
-    .slice(0, 20),
+  // Towns in his service area, each with its own page and text (see TOWN_TEXT).
+  cities: withTowns(profile.cities).cities,
   resources: [
     ...profile.resources.filter((r) => !ownFiles.has(r.file)),
     resource('know-before-you-go-10-minute-rv-check.pdf', 'Know Before You Go: 10-minute RV check', 'A walk-around before you leave: tires, water and electrical, slides and awnings, propane and alarms, hitch and lights.'),
@@ -207,4 +245,4 @@ const next = {
 next.import = { by: 'rsqu', at: new Date().toISOString(), files: added };
 db.prepare('UPDATE tenants SET site_profile = ? WHERE id = ?').run(JSON.stringify(next), t.id);
 console.log(`Done. ${next.cities.length} cities, ${SERVICES.length} services (${SERVICES.filter((s) => s[2]).length} with tile pictures), ${next.resources.length} files. Open /s/${slug} to see it.`);
-console.log('Still for Mike to fill in (Business → Edit website sections): base city, hours, Google links, and a few sentences for each city. Set prices for the new services in Products.');
+console.log('Still for Mike to fill in (Business → Edit website sections): base city, hours and Google links. Set prices for the new services in Products.');
