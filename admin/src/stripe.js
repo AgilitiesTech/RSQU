@@ -10,8 +10,37 @@ import crypto from 'node:crypto';
 //
 // Legacy model (kept only so payments taken before the switch can finish paying out): the
 // platform charged on its own account and transferred the business's share to an Express account.
+// Settings pasted into Render sometimes carry a space, a line break or quotes around them. None of
+// those can be part of a Stripe key or signing secret, so they're dropped.
+export function cleanSecret(v) {
+  let s = String(v ?? '').trim();
+  if (/^(['"`]).*\1$/s.test(s)) s = s.slice(1, -1).trim();
+  return s;
+}
+
+// What's wrong with a Stripe setting, in plain words, without ever repeating the value.
+// kind: 'secret' (STRIPE_SECRET_KEY) or 'webhook' (a whsec_ signing secret). '' means it looks right.
+export function stripeSettingProblem(name, raw, kind = 'secret') {
+  const v = cleanSecret(raw);
+  if (!v) return `${name} is empty.`;
+  if (v.startsWith(name + '=') || v.startsWith(name + ' ')) return `${name} has its own name pasted in front of the value. In Render, the value box should hold only the key itself.`;
+  if (/^bearer\s/i.test(v)) return `${name} starts with the word “Bearer”. Remove it so only the key is left.`;
+  if (/\s/.test(v)) return `${name} has a space or line break in the middle. Copy it again from Stripe with its copy button and paste it into Render.`;
+  if (kind === 'webhook') {
+    if (/^whsec_[A-Za-z0-9+/=]{20,}$/.test(v)) return '';
+    if (/^(sk|rk|pk)_/.test(v)) return `${name} holds an API key, not a webhook signing secret. The signing secret starts with whsec_ and is on the webhook’s page in Stripe (Developers → Webhooks → your destination → Signing secret → Reveal).`;
+    return `${name} doesn’t look like a webhook signing secret. It should start with whsec_. Find it in Stripe under Developers → Webhooks → your destination → Signing secret → Reveal.`;
+  }
+  if (/^(sk|rk)_(test|live)_[A-Za-z0-9]{20,}$/.test(v)) return '';
+  if (/^pk_(test|live)_/.test(v)) return `${name} holds your publishable key (it starts with pk_${v.includes('_live_') ? 'live' : 'test'}_). HitchPoint needs the secret key, which starts with sk_${v.includes('_live_') ? 'live' : 'test'}_. In Stripe: Developers → API keys → Secret key → Reveal, then copy it.`;
+  if (v.startsWith('whsec_')) return `${name} holds a webhook signing secret (whsec_). That belongs in STRIPE_CONNECT_WEBHOOK_SECRET. ${name} needs the secret key, which starts with sk_live_ (Developers → API keys → Secret key → Reveal).`;
+  if (/^(sk|rk)_(test|live)_/.test(v)) return `${name} starts correctly but has other characters in it, or is cut off (it’s ${v.length} characters; a Stripe secret key is usually over 100). Copy it again with the copy button next to the key in Stripe.`;
+  if (/^(sk|rk)_/.test(v)) return `${name} starts with ${v.slice(0, 3)} but not sk_live_ or sk_test_. Copy the secret key again from Developers → API keys.`;
+  return `${name} doesn’t look like a Stripe secret key. It should start with sk_live_ (on gethitchpoint.com) or sk_test_ (on a test copy). In Stripe: Developers → API keys → Secret key → Reveal, then copy it.`;
+}
+
 export function stripeClient(env) {
-  const key = env.STRIPE_SECRET_KEY;
+  const key = cleanSecret(env.STRIPE_SECRET_KEY);
   const base = env.STRIPE_API_BASE || 'https://api.stripe.com';
   // API v2 requires an explicit version. This is the version stripe-node v23 pins.
   const v2Version = env.STRIPE_API_VERSION || '2026-10-28.endive';

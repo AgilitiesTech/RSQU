@@ -2191,8 +2191,11 @@
       sc.disabled = true; sc.textContent = 'Checking…';
       const r = await api('/api/super/stripe-check', { method: 'POST' }).catch((e) => ({ ok: false, error: e.message }));
       const m = document.getElementById('sc-msg');
-      m.className = 'alert ' + (r.ok ? 'ok' : 'err');
-      m.textContent = r.ok ? `Connected to Stripe account ${r.name ? '“' + r.name + '” ' : ''}(${r.account_id}) in ${r.test_mode ? 'TEST mode, no real money moves' : 'LIVE mode'}.` : r.error;
+      const bad = (r.checks || []).filter((c) => !c.ok);
+      m.className = 'alert ' + (r.ok && !bad.length && !r.mode_note ? 'ok' : 'err');
+      m.textContent = (r.ok ? `Secret key works: connected to Stripe account ${r.name ? '“' + r.name + '” ' : ''}(${r.account_id}) in ${r.test_mode ? 'TEST mode, no real money moves' : 'LIVE mode'}.${r.mode_note || ''}` : r.error)
+        + (r.checks || []).map((c) => `\n${c.ok ? '✓' : '✗'} ${c.name}: ${c.message}`).join('');
+      m.style.whiteSpace = 'pre-line';
       m.hidden = false;
       sc.disabled = false; sc.textContent = 'Check Stripe connection';
     });
