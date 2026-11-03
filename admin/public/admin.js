@@ -610,7 +610,7 @@
     const yes = (on, at) => (on ? `<span class="tag" style="background:#DDF3E6;color:#14532D">Yes</span>${at ? `<div class="small muted">${when(at)}</div>` : ''}` : '<span class="small muted">No</span>');
     view.innerHTML = `
       <a href="#/quotes" class="small">← Quotes</a>
-      <div class="row between"><h1>Customers</h1>${rows.length ? '<a class="btn sm" href="/api/customers.csv">Download CSV</a>' : ''}</div>
+      <div class="row between"><h1>Customers</h1><div class="row">${isOwner() ? '<a class="btn primary sm" href="#/emails">Email subscribers</a>' : ''}${rows.length ? '<a class="btn sm" href="/api/customers.csv">Download CSV</a>' : ''}</div></div>
       <p class="small muted">Customers are added when they sign a proposal. Email updates are on unless they uncheck the box; texts only if they check that box. Every email you send them must include an unsubscribe link, and texts must honor STOP.</p>
       <div class="table-wrap" style="overflow-x:auto"><table class="items" style="min-width:640px">
         <thead><tr><th scope="col">Name</th><th scope="col">Phone</th><th scope="col">Email</th><th scope="col">Email updates</th><th scope="col">Texts</th><th scope="col">From</th></tr></thead>
@@ -1662,6 +1662,47 @@
     if (first) first.insertAdjacentHTML('afterend', `<section class="card stack"><h2>Products and services</h2><p>Your prices for quotes, and the services on your website.</p><div><a class="btn" href="#/products">Edit products and services</a></div></section>`);
   }
 
+  // ---------- owner features: subscriber emails ----------
+  async function campaignsView() {
+    setNav('quotes');
+    const st = await api('/api/campaigns');
+    const n = st.subscribers;
+    const blocked = !st.address.ok || !st.email_enabled || Boolean(st.next_allowed_label) || !n;
+    view.innerHTML = `
+      <a href="#/customers" class="small">← Customers</a>
+      <h1>Email your subscribers</h1>
+      <p class="muted">Send an update or an offer to customers who agreed to emails from you. ${n === 1 ? '1 person is' : n + ' people are'} signed up.</p>
+      ${!st.address.ok ? '<p class="alert err">Add your business mailing address first. The law requires it in every email like this. <a href="#/terms">Add your address</a></p>' : ''}
+      ${!st.email_enabled ? '<p class="alert err">Email isn’t set up on the platform yet. Contact support.</p>' : ''}
+      ${st.next_allowed_label ? `<p class="alert">You can send one email a day. Your next one can go out ${esc(st.next_allowed_label)}.</p>` : ''}
+      ${!n ? '<p class="alert">Nobody has signed up yet. Customers can sign up when they sign a proposal or pay an invoice.</p>' : ''}
+      <form class="card stack" id="cf">
+        <div><label for="cf-subj">Subject</label><input id="cf-subj" maxlength="150" placeholder="Book your spring check-up"></div>
+        <div><label for="cf-body">Message</label><textarea id="cf-body" rows="10" maxlength="10000" placeholder="Hi there,&#10;&#10;Spring is a good time to check your roof seals and batteries. Book this month and get 10% off.&#10;&#10;Mike"></textarea></div>
+        <p class="small muted">We add your business name, your mailing address${st.address.ok ? ` (${esc(st.address.line)})` : ''} and an unsubscribe link at the bottom. Replies go to your business email. Texts to subscribers aren’t available, because each state has its own rules for marketing texts.</p>
+        <p class="alert" id="cf-msg" hidden></p>
+        <div class="row"><button class="btn" type="button" id="cf-test" ${!st.address.ok || !st.email_enabled ? 'disabled' : ''}>Send me a test</button><button class="btn primary" type="submit" ${blocked ? 'disabled' : ''}>Send to ${n === 1 ? '1 subscriber' : n + ' subscribers'}</button></div>
+      </form>
+      <section class="card stack">
+        <h2>Emails you sent</h2>
+        ${st.campaigns.length ? `<div class="table-wrap" style="overflow-x:auto"><table class="items" style="min-width:520px"><thead><tr><th scope="col">Sent</th><th scope="col">Subject</th><th scope="col" class="num">People</th><th scope="col" class="num">Delivered</th><th scope="col" class="num">Not sent</th></tr></thead>
+          <tbody>${st.campaigns.map((c) => `<tr><td class="small">${esc(c.when_label)}${c.status === 'sending' ? '<div class="small muted">Still sending</div>' : ''}</td><td>${esc(c.subject)}</td><td class="num">${c.recipients}</td><td class="num">${c.sent}</td><td class="num">${c.skipped + c.failed}</td></tr>`).join('')}</tbody></table></div>
+          <p class="small muted">“Not sent” means the person unsubscribed before it went out, or their email didn’t go through.</p>` : '<p class="small muted">Nothing sent yet.</p>'}
+      </section>`;
+    const f = document.getElementById('cf'), msg = document.getElementById('cf-msg');
+    const body = () => ({ subject: document.getElementById('cf-subj').value, body: document.getElementById('cf-body').value });
+    document.getElementById('cf-test').addEventListener('click', async (e) => {
+      try { const r = await api('/api/campaigns/test', { method: 'POST', body: body() }); flash(msg, `Test sent to ${r.to}.`); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    });
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!confirm(`Send this email to ${n === 1 ? '1 person' : n + ' people'}? You can send one email a day.`)) return;
+      try { await api('/api/campaigns', { method: 'POST', body: body() }); await campaignsView(); flash(document.getElementById('cf-msg'), 'Sending now. It can take a few minutes to reach everyone.'); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    });
+  }
+
   // ---------- router ----------
   async function loadMe() { me = await api('/api/me', { quiet: true }).catch(() => ({ authed: false })); if (!me.authed) me = null; return me; }
   async function route() {
@@ -1689,6 +1730,7 @@
       else if (a === 'schedule' && b === 'job' && c) await jobView(c);
       else if (a === 'schedule' && b === 'edit' && c) await jobFormView(c);
       else if (a === 'schedule') await scheduleView(b, c);
+      else if (a === 'emails') await campaignsView();
       else if (a === 'quotes') await quotesView();
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();

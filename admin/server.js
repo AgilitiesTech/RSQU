@@ -1381,6 +1381,55 @@ export function createApp(env = process.env) {
     send(res, 200, { url: checkoutUrl });
   });
 
+  // ---------- owner features: subscriber emails ----------
+  // Update and offer emails to customers who agreed to them. Every email carries the business's name
+  // and mailing address and a one-click unsubscribe. One send per business per day. No texts here:
+  // marketing texts need state-by-state rules and carrier registration first.
+  const subscribers = (tid) => db.prepare(`SELECT MIN(id) AS id, email FROM customers WHERE tenant_id = ? AND email_opt_in = 1 AND email IS NOT NULL AND email != '' GROUP BY email ORDER BY MIN(id)`).all(tid);
+  const lastCampaign = (tid) => db.prepare('SELECT created_at FROM campaigns WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1').get(tid);
+  function campaignInput(b) {
+    const subject = noCtl(b.subject, 150), body = String(b.body ?? '').replace(/\r\n/g, '\n').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ').trim().slice(0, 10000);
+    if (!subject) throw new HttpError(400, 'Add a subject line.');
+    if (body.length < 20) throw new HttpError(400, 'Write your message. A few sentences is plenty.');
+    return { subject, body };
+  }
+  route('GET', '/api/campaigns', async (req, res, p, url, { tenant: t, user }) => {
+    const last = lastCampaign(t.id);
+    const next = last ? new Date(owner.parseUtc(last.created_at).getTime() + 864e5) : null;
+    const tz = owner.tzOf(t);
+    send(res, 200, {
+      address: owner.postalAddress(t), subscribers: subscribers(t.id).length, email_enabled: notify.emailEnabled, your_email: user.email,
+      next_allowed_at: next && next > new Date() ? owner.utcString(next) : null, next_allowed_label: next && next > new Date() ? owner.formatWhen(next, tz) : null,
+      campaigns: db.prepare('SELECT id, subject, recipients, sent, skipped, failed, status, created_at, finished_at FROM campaigns WHERE tenant_id = ? ORDER BY id DESC LIMIT 50').all(t.id)
+        .map((c) => ({ ...c, when_label: owner.formatWhen(owner.parseUtc(c.created_at), tz) })),
+    });
+  }, { auth: 'owner' });
+  route('POST', '/api/campaigns/test', async (req, res, p, url, { tenant: t, user }) => {
+    const { subject, body } = campaignInput(await json(req));
+    const address = owner.postalAddress(t);
+    if (!address.ok) throw new HttpError(409, 'Add your business mailing address first. Go to Settings, then Customer Terms & Conditions.');
+    if (!notify.emailEnabled) throw new HttpError(503, 'Email isn’t set up on the platform yet. Contact support.');
+    if (limited('camptest:' + t.id, 10, 3600_000)) throw new HttpError(429, 'You’ve sent 10 tests this hour. Try again later.');
+    const e = owner.campaignEmail({ t, subject: `[Test] ${subject}`, body, address, unsubUrl: '(each customer gets their own unsubscribe link here)' });
+    const ok = await notify.email(user.email, e.subject, e.text, { fromName: t.name, replyTo: t.email || undefined });
+    if (!ok) throw new HttpError(502, 'The test email didn’t go out. Try again in a minute.');
+    send(res, 200, { ok: true, to: user.email });
+  }, { auth: 'owner' });
+  route('POST', '/api/campaigns', async (req, res, p, url, { tenant: t, user }) => {
+    const { subject, body } = campaignInput(await json(req));
+    const address = owner.postalAddress(t);
+    if (!address.ok) throw new HttpError(409, 'Add your business mailing address first. Go to Settings, then Customer Terms & Conditions.');
+    if (!notify.emailEnabled) throw new HttpError(503, 'Email isn’t set up on the platform yet. Contact support.');
+    const last = lastCampaign(t.id);
+    if (last && owner.parseUtc(last.created_at).getTime() + 864e5 > Date.now()) throw new HttpError(429, `You can send one email to your subscribers each day. You can send the next one ${owner.formatWhen(new Date(owner.parseUtc(last.created_at).getTime() + 864e5), owner.tzOf(t))}.`);
+    const list = subscribers(t.id);
+    if (!list.length) throw new HttpError(409, 'Nobody has signed up for your emails yet.');
+    const ins = db.prepare('INSERT INTO campaigns (tenant_id, user_id, subject, body, recipients, created_at) VALUES (?,?,?,?,?,?)').run(t.id, user.id, subject, body, list.length, now());
+    const cid = Number(ins.lastInsertRowid);
+    for (const c of list) queueMessage({ t, kind: 'campaign', channel: 'email', to: normEmail(c.email), refId: cid, customerId: c.id });
+    send(res, 201, { id: cid, recipients: list.length });
+  }, { auth: 'owner' });
+
   // Customers and who's subscribed
   route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, db.prepare('SELECT id, name, phone, email, email_opt_in, sms_opt_in, email_consent_at, sms_consent_at, email_unsubscribed_at, source, created_at FROM customers WHERE tenant_id = ? ORDER BY id DESC LIMIT 2000').all(t.id));

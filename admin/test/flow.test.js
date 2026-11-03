@@ -1186,6 +1186,74 @@ test('quick invoices: no signature, the customer accepts the terms by paying, re
   assert.equal((await other('POST', '/api/invoices', { request_id: rid })).json.request_id, null);
 });
 
+test('emails to subscribers: address required, opted-in only, unsubscribe link and headers, batches, one a day', async () => {
+  const draft = { subject: 'Spring check-up special', body: 'Hi there,\n\nBook a spring check-up this month and get 10% off.\n\nMike' };
+  // Without a mailing address (Ola never filled in Customer Terms details), nothing can be sent.
+  assert.equal((await other('GET', '/api/campaigns')).json.address.ok, false);
+  assert.match((await other('POST', '/api/campaigns/test', draft)).json.error, /mailing address/);
+  assert.match((await other('POST', '/api/campaigns', draft)).json.error, /mailing address/);
+  assert.equal((await tia('GET', '/api/campaigns')).status, 403, 'owners only');
+  assert.equal((await tia('POST', '/api/campaigns', draft)).status, 403);
+  assert.equal((await mike('POST', '/api/campaigns', { ...draft, subject: '' })).status, 400);
+  assert.equal((await mike('POST', '/api/campaigns', { ...draft, body: 'Hi' })).status, 400);
+
+  const st = (await mike('GET', '/api/campaigns')).json;
+  assert.deepEqual([st.address.ok, st.address.line], [true, '1 Main St, Ogden, UT 84401']);
+  const optedIn = appDb.prepare(`SELECT DISTINCT email FROM customers WHERE tenant_id = ? AND email_opt_in = 1 AND email != ''`).all(mikeId).map((r) => r.email).sort();
+  assert.equal(st.subscribers, optedIn.length);
+  assert.ok(!optedIn.includes('pat@example.test') && !optedIn.includes('sue@example.test') && !optedIn.includes('nat@example.test'));
+  assert.ok(optedIn.length >= 4);
+
+  // A test goes only to the owner and doesn't count as the day's email.
+  let mark = outbox.length;
+  const t1 = await mike('POST', '/api/campaigns/test', draft);
+  assert.equal(t1.status, 200);
+  const test1 = outbox.slice(mark);
+  assert.deepEqual(test1.map((m) => [m.to, m.subject]), [['mike@rv.test', '[Test] Spring check-up special']]);
+  assert.match(test1[0].text, /10% off[\s\S]*Mike Stevens Emergency RV & Trailer Repair\nMike Stevens RV Repair LLC\n1 Main St, Ogden, UT 84401/);
+
+  const sent = await mike('POST', '/api/campaigns', draft);
+  assert.equal(sent.status, 201, JSON.stringify(sent.json));
+  assert.equal(sent.json.recipients, optedIn.length);
+  assert.equal(outbox.length, mark + 1, 'queued for the background sender, not sent in the request');
+  assert.equal((await mike('POST', '/api/campaigns', { ...draft, subject: 'Again' })).status, 429, 'one a day');
+  assert.match((await mike('GET', '/api/campaigns')).json.next_allowed_label, / at /);
+
+  // Someone unsubscribes after it's queued: they're skipped.
+  const leaving = optedIn.find((e) => e === 'eve@example.test') || optedIn[0];
+  const tok = appDb.prepare('SELECT unsub_token FROM customers WHERE tenant_id = ? AND email = ?').get(mikeId, leaving).unsub_token;
+  await anon('POST', '/u/' + tok, 'List-Unsubscribe=One-Click', { 'Content-Type': 'application/x-www-form-urlencoded' });
+
+  // Sent in batches by the background sender.
+  mark = outbox.length;
+  const soon = new Date(Date.now() + 1000);
+  const campaign = () => appDb.prepare('SELECT * FROM campaigns WHERE id = ?').get(sent.json.id);
+  await runDue(soon, { limit: 2 });
+  assert.ok(campaign().sent + campaign().skipped <= 2, 'one batch at a time');
+  for (let i = 0; i < 20 && campaign().status !== 'done'; i++) await runDue(soon, { limit: 2 });
+  const c = campaign();
+  assert.deepEqual([c.status, c.recipients, c.sent, c.skipped, c.failed], ['done', optedIn.length, optedIn.length - 1, 1, 0]);
+  const mails = outbox.slice(mark).filter((m) => m.subject === draft.subject);
+  assert.deepEqual(mails.map((m) => m.to).sort(), optedIn.filter((e) => e !== leaving));
+  for (const m of mails) {
+    const cust = appDb.prepare('SELECT unsub_token FROM customers WHERE tenant_id = ? AND email = ?').get(mikeId, m.to);
+    assert.match(m.text, new RegExp(`Unsubscribe: http://localhost:3000/u/${cust.unsub_token}$`));
+    assert.equal(m.headers['List-Unsubscribe'], `<http://localhost:3000/u/${cust.unsub_token}>`);
+    assert.equal(m.headers['List-Unsubscribe-Post'], 'List-Unsubscribe=One-Click');
+    assert.match(m.text, /1 Main St, Ogden, UT 84401/);
+    assert.equal(m.fromName, 'Mike Stevens Emergency RV & Trailer Repair');
+  }
+  await runDue(soon);
+  assert.equal(outbox.slice(mark).filter((m) => m.subject === draft.subject).length, mails.length, 'nobody gets it twice');
+  const list = (await mike('GET', '/api/campaigns')).json.campaigns;
+  assert.deepEqual([list[0].subject, list[0].sent, list[0].skipped], [draft.subject, optedIn.length - 1, 1]);
+
+  // The next day, another one can go.
+  appDb.prepare(`UPDATE campaigns SET created_at = datetime('now', '-25 hours') WHERE id = ?`).run(sent.json.id);
+  assert.equal((await mike('GET', '/api/campaigns')).json.next_allowed_at, null);
+  assert.equal((await other('GET', '/api/campaigns')).json.campaigns.length, 0, 'each business sees only its own');
+});
+
 test('bold look: banner, service tiles, highlights, service pages', async () => {
   const st = (await mike('GET', '/api/website')).json;
   assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);
