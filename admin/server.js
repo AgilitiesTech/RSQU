@@ -15,6 +15,8 @@ import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } 
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
 import * as AFF from './src/affiliates.js';
 import * as owner from './src/owner-features.js';
+import { sealer } from './src/sealed.js';
+import * as W9 from './src/w9.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -25,6 +27,9 @@ export function createApp(env = process.env) {
   const uploads = path.join(dataDir, 'uploads');
   const stripe = stripeClient(env);
   const notify = notifier(env);
+  // Encrypts affiliates' tax ID and bank numbers (src/sealed.js). Without DATA_ENCRYPTION_KEY, the
+  // app won't take W-9s or bank details at all.
+  const sealed = sealer(env.DATA_ENCRYPTION_KEY);
   const platformEmail = env.PLATFORM_CONTACT_EMAIL || 'aaron@agilitiestech.com';
   const platformName = env.PLATFORM_NAME || BRAND.name;
 
@@ -49,7 +54,8 @@ export function createApp(env = process.env) {
   const hexColor = (v, d) => (/^#[0-9a-fA-F]{6}$/.test(v || '') ? v : d);
   const money = (c) => `$${(c / 100).toFixed(2)}`;
 
-  class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+  // field: the form field the message is about, so the page can point at it.
+  class HttpError extends Error { constructor(status, msg, field) { super(msg); this.status = status; if (field) this.field = field; } }
 
   function send(res, status, body, headers = {}) {
     const isJson = typeof body !== 'string' && !Buffer.isBuffer(body);
@@ -1708,13 +1714,20 @@ export function createApp(env = process.env) {
   const sqlTime = (ts, modifier) => db.prepare('SELECT datetime(?, ?) AS d').get(ts, modifier).d;
   const getAffiliate = (id) => db.prepare('SELECT * FROM affiliates WHERE id = ?').get(id);
   const affiliateOfTenant = (tid) => db.prepare('SELECT * FROM affiliates WHERE tenant_id = ?').get(tid);
+  const affiliateOfUser = (uid) => db.prepare('SELECT * FROM affiliates WHERE user_id = ?').get(uid);
+  // A business affiliate goes by its business name and owner's email; a person or group by its own.
+  const ownerEmailOf = (tid) => db.prepare(`SELECT email FROM users WHERE tenant_id = ? AND role = 'owner' ORDER BY id LIMIT 1`).get(tid)?.email || '';
+  const affiliateName = (a) => (a.tenant_id ? getTenant(a.tenant_id)?.name : '') || a.name || '';
+  const affiliateEmail = (a) => (a.tenant_id ? ownerEmailOf(a.tenant_id) : a.user_id ? getUser(a.user_id)?.email : '') || a.email || '';
   const affiliateByCode = (code) => { const c = AFF.normalizeCode(code); return AFF.CODE_RE.test(c) ? db.prepare('SELECT * FROM affiliates WHERE code = ?').get(c) : null; };
   const affiliateLink = (req, a) => `${siteOrigin(req)}/a/${a.code}`;
-  // A code that credits new sign-ups: active, terms accepted, and the affiliate's own business is active.
+  // A code that credits new sign-ups: active, terms accepted, and the affiliate's own business (if it
+  // is one) is active.
   function liveAffiliate(code) {
     const a = affiliateByCode(code);
     if (!a || a.status !== 'active' || !a.terms_accepted_at) return null;
-    return getTenant(a.tenant_id)?.status === 'active' ? a : null;
+    if (a.tenant_id) return getTenant(a.tenant_id)?.status === 'active' ? a : null;
+    return a.user_id && getUser(a.user_id) ? a : null;
   }
 
   // Share history: a payment always uses the share and duration in effect when it was paid.
@@ -1817,10 +1830,57 @@ export function createApp(env = process.env) {
     return lines.sort((a, b) => (a.sort < b.sort ? 1 : a.sort > b.sort ? -1 : 0)).map((x) => x.line);
   }
 
+  // ---- tax forms and payout details ----
+  const TAX_NOT_READY = 'Secure storage for tax forms isn’t set up yet, so we can’t take W-9s or bank details. An Agilities admin needs to add DATA_ENCRYPTION_KEY in Render first.';
+  const latestW9 = (affId) => db.prepare('SELECT * FROM affiliate_w9 WHERE affiliate_id = ? ORDER BY id DESC LIMIT 1').get(affId);
+  const tinContext = (affId) => `w9-tin:${affId}`;
+  const bankContext = (affId) => `payout-bank:${affId}`;
+  // W-9 and bank checks throw W9Error(field, message); turn those into a 400 that names the field.
+  function formCheck(fn) {
+    try { return fn(); } catch (e) { if (e instanceof W9.W9Error) throw new HttpError(400, e.message, e.field); throw e; }
+  }
+  function checkPayout(b = {}) {
+    const method = ['ach', 'check'].includes(b.method) ? b.method : '';
+    if (!method) throw new HttpError(400, 'Choose how you want to be paid: direct deposit or a mailed check.', 'payout_method');
+    return { method, bank: method === 'ach' ? formCheck(() => W9.checkBank(b.bank || {})) : null };
+  }
+  const logSensitive = (req, user, affId, what) => db.prepare('INSERT INTO sensitive_access_log (user_id, user_email, affiliate_id, what, ip, ua, at) VALUES (?,?,?,?,?,?,?)')
+    .run(user?.id ?? null, user?.email ?? null, affId, what, clientIp(req), clean(req.headers['user-agent'], 400), now());
+  // Stores a signed W-9 (the number encrypted, the last 4 readable) and marks the W-9 as on file.
+  function saveW9(req, a, w, user) {
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const signedAt = now();
+    db.prepare(`INSERT INTO affiliate_w9 (affiliate_id, form_revision, legal_name, business_name, tax_class, llc_class, other_class, foreign_owners, exempt_payee_code, fatca_code,
+        address, city, state, zip, tin_type, tin_sealed, tin_last4, backup_withholding, signature, signed_at, user_id, signer_email, ip, ua, record_sha256)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(a.id, W9.FORM_REVISION, w.legal_name, w.business_name || null, w.tax_class, w.llc_class || null, w.other_class || null,
+      w.foreign_owners, w.exempt_payee_code || null, w.fatca_code || null, w.address, w.city, w.state, w.zip, w.tin_type, sealed.seal(w.tin, tinContext(a.id)), W9.tinLast4(w.tin),
+      w.backup_withholding, w.signature, signedAt, user.id, user.email, clientIp(req), clean(req.headers['user-agent'], 400), W9.recordHash(w, signedAt, sealed.fingerprint));
+    db.prepare('UPDATE affiliates SET w9_on_file = 1, w9_on_file_at = ?, updated_at = ? WHERE id = ?').run(signedAt, signedAt, a.id);
+    logSensitive(req, user, a.id, 'w9_submitted');
+  }
+  function savePayout(req, a, pay, user) {
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const box = pay.bank ? sealed.seal(JSON.stringify(pay.bank), bankContext(a.id)) : null;
+    db.prepare('UPDATE affiliates SET payout_method = ?, payout_sealed = ?, payout_last4 = ?, payout_updated_at = ?, updated_at = ? WHERE id = ?')
+      .run(pay.method, box, pay.bank ? pay.bank.account.slice(-4) : null, now(), now(), a.id);
+    logSensitive(req, user, a.id, 'payout_changed');
+  }
+  // What the affiliate (and the admin list) sees: never a full tax ID or bank number.
+  function taxSummary(a) {
+    const w = latestW9(a.id);
+    return {
+      w9: w ? { legal_name: w.legal_name, business_name: w.business_name || '', classification: W9.classText(w), tin: W9.maskedTin(w.tin_type, w.tin_last4), city: w.city, state: w.state, signed_at: w.signed_at, backup_withholding: Boolean(w.backup_withholding) } : null,
+      w9_on_paper: Boolean(a.w9_on_file && !w),
+      payout: a.payout_method ? { method: a.payout_method, last4: a.payout_last4 || '', updated_at: a.payout_updated_at } : null,
+      ready: Boolean(sealed),
+    };
+  }
+
   function ownerAffiliate(req, a) {
     sweepAffiliateLedger();
     const accepted = Boolean(a.terms_accepted_at);
     const affiliate = {
+      name: affiliateName(a), kind: a.tenant_id ? 'business' : 'person', tax: taxSummary(a),
       code: a.code, status: a.status, share_bp: a.share_bp, months: a.months, w9_on_file: Boolean(a.w9_on_file), link: accepted ? affiliateLink(req, a) : null,
       terms: { url: '/legal/affiliate-terms', version: AFF.AFFILIATE_TERMS_VERSION, accepted_at: a.terms_accepted_at, accepted_version: a.terms_version, needs_accept: a.terms_version !== AFF.AFFILIATE_TERMS_VERSION },
       hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS,
@@ -1837,10 +1897,12 @@ export function createApp(env = process.env) {
     };
   }
   function superAffiliateRow(a) {
-    const t = getTenant(a.tenant_id);
+    const t = a.tenant_id ? getTenant(a.tenant_id) : null;
+    const w = latestW9(a.id);
     return {
-      id: a.id, tenant_id: a.tenant_id, name: t?.name || '', tenant_status: t?.status || '', code: a.code, share_bp: a.share_bp, months: a.months, status: a.status,
-      w9_on_file: Boolean(a.w9_on_file), w9_on_file_at: a.w9_on_file_at, terms_accepted_at: a.terms_accepted_at, terms_version: a.terms_version,
+      id: a.id, tenant_id: a.tenant_id, kind: t ? 'business' : 'person', name: affiliateName(a), email: affiliateEmail(a), tenant_status: t?.status || '', code: a.code, share_bp: a.share_bp, months: a.months, status: a.status,
+      w9_on_file: Boolean(a.w9_on_file), w9_on_file_at: a.w9_on_file_at, w9: w ? 'electronic' : a.w9_on_file ? 'paper' : null, backup_withholding: Boolean(w?.backup_withholding), payout_method: a.payout_method || null,
+      terms_accepted_at: a.terms_accepted_at, terms_version: a.terms_version,
       terms_current: a.terms_version === AFF.AFFILIATE_TERMS_VERSION, created_at: a.created_at,
       referrals: db.prepare('SELECT COUNT(*) AS n FROM tenants WHERE referred_by_affiliate_id = ?').get(a.id).n,
       ...affiliateTotals(a.id), clicks: clickStats(a.id),
@@ -1848,7 +1910,7 @@ export function createApp(env = process.env) {
   }
   function payoutBlock(a, available) {
     if (!a.terms_accepted_at) return 'They haven’t accepted the Affiliate Program Terms yet. Ask them to accept on their referral page.';
-    if (!a.w9_on_file) return 'Mark the W-9 as on file before recording a payout.';
+    if (!a.w9_on_file) return 'We need their W-9 before a payout. Ask them to fill it out (button above), or tick “Paper W-9 on file” if you have a signed paper copy.';
     if (available < AFF.MIN_PAYOUT_CENTS) return `The available balance is ${usd(available)}. Payouts start at ${usd(AFF.MIN_PAYOUT_CENTS)}.`;
     return '';
   }
@@ -1856,7 +1918,11 @@ export function createApp(env = process.env) {
     sweepAffiliateLedger();
     const row = superAffiliateRow(a);
     return {
-      affiliate: { ...row, link: affiliateLink(req, a), owner_email: db.prepare(`SELECT email FROM users WHERE tenant_id = ? AND role = 'owner' ORDER BY id LIMIT 1`).get(a.tenant_id)?.email || '' },
+      affiliate: { ...row, link: affiliateLink(req, a), owner_email: row.email, phone: a.tenant_id ? getTenant(a.tenant_id)?.phone || '' : a.phone || '', audience: a.audience || '' },
+      tax: taxSummary(a),
+      w9_history: db.prepare('SELECT id, signed_at, legal_name, tin_type, tin_last4, signer_email FROM affiliate_w9 WHERE affiliate_id = ? ORDER BY id DESC').all(a.id)
+        .map((w) => ({ id: w.id, signed_at: w.signed_at, legal_name: w.legal_name, tin: W9.maskedTin(w.tin_type, w.tin_last4), signer_email: w.signer_email })),
+      access_log: db.prepare('SELECT user_email, what, at FROM sensitive_access_log WHERE affiliate_id = ? ORDER BY id DESC LIMIT 20').all(a.id),
       referrals: referralsOf(a),
       ledger: ledgerOf(a.id).map((l) => ({ id: l.id, date: l.shown_at, created_at: l.created_at, business: l.business || '', tenant_id: l.tenant_id, payment_id: l.payment_id, type: l.type, amount_cents: l.amount_cents, status: l.status, available_at: l.available_at, share_bp: l.share_bp, note: l.note || '', payout_id: l.payout_id, payout_method: l.payout_method || '', reference: l.payout_reference || '' })),
       payouts: db.prepare('SELECT p.id, p.amount_cents, p.method, p.reference, p.paid_at, p.created_at, u.email AS created_by FROM affiliate_payouts p LEFT JOIN users u ON u.id = p.created_by WHERE p.affiliate_id = ? ORDER BY p.paid_at DESC, p.id DESC').all(a.id),
@@ -1927,13 +1993,22 @@ export function createApp(env = process.env) {
 
   // Sign-up credit: a code typed on the form wins, then the link cookie. An affiliate can't refer itself.
   function selfReferral(a, { email, phone }) {
-    const t = getTenant(a.tenant_id);
-    if (!t) return false;
-    const emails = new Set(db.prepare('SELECT email FROM users WHERE tenant_id = ?').all(t.id).map((u) => normEmail(u.email)));
-    if (t.email) emails.add(normEmail(t.email));
+    const emails = new Set(), phones = [];
+    if (a.tenant_id) {
+      const t = getTenant(a.tenant_id);
+      if (!t) return false;
+      for (const u of db.prepare('SELECT email FROM users WHERE tenant_id = ?').all(t.id)) emails.add(normEmail(u.email));
+      if (t.email) emails.add(normEmail(t.email));
+      phones.push(t.phone, t.notify_phone);
+    } else {
+      const u = a.user_id ? getUser(a.user_id) : null;
+      if (u) emails.add(normEmail(u.email));
+      if (a.email) emails.add(normEmail(a.email));
+      phones.push(a.phone);
+    }
     if (email && emails.has(normEmail(email))) return true;
     const k = phoneKey(phone);
-    return Boolean(k && [t.phone, t.notify_phone].some((x) => phoneKey(x) === k));
+    return Boolean(k && phones.some((x) => phoneKey(x) === k));
   }
   function signupReferral(req, b, who) {
     const typed = AFF.normalizeCode(b.referral_code);
@@ -1961,18 +2036,20 @@ export function createApp(env = process.env) {
   route('GET', '/api/public/referral', async (req, res, p, url) => {
     if (limited('ref-lookup:' + clientIp(req), 120, 3600_000)) throw new HttpError(429, 'Too many requests. Try again in a few minutes.');
     const a = liveAffiliate(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE)) || liveAffiliate(url.searchParams.get('code'));
-    send(res, 200, a ? { code: a.code, name: getTenant(a.tenant_id).name } : { code: null });
+    send(res, 200, a ? { code: a.code, name: affiliateName(a) } : { code: null });
   });
 
-  // The business owner's referral page.
+  // The affiliate's own referral page: a person or group signed in with its own login, or the owner
+  // of a business that's an affiliate.
   const ownAffiliate = ({ tenant: t, user, isSuper }) => {
+    if (user.role === 'affiliate') return affiliateOfUser(user.id);
     if (!isSuper && user.role !== 'owner') throw new HttpError(403, 'Only the business owner can see the referral program.');
     return affiliateOfTenant(t.id);
   };
   route('GET', '/api/affiliate', async (req, res, p, url, ctx) => {
     const a = ownAffiliate(ctx);
     send(res, 200, a ? ownerAffiliate(req, a) : { affiliate: null });
-  }, { auth: 'tenant' });
+  }, { auth: 'affiliate' });
   route('POST', '/api/affiliate/terms', async (req, res, p, url, ctx) => {
     if (ctx.isSuper) throw new HttpError(403, 'Only the business owner can accept the Affiliate Program Terms.');
     const a = ownAffiliate(ctx);
@@ -1981,9 +2058,9 @@ export function createApp(env = process.env) {
     if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.');
     const ts = now();
     db.prepare('UPDATE affiliates SET terms_accepted_at = ?, terms_version = ?, updated_at = ? WHERE id = ?').run(ts, AFF.AFFILIATE_TERMS_VERSION, ts, a.id);
-    db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(ctx.user.id, ctx.tenant.id, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+    db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(ctx.user.id, ctx.tenant?.id ?? null, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
     send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
-  }, { auth: 'tenant' });
+  }, { auth: 'affiliate' });
   route('GET', '/api/affiliate/ledger.csv', async (req, res, p, url, ctx) => {
     const a = ownAffiliate(ctx);
     if (!a) throw new HttpError(404, 'Not found');
@@ -1996,15 +2073,244 @@ export function createApp(env = process.env) {
     const rows = ownerLedger(a.id).map((l) => AFF.csvLine([l.month || l.date, l.business, what(l), { usd: l.amount_cents }, l.status.replace('_', ' ')]));
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="referral-earnings.csv"', 'Cache-Control': 'no-store' });
     res.end([AFF.csvLine(['Month or date', 'Business', 'What it is', 'Amount', 'Status']), ...rows].join('\n') + '\n');
-  }, { auth: 'tenant' });
+  }, { auth: 'affiliate' });
+
+  // The W-9 form's choices and wording, for the invitation page and the affiliate's details page.
+  route('GET', '/api/public/w9-form', async (req, res) => send(res, 200, {
+    revision: W9.FORM_REVISION, classes: W9.TAX_CLASSES, llc_classes: W9.LLC_CLASSES, states: W9.STATES,
+    exempt_payee_codes: W9.EXEMPT_PAYEE_CODES, fatca_codes: W9.FATCA_CODES, certification: W9.CERTIFICATION, requester: `Agilities Tech, LLC (${platformName})`,
+  }, { 'Cache-Control': 'public, max-age=3600' }));
+
+  // The affiliate updates its own W-9 or payout details. Both need the account password again, so a
+  // borrowed or stolen session can't redirect payouts or change the tax record.
+  function affiliateForChange(ctx, b) {
+    if (ctx.isSuper) throw new HttpError(403, 'Only the affiliate can change its own tax form and payout details.');
+    const a = ownAffiliate(ctx);
+    if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    if (limited('aff-change:' + ctx.user.id, 10, 3600_000)) throw new HttpError(429, 'Too many tries. Wait an hour and try again.');
+    if (!verifyPassword(String(b.password || ''), ctx.user.password_hash)) throw new HttpError(400, 'That password isn’t right. Enter the password you log in with.', 'password');
+    return a;
+  }
+  route('POST', '/api/affiliate/w9', async (req, res, p, url, ctx) => {
+    const b = await json(req);
+    const a = affiliateForChange(ctx, b);
+    const w = formCheck(() => W9.checkW9(b.w9 || {}));
+    saveW9(req, a, w, ctx.user);
+    notify.email(affiliateEmail(a), `We got your new W-9 for ${platformName}`, `A new W-9 (tax ID ending in ${W9.tinLast4(w.tin)}) was submitted for your referral account on ${now()} UTC.\n\nIf you didn't do this, reply to this email right away.\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(platformEmail, `${affiliateName(a)} sent a new W-9`, `${affiliateName(a)} (code ${a.code}) submitted a new W-9 on ${now()} UTC.${w.backup_withholding ? '\n\nThey say the IRS has them on backup withholding. Talk to your accountant before the next payout.' : ''}\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
+    send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
+  }, { auth: 'affiliate' });
+  route('POST', '/api/affiliate/payout', async (req, res, p, url, ctx) => {
+    const b = await json(req);
+    const a = affiliateForChange(ctx, b);
+    const pay = checkPayout(b.payout || {});
+    savePayout(req, a, pay, ctx.user);
+    const how = pay.method === 'ach' ? `direct deposit to the account ending in ${pay.bank.account.slice(-4)}` : 'a check mailed to the address on your W-9';
+    // Tell them right away, so a change they didn't make is caught before money moves.
+    notify.email(affiliateEmail(a), `Your ${platformName} payout details changed`, `Your referral payouts will now go by ${how}. This change was made on ${now()} UTC.\n\nIf you didn't make this change, reply to this email right away so we can hold your payouts.\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(platformEmail, `${affiliateName(a)} changed payout details`, `${affiliateName(a)} (code ${a.code}) changed payout details to ${pay.method === 'ach' ? 'ACH, account ending ' + pay.bank.account.slice(-4) : 'check'} on ${now()} UTC. Confirm with them before the next payout if this looks unexpected.\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
+    send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
+  }, { auth: 'affiliate' });
+
+  // ---- invitations ----
+  // An Agilities admin invites someone by email. The emailed link (valid INVITE_DAYS, one use) opens
+  // a page where they set up a login (or confirm their business login), sign a W-9, give payout
+  // details, accept the Affiliate Program Terms, and get their referral link.
+  const INVITE_DAYS = 14;
+  const inviteLink = (req, token) => `${siteOrigin(req)}/admin/#/join/${token}`;
+  const userByEmail = (email) => db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const inviteRow = (i) => ({
+    id: i.id, email: i.email, share_bp: i.share_bp, months: i.months, status: i.status === 'pending' && i.expires_at <= now() ? 'expired' : i.status,
+    expires_at: i.expires_at, sent_count: i.sent_count, last_sent_at: i.last_sent_at, created_at: i.created_at, accepted_at: i.accepted_at, affiliate_id: i.affiliate_id,
+  });
+  const shareSpan = (months) => (months ? `for ${months} month${months === 1 ? '' : 's'} after each one signs up` : `for as long as each one uses ${platformName}`);
+  // Who can't be invited: anyone already in the program, and logins that aren't a business owner's.
+  function inviteBlock(email) {
+    const u = userByEmail(email);
+    if (u && u.role === 'super') return 'That’s an Agilities admin login. Use a different email.';
+    if (u && u.role === 'staff') return 'That email is a staff login at a business. Invite the business owner, or use a different email.';
+    if (u && u.role === 'affiliate' && affiliateOfUser(u.id)) return 'That person is already an affiliate. Open them from the list.';
+    if (u && u.role === 'owner' && u.tenant_id && affiliateOfTenant(u.tenant_id)) return `${getTenant(u.tenant_id)?.name || 'That business'} is already an affiliate. Open it from the list, then use “Ask for W-9 and payout details”.`;
+    if (db.prepare('SELECT 1 FROM affiliates WHERE email = ? COLLATE NOCASE').get(email)) return 'That email already belongs to an affiliate. Open them from the list.';
+    return '';
+  }
+  async function sendInvite(req, inv, token) {
+    const link = inviteLink(req, token);
+    const emailed = await notify.email(inv.email, `You’re invited to the ${platformName} referral program`,
+      `Hi,\n\n${platformName} helps mobile RV repair businesses run their jobs, quotes and payments. You’re invited to refer businesses to it and earn ${inv.share_bp / 100}% of the fee ${platformName} keeps on their card payments, ${shareSpan(inv.months)}.\n\n`
+      + `Set up your account, fill out a W-9 tax form, and get your referral link here. It takes about 10 minutes:\n${link}\n\n`
+      + `Have your Social Security number or EIN ready, and your bank’s routing and account numbers if you want direct deposit. The link works for ${INVITE_DAYS} days and is just for you.\n\nQuestions? Reply to this email.\n\n${platformName}`,
+      { replyTo: platformEmail });
+    db.prepare('UPDATE affiliate_invites SET sent_count = sent_count + ?, last_sent_at = CASE WHEN ? THEN ? ELSE last_sent_at END WHERE id = ?').run(emailed ? 1 : 0, emailed ? 1 : 0, now(), inv.id);
+    return { emailed, link };
+  }
+  route('POST', '/api/super/affiliate-invites', async (req, res, p, url, ctx) => {
+    if (!sealed) throw new HttpError(409, TAX_NOT_READY);
+    const b = await json(req);
+    const email = clean(b.email, 200).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Enter the email address to send the invitation to.', 'email');
+    const share = formField('share', () => cleanShare(b.share_bp)), months = formField('months', () => cleanMonths(b.months));
+    const blocked = inviteBlock(email);
+    if (blocked) throw new HttpError(409, blocked, 'email');
+    const token = randomToken(24);
+    db.prepare(`UPDATE affiliate_invites SET status = 'canceled' WHERE email = ? AND status = 'pending'`).run(email); // a new invitation replaces an old one
+    const r = db.prepare('INSERT INTO affiliate_invites (email, share_bp, months, token_hash, expires_at, created_by) VALUES (?,?,?,?,?,?)')
+      .run(email, share, months, sha256(token), sqlTime(now(), `+${INVITE_DAYS} days`), ctx.user.id);
+    const inv = db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(Number(r.lastInsertRowid));
+    const sent = await sendInvite(req, inv, token);
+    send(res, 201, { invite: inviteRow(db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(inv.id)), ...sent });
+  }, { auth: 'super' });
+  // A fresh link (the old one stops working) and another 14 days.
+  route('POST', '/api/super/affiliate-invites/:id/resend', async (req, res, p) => {
+    const inv = db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(p.id);
+    if (!inv) throw new HttpError(404, 'Not found');
+    if (inv.status !== 'pending') throw new HttpError(409, inv.status === 'accepted' ? 'They already joined.' : 'This invitation was canceled. Send a new one.');
+    const blocked = inviteBlock(inv.email);
+    if (blocked) throw new HttpError(409, blocked);
+    const token = randomToken(24);
+    db.prepare('UPDATE affiliate_invites SET token_hash = ?, expires_at = ? WHERE id = ?').run(sha256(token), sqlTime(now(), `+${INVITE_DAYS} days`), inv.id);
+    const sent = await sendInvite(req, db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(inv.id), token);
+    send(res, 200, { invite: inviteRow(db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(inv.id)), ...sent });
+  }, { auth: 'super' });
+  route('POST', '/api/super/affiliate-invites/:id/cancel', async (req, res, p) => {
+    const ch = db.prepare(`UPDATE affiliate_invites SET status = 'canceled' WHERE id = ? AND status = 'pending'`).run(p.id).changes;
+    if (!ch) throw new HttpError(409, 'That invitation isn’t waiting anymore. Reload the page.');
+    send(res, 200, { ok: true });
+  }, { auth: 'super' });
+
+  // Field-specific messages for checks that throw plain HttpErrors.
+  function formField(field, fn) {
+    try { return fn(); } catch (e) { if (e instanceof HttpError && !e.field) e.field = field; throw e; }
+  }
+  // An invitation that can still be used: the token matches, it's pending, and it hasn't expired.
+  function openInvite(token) {
+    const inv = /^[\w-]{20,64}$/.test(token || '') ? db.prepare('SELECT * FROM affiliate_invites WHERE token_hash = ?').get(sha256(token)) : null;
+    if (!inv || inv.status !== 'pending' || inv.expires_at <= now()) throw new HttpError(404, `This invitation link has expired or was already used. Ask ${platformName} to send a new one.`);
+    return inv;
+  }
+  // Who is accepting: a new login, the owner of a business (signs in with their password), or nobody
+  // (an email we can't use for an affiliate).
+  function inviteAccount(inv) {
+    const u = userByEmail(inv.email);
+    if (!u) return { kind: 'new' };
+    if (u.role === 'owner' && u.tenant_id && getTenant(u.tenant_id)) return { kind: 'business', user: u, tenant: getTenant(u.tenant_id) };
+    return { kind: 'blocked', user: u };
+  }
+  function codeCheck(raw, fallback) {
+    const c = AFF.normalizeCode(raw);
+    if (!c) return { code: fallback, ok: true, message: '' };
+    if (!AFF.CODE_RE.test(c)) return { code: c, ok: false, message: 'Use 3 to 40 lowercase letters, numbers or dashes, like utah-rv-club.' };
+    if (db.prepare('SELECT 1 FROM affiliates WHERE code = ?').get(c)) return { code: c, ok: false, message: 'That one’s taken. Try another.' };
+    return { code: c, ok: true, message: '' };
+  }
+  // The token travels in the request body, never the URL, so it doesn't land in request logs. (In the
+  // browser it's after the #, which isn't sent to the server.)
+  route('POST', '/api/public/affiliate-invites/lookup', async (req, res) => {
+    if (limited('aff-invite:' + clientIp(req), 120, 3600_000)) throw new HttpError(429, 'Too many requests. Try again in a few minutes.');
+    const q = await json(req);
+    const inv = openInvite(q.token);
+    const acct = inviteAccount(inv);
+    const base = acct.kind === 'business' ? acct.tenant.slug : slugify(inv.email.split('@')[0].replace(/[._+]+/g, '-'));
+    const suggested = uniqueCode(AFF.codeFromSlug(base));
+    const check = q.code !== undefined ? codeCheck(q.code, suggested) : null;
+    send(res, 200, {
+      email: inv.email, share_bp: inv.share_bp, months: inv.months, expires_at: inv.expires_at, platform: platformName,
+      account: acct.kind, business_name: acct.kind === 'business' ? acct.tenant.name : null, suggested_code: suggested, link_base: `${siteOrigin(req)}/a/`,
+      hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS, terms_url: '/legal/affiliate-terms', terms_version: AFF.AFFILIATE_TERMS_VERSION,
+      tax_ready: Boolean(sealed), ...(check ? { code_check: check } : {}),
+    });
+  });
+  route('POST', '/api/public/affiliate-invites/accept', async (req, res) => {
+    if (limited('aff-join:' + clientIp(req), 30, 3600_000)) throw new HttpError(429, 'Too many tries from this network. Wait an hour and try again.');
+    const b = await json(req);
+    const inv = openInvite(b.token);
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const acct = inviteAccount(inv);
+    if (acct.kind === 'blocked') throw new HttpError(409, `This email already has a ${platformName} login that can’t be used for the referral program. Email support for help.`);
+    if (acct.kind === 'business') {
+      if (limited('aff-join-pw:' + inv.id, 10, 3600_000)) throw new HttpError(429, 'Too many password tries. Wait an hour and try again.');
+      if (!verifyPassword(String(b.password || ''), acct.user.password_hash)) throw new HttpError(400, `That password doesn’t match your ${platformName} login. Use the password you log in with.`, 'password');
+    } else if (String(b.password || '').length < 10) throw new HttpError(400, 'Choose a password of at least 10 characters.', 'password');
+    const name = acct.kind === 'business' ? acct.tenant.name : clean(b.name, 120);
+    if (name.length < 2) throw new HttpError(400, 'Enter your name, or your group’s or company’s name.', 'name');
+    const phone = clean(b.phone, 40), audience = clean(b.audience, 500);
+    const cc = codeCheck(b.code, '');
+    if (!cc.code || !cc.ok) throw new HttpError(400, cc.message || 'Choose your link name.', 'code');
+    const w = formCheck(() => W9.checkW9(b.w9 || {}));
+    const pay = checkPayout(b.payout || {});
+    if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.', 'agree');
+    if (acct.kind === 'business' && affiliateOfTenant(acct.tenant.id)) throw new HttpError(409, `${acct.tenant.name} is already in the referral program. Log in to see your link.`);
+    let user = acct.user, a;
+    const ts = now();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // The same link, still pending and unexpired at this moment (not just when the request started).
+      if (!db.prepare(`UPDATE affiliate_invites SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending' AND token_hash = ? AND expires_at > ?`).run(ts, inv.id, inv.token_hash, ts).changes) throw new HttpError(409, 'This invitation link was already used, replaced or expired. Log in, or ask for a new link.');
+      if (!user) {
+        const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role, last_login_at) VALUES (NULL, ?, ?, ?, 'affiliate', ?)`).run(inv.email, name, hashPassword(b.password), ts);
+        user = getUser(Number(u.lastInsertRowid));
+      } else db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(ts, user.id);
+      const isBiz = acct.kind === 'business';
+      const r = db.prepare(`INSERT INTO affiliates (tenant_id, user_id, code, share_bp, months, name, email, phone, audience, terms_accepted_at, terms_version, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(isBiz ? acct.tenant.id : null, isBiz ? null : user.id, cc.code, inv.share_bp, inv.months, isBiz ? null : name, isBiz ? null : inv.email, phone || null, audience || null, ts, AFF.AFFILIATE_TERMS_VERSION, ts, ts);
+      a = getAffiliate(Number(r.lastInsertRowid));
+      logRate(a);
+      db.prepare('UPDATE affiliate_invites SET affiliate_id = ? WHERE id = ?').run(a.id, inv.id);
+      db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(user.id, isBiz ? acct.tenant.id : null, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+      saveW9(req, a, w, user);
+      savePayout(req, a, pay, user);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+    a = getAffiliate(a.id);
+    const link = affiliateLink(req, a);
+    notify.email(inv.email, `Your ${platformName} referral link`, `You’re in. Here’s your referral link:\n${link}\n\nYou earn ${a.share_bp / 100}% of the fee ${platformName} keeps on card payments from each business that signs up through it, ${shareSpan(a.months)}. Businesses can also type your code, ${a.code}, when they sign up.\n\nWhen you share your link, say that you earn a share if they sign up.\n\nSee your clicks, referrals and earnings any time: ${siteOrigin(req)}/admin/\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(platformEmail, `New affiliate: ${affiliateName(a)}`, `${affiliateName(a)} <${inv.email}> accepted the invitation and joined the referral program (code ${a.code}, ${a.share_bp / 100}%${a.months ? `, ${a.months} months` : ''}). W-9 received; payouts by ${a.payout_method === 'ach' ? 'ACH' : 'check'}.\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
+    send(res, 201, { link, code: a.code, name: affiliateName(a), share_bp: a.share_bp, months: a.months }, { 'Set-Cookie': cookie(req, sess.create(user.id), sess.maxAge) });
+  });
+
+  // Super admin: the full W-9 (printable hard copy) and bank details. Every view is logged.
+  route('GET', '/api/super/affiliates/:id/w9', async (req, res, p, url, ctx) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const wid = Number(url.searchParams.get('w')) || 0;
+    const w = wid ? db.prepare('SELECT * FROM affiliate_w9 WHERE id = ? AND affiliate_id = ?').get(wid, a.id) : latestW9(a.id);
+    if (!w) throw new HttpError(404, 'No W-9 has been submitted online for this affiliate.');
+    let tin;
+    try { tin = sealed.open(w.tin_sealed, tinContext(a.id)); } catch { throw new HttpError(409, 'This W-9 can’t be read with the current DATA_ENCRYPTION_KEY. Was the key changed?'); }
+    logSensitive(req, ctx.user, a.id, 'w9_viewed');
+    const fields = { ...w, tin, llc_class: w.llc_class || '', other_class: w.other_class || '', business_name: w.business_name || '', exempt_payee_code: w.exempt_payee_code || '', fatca_code: w.fatca_code || '' };
+    const intact = W9.recordHash(fields, w.signed_at, sealed.fingerprint) === w.record_sha256;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex', ...securityHeaders });
+    res.end(W9.renderW9Record({ w, tin, requester: `Agilities Tech, LLC (${platformName})`, viewedBy: ctx.user.email, viewedAt: now(), intact }));
+  }, { auth: 'super' });
+  route('POST', '/api/super/affiliates/:id/bank', async (req, res, p, url, ctx) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    if (a.payout_method !== 'ach' || !a.payout_sealed) throw new HttpError(404, 'They chose to be paid by check, so there are no bank details.');
+    let bank;
+    try { bank = JSON.parse(sealed.open(a.payout_sealed, bankContext(a.id))); } catch { throw new HttpError(409, 'These bank details can’t be read with the current DATA_ENCRYPTION_KEY. Was the key changed?'); }
+    logSensitive(req, ctx.user, a.id, 'bank_viewed');
+    send(res, 200, { holder: bank.holder, routing: bank.routing, account: bank.account, type: bank.type, updated_at: a.payout_updated_at });
+  }, { auth: 'super' });
+  // Email an existing affiliate a link to fill out (or update) their W-9 and payout details.
+  route('POST', '/api/super/affiliates/:id/request-details', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(409, TAX_NOT_READY);
+    const to = affiliateEmail(a);
+    const link = `${siteOrigin(req)}/admin/#/${a.tenant_id ? 'affiliate/details' : 'account'}`;
+    const emailed = await notify.email(to, `Add your W-9 and payout details for ${platformName} referrals`, `Hi,\n\nTo pay your referral earnings, we need a W-9 tax form and how you’d like to be paid. Log in and fill them out here (about 5 minutes):\n${link}\n\nHave your Social Security number or EIN ready, and your bank’s routing and account numbers if you want direct deposit.\n\n${platformName}`, { replyTo: platformEmail });
+    send(res, 200, { emailed, link, to });
+  }, { auth: 'super' });
 
   // Super admin: affiliates, referrals, payouts.
   route('GET', '/api/super/affiliates', async (req, res) => {
     sweepAffiliateLedger();
-    const affiliates = db.prepare('SELECT a.* FROM affiliates a JOIN tenants t ON t.id = a.tenant_id ORDER BY t.name COLLATE NOCASE').all().map(superAffiliateRow);
-    const businesses = db.prepare('SELECT id, name, slug FROM tenants WHERE id NOT IN (SELECT tenant_id FROM affiliates) ORDER BY name COLLATE NOCASE').all();
+    const affiliates = db.prepare('SELECT a.* FROM affiliates a LEFT JOIN tenants t ON t.id = a.tenant_id ORDER BY COALESCE(t.name, a.name) COLLATE NOCASE').all().map(superAffiliateRow);
+    const businesses = db.prepare('SELECT id, name, slug FROM tenants WHERE id NOT IN (SELECT tenant_id FROM affiliates WHERE tenant_id IS NOT NULL) ORDER BY name COLLATE NOCASE').all();
     const years = db.prepare(`SELECT DISTINCT substr(paid_at, 1, 4) AS y FROM affiliate_payouts ORDER BY y DESC`).all().map((r) => r.y);
-    send(res, 200, { affiliates, businesses, years: [...new Set([now().slice(0, 4), ...years])], min_payout_cents: AFF.MIN_PAYOUT_CENTS });
+    const invites = db.prepare(`SELECT * FROM affiliate_invites WHERE status = 'pending' OR (status = 'accepted' AND accepted_at >= ?) ORDER BY id DESC LIMIT 200`).all(sqlTime(now(), '-30 days')).map(inviteRow);
+    send(res, 200, { affiliates, businesses, invites, tax_ready: Boolean(sealed), email_enabled: notify.emailEnabled, years: [...new Set([now().slice(0, 4), ...years])], min_payout_cents: AFF.MIN_PAYOUT_CENTS });
   }, { auth: 'super' });
   route('POST', '/api/super/affiliates', async (req, res) => {
     const b = await json(req);
@@ -2021,18 +2327,20 @@ export function createApp(env = process.env) {
   }, { auth: 'super' });
   route('GET', '/api/super/affiliate-payouts.csv', async (req, res, p, url) => {
     const year = /^\d{4}$/.test(url.searchParams.get('year') || '') ? url.searchParams.get('year') : now().slice(0, 4);
-    const rows = db.prepare(`SELECT a.code, a.w9_on_file, a.w9_on_file_at, t.name, t.legal_profile,
-        (SELECT email FROM users u WHERE u.tenant_id = t.id AND u.role = 'owner' ORDER BY u.id LIMIT 1) AS owner_email,
-        COUNT(p.id) AS payouts, SUM(p.amount_cents) AS total
-      FROM affiliate_payouts p JOIN affiliates a ON a.id = p.affiliate_id JOIN tenants t ON t.id = a.tenant_id
-      WHERE substr(p.paid_at, 1, 4) = ? GROUP BY a.id ORDER BY t.name COLLATE NOCASE`).all(year);
+    const rows = db.prepare(`SELECT a.*, t.legal_profile, COUNT(p.id) AS payouts, SUM(p.amount_cents) AS total
+      FROM affiliate_payouts p JOIN affiliates a ON a.id = p.affiliate_id LEFT JOIN tenants t ON t.id = a.tenant_id
+      WHERE substr(p.paid_at, 1, 4) = ? GROUP BY a.id ORDER BY COALESCE(t.name, a.name) COLLATE NOCASE`).all(year);
+    // Form 1099-NEC/MISC threshold: $600 through 2025 payments, $2,000 for 2026 payments (indexed after 2026).
+    const threshold = Number(year) <= 2025 ? 60000 : 200000;
     const lines = rows.map((r) => {
+      const w = latestW9(r.id);
       const lp = customerTerms.parseProfile(r.legal_profile) || {};
-      const address = [lp.addressLine1, lp.addressLine2, lp.city, [lp.state, lp.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
-      return AFF.csvLine([year, r.name, lp.legalName || '', address, r.owner_email || '', r.code, r.w9_on_file ? `yes (${(r.w9_on_file_at || '').slice(0, 10)})` : 'no', String(r.payouts), { usd: r.total }]);
+      const address = w ? `${w.address}, ${w.city}, ${w.state} ${W9.zipText(w.zip)}` : [lp.addressLine1, lp.addressLine2, lp.city, [lp.state, lp.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+      return AFF.csvLine([year, affiliateName(r), w ? w.legal_name : lp.legalName || '', w?.business_name || '', w ? W9.classText(w) : '', w ? W9.maskedTin(w.tin_type, w.tin_last4) : '', address, affiliateEmail(r), r.code,
+        w ? `electronic (${w.signed_at.slice(0, 10)})` : r.w9_on_file ? `paper (${(r.w9_on_file_at || '').slice(0, 10)})` : 'no', w?.backup_withholding ? 'yes' : '', String(r.payouts), { usd: r.total }, r.total >= threshold ? 'yes' : 'no']);
     });
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="affiliate-payouts-${year}.csv"`, 'Cache-Control': 'no-store' });
-    res.end([AFF.csvLine(['Year', 'Business', 'Legal name', 'Address on file', 'Owner email', 'Affiliate code', 'W-9 on file', 'Payouts', 'Total paid']), ...lines].join('\n') + '\n');
+    res.end([AFF.csvLine(['Year', 'Affiliate', 'Legal name (W-9 line 1)', 'Business name (line 2)', 'Tax classification', 'Tax ID (last 4)', 'Address', 'Email', 'Affiliate code', 'W-9', 'Backup withholding', 'Payouts', 'Total paid', `At or over ${usd(threshold).replace('.00', '')} (1099 likely)`]), ...lines].join('\n') + '\n');
   }, { auth: 'super' });
   route('GET', '/api/super/affiliates/:id', async (req, res, p) => {
     const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
@@ -2095,9 +2403,9 @@ export function createApp(env = process.env) {
   function tenantReferral(t) {
     const a = t.referred_by_affiliate_id ? getAffiliate(t.referred_by_affiliate_id) : null;
     return {
-      referred_by: a ? { id: a.id, code: a.code, name: getTenant(a.tenant_id)?.name || '' } : null,
+      referred_by: a ? { id: a.id, code: a.code, name: affiliateName(a) } : null,
       referred_at: t.referred_at, how: t.referred_how, joined: t.created_at, own_affiliate_id: affiliateOfTenant(t.id)?.id ?? null,
-      affiliates: db.prepare('SELECT a.id, a.code, a.status, t.name FROM affiliates a JOIN tenants t ON t.id = a.tenant_id WHERE a.tenant_id != ? ORDER BY t.name COLLATE NOCASE').all(t.id),
+      affiliates: db.prepare('SELECT a.id, a.code, a.status, COALESCE(t.name, a.name) AS name FROM affiliates a LEFT JOIN tenants t ON t.id = a.tenant_id WHERE a.tenant_id IS NULL OR a.tenant_id != ? ORDER BY COALESCE(t.name, a.name) COLLATE NOCASE').all(t.id),
     };
   }
   route('GET', '/api/super/tenants/:id/referral', async (req, res, p) => {
@@ -2493,7 +2801,9 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
             if (!ctx) throw new HttpError(401, 'Please log in.');
             if (req.method !== 'GET' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) throw new HttpError(403, 'Forbidden');
             if (r.auth === 'super' && !ctx.isSuper) throw new HttpError(403, 'Forbidden');
-            if (r.auth === 'tenant' || r.auth === 'owner') {
+            // 'affiliate': a referral partner's own login (no business), or a business user as for 'tenant'.
+            if (r.auth === 'affiliate' && ctx.user.role === 'affiliate') { /* no business to check */ }
+            else if (r.auth === 'tenant' || r.auth === 'owner' || r.auth === 'affiliate') {
               if (!ctx.tenant) throw new HttpError(ctx.isSuper ? 409 : 403, ctx.isSuper ? 'Choose a business to view first.' : 'Forbidden');
               if (!ctx.isSuper && ctx.tenant.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact support.');
               if (!ctx.isSuper && needsAgreements(ctx.user)) throw new HttpError(428, 'Please accept the updated agreements.');
@@ -2594,7 +2904,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
     } catch (e) {
       const status = e.status || 500;
       if (status === 500) console.error(e);
-      if (!res.headersSent) send(res, status, { error: status === 500 ? 'Something went wrong. Try again.' : e.message });
+      if (!res.headersSent) send(res, status, { error: status === 500 ? 'Something went wrong. Try again.' : e.message, ...(e.field && status !== 500 ? { field: e.field } : {}) });
       else res.end();
     }
   }
