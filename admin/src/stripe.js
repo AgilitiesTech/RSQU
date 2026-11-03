@@ -37,7 +37,7 @@ export function stripeClient(env) {
     if (account) headers['Stripe-Account'] = account;
     const res = await fetch(base + pathname, { method, headers, body: body ? form(body).toString() : undefined });
     const json = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(json?.error?.message || `Stripe error ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(json?.error?.message || `Stripe error ${res.status}`), { status: res.status });
     return json;
   }
 
@@ -154,6 +154,10 @@ export function stripeClient(env) {
     // for direct charges; omit it for legacy platform charges.
     retrieveCheckout(id, account) {
       return call('GET', `/v1/checkout/sessions/${encodeURIComponent(id)}?expand[]=payment_intent.latest_charge.balance_transaction`, null, { account });
+    },
+    // Closes an open Checkout so it can't be paid. Stripe refuses if it isn't open (already paid or expired).
+    expireCheckout(id, account) {
+      return call('POST', `/v1/checkout/sessions/${encodeURIComponent(id)}/expire`, {}, { account });
     },
     // LEGACY: pays out a platform charge taken under the old model.
     createTransfer({ amountCents, destination, sourceTransaction, group, ref }) {

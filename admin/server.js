@@ -13,7 +13,10 @@ import * as siteProfile from './src/site-profile.js';
 import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
 import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
+import * as AFF from './src/affiliates.js';
 import * as owner from './src/owner-features.js';
+import { sealer } from './src/sealed.js';
+import * as W9 from './src/w9.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -24,6 +27,9 @@ export function createApp(env = process.env) {
   const uploads = path.join(dataDir, 'uploads');
   const stripe = stripeClient(env);
   const notify = notifier(env);
+  // Encrypts affiliates' tax ID and bank numbers (src/sealed.js). Without DATA_ENCRYPTION_KEY, the
+  // app won't take W-9s or bank details at all.
+  const sealed = sealer(env.DATA_ENCRYPTION_KEY);
   const platformEmail = env.PLATFORM_CONTACT_EMAIL || 'aaron@agilitiestech.com';
   const platformName = env.PLATFORM_NAME || BRAND.name;
 
@@ -48,7 +54,8 @@ export function createApp(env = process.env) {
   const hexColor = (v, d) => (/^#[0-9a-fA-F]{6}$/.test(v || '') ? v : d);
   const money = (c) => `$${(c / 100).toFixed(2)}`;
 
-  class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+  // field: the form field the message is about, so the page can point at it.
+  class HttpError extends Error { constructor(status, msg, field) { super(msg); this.status = status; if (field) this.field = field; } }
 
   function send(res, status, body, headers = {}) {
     const isJson = typeof body !== 'string' && !Buffer.isBuffer(body);
@@ -157,7 +164,8 @@ export function createApp(env = process.env) {
   function quoteFull(q) {
     const items = getItems(q.id);
     const payments = db.prepare('SELECT * FROM payments WHERE quote_id = ? ORDER BY id').all(q.id);
-    return { ...q, photos: jparse(q.photos, []), ai_draft: jparse(q.ai_draft, null), items, totals: quoteTotals(q, items), payments };
+    const { totals, paid, due } = quoteDue(q, items);
+    return { ...q, photos: jparse(q.photos, []), ai_draft: jparse(q.ai_draft, null), items, totals, payments, paid_cents: paid, due_cents: due };
   }
 
   // ---------- customers, consent and receipts ----------
@@ -233,7 +241,7 @@ export function createApp(env = process.env) {
     const url = `${publicBase()}/r/${pay.token}`;
     const amount = receiptMoney(pay.amount_cents);
     const sms = toE164(phone);
-    if (sms) await notify.sms(sms, `${t.name}: Thanks${first ? ', ' + first : ''}! We received your payment of ${amount}. Your receipt: ${url}`);
+    if (sms && !smsStopped(sms)) await notify.sms(sms, `${t.name}: Thanks${first ? ', ' + first : ''}! We received your payment of ${amount}. Your receipt: ${url}`);
     if (/^\S+@\S+\.\S+$/.test(email)) {
       const c = findCustomer(t.id, phone, email);
       const unsub = c && c.email_opt_in && normEmail(c.email) === email ? `${publicBase()}/u/${c.unsub_token}` : '';
@@ -247,23 +255,60 @@ export function createApp(env = process.env) {
     }
   }
 
+  // What's still owed on a quote: the balance less quote payments already made (one can cover only
+  // part of it, for example a payment for an older amount).
+  function quoteDue(q, items = getItems(q.id)) {
+    const totals = quoteTotals(q, items);
+    const paid = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS s FROM payments WHERE quote_id = ? AND kind = 'quote' AND status = 'paid'`).get(q.id).s;
+    return { totals, paid, due: Math.max(0, totals.balance - paid) };
+  }
+  const ownerEmail = (t) => db.prepare(`SELECT email FROM users WHERE tenant_id = ? AND role = 'owner' ORDER BY id LIMIT 1`).get(t.id)?.email || t.email || '';
+
+  // Records a payment as paid. A quote is marked paid only once what's owed is covered. A payment on a
+  // voided quote, a second payment, or one for more or less than was due is kept with a note, and the
+  // owner gets a text and an email (they may need to refund it).
   function markPaid(payment, method, sessionId) {
-    if (payment.status === 'paid') return;
     const offline = method !== 'card';
-    db.prepare(`UPDATE payments SET status = 'paid', paid_at = ?, method = ?, stripe_session_id = COALESCE(?, stripe_session_id), fee_cents = CASE WHEN ? THEN 0 ELSE fee_cents END WHERE id = ?`)
+    const claimed = db.prepare(`UPDATE payments SET status = 'paid', paid_at = ?, method = ?, stripe_session_id = COALESCE(?, stripe_session_id), fee_cents = CASE WHEN ? THEN 0 ELSE fee_cents END WHERE id = ? AND status != 'paid'`)
       .run(now(), method, sessionId || null, offline ? 1 : 0, payment.id);
+    if (!claimed.changes) return;
     const t = getTenant(payment.tenant_id);
+    let note = '';
     if (payment.kind === 'deposit') {
       refreshCredits(payment.request_id);
       notify.sms(t?.notify_phone, `${money(payment.amount_cents)} deposit paid (request #${payment.request_id}).`);
     } else if (payment.quote_id) {
-      db.prepare(`UPDATE quotes SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), payment.quote_id);
       const q = db.prepare('SELECT * FROM quotes WHERE id = ?').get(payment.quote_id);
-      setRequestStatus(q?.request_id, 'paid');
-      notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
+      const { totals, paid } = quoteDue(q);
+      const before = paid - payment.amount_cents, what = q.kind === 'invoice' ? 'invoice' : 'proposal';
+      if (q.status === 'void') note = `This payment came in after you voided the ${what}. You may need to refund it.`;
+      else if (q.status === 'paid' || (before > 0 && before >= totals.balance)) note = `The ${what} was already paid, so the customer paid twice. You may need to refund ${money(payment.amount_cents)}.`;
+      else if (paid > totals.balance) note = `The customer paid ${money(paid - totals.balance)} more than was due. You may need to refund the difference.`;
+      else if (paid < totals.balance) note = `The customer paid less than the balance. ${money(totals.balance - paid)} is still due.`;
+      if (q.status !== 'void' && q.status !== 'paid' && paid >= totals.balance) {
+        db.prepare(`UPDATE quotes SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), q.id);
+        setRequestStatus(q.request_id, 'paid');
+      }
+      if (note) {
+        db.prepare('UPDATE payments SET note = ? WHERE id = ?').run(note, payment.id);
+        paymentNeedsAttention(t, q, { ...payment, method }, note);
+      } else notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
     }
     sendReceipt(payment.id).catch((e) => console.error('Receipt failed', e));
-    try { scheduleReviewRequest(payment.id); } catch (e) { console.error('Review request failed', e); } // owner features
+    if (!note) try { scheduleReviewRequest(payment.id); } catch (e) { console.error('Review request failed', e); } // owner features
+  }
+  function paymentNeedsAttention(t, q, pay, note) {
+    const what = q.kind === 'invoice' ? 'invoice' : 'proposal';
+    const link = `${publicBase()}/admin/#/quotes/${q.id}`;
+    const who = q.signer_name || q.customer_name || 'customer';
+    notify.sms(t.notify_phone, `A payment needs your attention: ${money(pay.amount_cents)} for ${what} #${q.id} (${who}). ${note} ${link}`);
+    const to = ownerEmail(t);
+    if (!to) return;
+    notify.email(to, `A payment needs your attention: ${what} #${q.id}`, [
+      'Hi,', '', `A payment of ${money(pay.amount_cents)} ${pay.method === 'card' ? 'was made online' : `was recorded (${pay.method})`} for ${what} #${q.id}, ${q.title} (${who}).`, '', note, '',
+      ...(pay.method === 'card' ? ['You refund card payments from your Stripe Dashboard.', ''] : []),
+      `Open the ${what}: ${link}`, '', platformName,
+    ].join('\n')).catch(() => {});
   }
 
   function saveImage(dataUrl, prefix, maxBytes) {
@@ -315,8 +360,17 @@ export function createApp(env = process.env) {
 
   // `termsVersion`: the customer terms version the customer accepted (signed on the proposal, or
   // shown on the payment page). Recorded on the payment and in Stripe metadata.
+  // One Checkout per payment: a reload or a second tab gets the customer's open Checkout back.
   async function startCheckout(req, t, payment, { successPath, cancelPath, email, termsVersion }) {
     if (!onlineReady(t)) throw new HttpError(503, 'Online payments aren’t set up yet for this business. Please pay directly.');
+    if (payment.stripe_session_id) {
+      const st = await checkoutState(payment);
+      if (st.state === 'paying') throw new HttpError(409, PAYING_NOW);
+      if (st.state === 'open') {
+        if (st.session.amount_total === payment.amount_cents && payment.charge_type === 'direct' && payment.stripe_account === t.stripe_account_id && st.session.url) return st.session.url;
+        await expireCheckout(payment, PAYING_NOW);
+      }
+    }
     const base = baseUrl(req);
     const sep = successPath.includes('?') ? '&' : '?';
     const terms = (termsVersion && db.prepare('SELECT * FROM customer_terms WHERE tenant_id = ? AND version = ?').get(t.id, termsVersion)) || latestTerms(t.id);
@@ -336,6 +390,45 @@ export function createApp(env = process.env) {
     db.prepare(`UPDATE payments SET stripe_session_id = ?, charge_type = 'direct', stripe_account = ?, customer_terms_version = ? WHERE id = ?`)
       .run(session.id, t.stripe_account_id, terms.version, payment.id);
     return session.url;
+  }
+
+  const PAYING_NOW = 'Your payment is going through. Refresh this page in a minute.';
+  const OWNER_PAYING_NOW = 'The customer is paying right now. Refresh in a minute.';
+  const checkoutAccount = (pay) => (pay.charge_type === 'direct' ? pay.stripe_account : undefined);
+  // Where a payment's Checkout stands at Stripe: 'open', 'paying' (finished, or a bank payment still
+  // clearing) or 'gone' (expired, failed or not found), with the session when there is one.
+  async function checkoutState(pay) {
+    if (!pay.stripe_session_id || !stripe.enabled) return { state: 'gone' };
+    let s;
+    try { s = await stripe.retrieveCheckout(pay.stripe_session_id, checkoutAccount(pay)); }
+    catch (e) {
+      if (e.status === 404 || /^No such/i.test(e.message)) return { state: 'gone' };
+      throw new HttpError(502, 'We couldn’t reach Stripe. Try again in a minute.');
+    }
+    if (s.status === 'open') return { state: 'open', session: s };
+    if (s.status === 'complete') {
+      const pi = s.payment_intent && typeof s.payment_intent === 'object' ? s.payment_intent : null;
+      const failed = s.payment_status !== 'paid' && pi && ['requires_payment_method', 'canceled'].includes(pi.status);
+      return { state: failed ? 'gone' : 'paying', session: s };
+    }
+    return { state: 'gone', session: s };
+  }
+  // Closes a payment's open Checkout so it can't be paid. If Stripe won't close it because the customer
+  // already paid, refuses with `busy`.
+  async function expireCheckout(pay, busy) {
+    if (!pay.stripe_session_id || !stripe.enabled) return;
+    try { await stripe.expireCheckout(pay.stripe_session_id, checkoutAccount(pay)); return; } catch { /* not open: find out why */ }
+    const st = await checkoutState(pay);
+    if (st.state === 'paying') throw new HttpError(409, busy);
+    if (st.state === 'open') throw new HttpError(502, 'We couldn’t reach Stripe. Try again in a minute.');
+  }
+  // Expires and cancels every unpaid card payment on a quote (all of them, or all but `keepAmount`).
+  async function closeQuoteCheckouts(quoteId, busy, keepAmount = null) {
+    const open = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND method = 'card'`).all(quoteId).filter((p) => p.amount_cents !== keepAmount);
+    for (const pay of open) {
+      await expireCheckout(pay, busy);
+      db.prepare(`UPDATE payments SET status = 'canceled' WHERE id = ? AND status = 'pending'`).run(pay.id);
+    }
   }
 
   // After an online payment succeeds, record the Processing Fee (Stripe's fee + platform share).
@@ -395,6 +488,7 @@ export function createApp(env = process.env) {
         .run(ch.id, stripeFee, share, net, pay.id);
       // A webhook and the return-page confirm can arrive together: only the first one notifies.
       if (r.changes) notify.sms(t?.notify_phone, `${money(net)} added to your Stripe balance (${money(pay.amount_cents)} paid, ${money(stripeFee + share)} Processing Fee).`);
+      syncAffiliateLedger(pay.id);
     } catch (e) {
       db.prepare(`UPDATE payments SET transfer_status = 'pending', transfer_error = ? WHERE id = ?`).run(String(e.message).slice(0, 300), pay.id);
     }
@@ -413,6 +507,7 @@ export function createApp(env = process.env) {
     const due = target - (fee.amount_refunded || 0);
     if (due > 0) await stripe.refundApplicationFee(feeId, due, `appfee-refund-${feeId}-${target}`);
     db.prepare('UPDATE payments SET fee_refunded_cents = ? WHERE id = ?').run(Math.max(target, fee.amount_refunded || 0), pay.id);
+    syncAffiliateLedger(pay.id);
   }
 
   async function retryPayouts(tenantId) {
@@ -475,9 +570,11 @@ export function createApp(env = process.env) {
     if (String(b.password || '').length < 10) throw new HttpError(400, 'Use a password of at least 10 characters.');
     if (!b.agree) throw new HttpError(400, 'Please accept the Terms of Service, Privacy Policy and Payment Processing and Fee Terms.');
     if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) throw new HttpError(409, 'That email already has an account. Log in instead.');
+    const ref = signupReferral(req, b, { email, phone });
     const t = db.prepare(`INSERT INTO tenants (slug, name, phone, email, notify_phone, terms) VALUES (?,?,?,?,?,?)`)
       .run(uniqueSlug(business), business, phone, email, phone, 'Work is done as described above. Anything not listed is quoted separately and only done with your approval. Payment is due when the work is complete.');
     const tid = Number(t.lastInsertRowid);
+    if (ref) setReferral(tid, ref.affiliate.id, ref.how);
     const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role, last_login_at) VALUES (?,?,?,?, 'owner', ?)`).run(tid, email, name, hashPassword(b.password), now());
     const user = getUser(Number(u.lastInsertRowid));
     recordAgreements(req, user, tid);
@@ -582,6 +679,8 @@ export function createApp(env = process.env) {
     if (!q || q.status === 'void' || !t) throw new HttpError(404, 'This proposal isn’t available.');
     if (q.status === 'draft') db.prepare(`UPDATE quotes SET status = 'sent', updated_at = ? WHERE id = ?`).run(now(), q.id);
     const full = quoteFull({ ...q, status: q.status === 'draft' ? 'sent' : q.status });
+    // Until it's paid, the balance shown is what's still owed (after any part already paid).
+    if (full.status !== 'paid') full.totals = { ...full.totals, paid: full.paid_cents, balance: full.due_cents };
     send(res, 200, {
       id: full.id, kind: full.kind || 'proposal', title: full.title, status: full.status, customer_name: full.customer_name, location: full.location, rig: full.rig,
       notes: full.notes, terms: full.terms, tax_rate_bp: full.tax_rate_bp, created_at: full.created_at,
@@ -641,13 +740,14 @@ export function createApp(env = process.env) {
     if (!q || q.status === 'void' || !t) throw new HttpError(404, 'This proposal isn’t available.');
     if (!q.signed_at) throw new HttpError(409, 'Please sign the proposal first.');
     if (q.status === 'paid') throw new HttpError(409, 'This proposal is already paid.');
-    const { balance } = quoteTotals(q, getItems(q.id));
-    if (balance < 50) throw new HttpError(409, 'Nothing is due on this proposal.');
-    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? ORDER BY id DESC`).get(q.id, balance);
+    const { due } = quoteDue(q);
+    if (due < 50) throw new HttpError(409, 'Nothing is due on this proposal.');
+    await closeQuoteCheckouts(q.id, PAYING_NOW, due); // an open Checkout for another amount can't be paid
+    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, due);
     if (!pay) {
       const tok = randomToken();
       db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, 'card')`)
-        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
+        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, due);
       pay = getPayment(tok);
     }
     const url = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email: q.customer_email, termsVersion: q.customer_terms_version });
@@ -692,8 +792,12 @@ export function createApp(env = process.env) {
       // Direct charges arrive from the business's account (Connect endpoint, evt.account set);
       // legacy platform charges arrive on the platform endpoint (no evt.account).
       const rightAccount = pay && (pay.charge_type === 'direct' ? evt.account === pay.stripe_account : !evt.account);
-      if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); }
+      if (pay && rightAccount && o.id === pay.stripe_session_id) { markPaid(pay, 'card', o.id); await settle(pay.token); syncAffiliateLedger(pay.id); }
     } else if (evt.type === 'charge.refunded' && evt.account && o?.id) {
+      // How much the business has refunded so far (for the QuickBooks download).
+      const refunded = Math.round(Number(o.amount_refunded) || 0);
+      const at = evt.created ? owner.utcString(new Date(evt.created * 1000)) : now();
+      db.prepare(`UPDATE payments SET refunded_cents = ?, refunded_at = ? WHERE charge_id = ? AND stripe_account = ? AND charge_type = 'direct' AND refunded_cents < ?`).run(refunded, at, o.id, evt.account, refunded);
       await returnPlatformFee(evt.account, o);
     } else if (evt.type === 'account.updated' && o?.id) {
       const t = db.prepare('SELECT * FROM tenants WHERE stripe_account_id = ? OR legacy_stripe_account_id = ?').get(o.id, o.id);
@@ -869,13 +973,18 @@ export function createApp(env = process.env) {
 
   route('GET', '/api/quotes/:id', async (req, res, p, url, { tenant: t }) => {
     const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
-    send(res, 200, { ...quoteFull(q), proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, quoteTotals(q, getItems(q.id)).balance) });
+    const full = quoteFull(q);
+    send(res, 200, { ...full, proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, full.due_cents) });
   }, { auth: 'tenant' });
 
   route('PUT', '/api/quotes/:id', async (req, res, p, url, { tenant: t }) => {
-    const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
-    if (q.signed_at || q.status === 'paid') throw new HttpError(409, 'This quote is signed, so it can’t be changed. Make a new quote instead.');
+    let q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
+    const locked = (x) => { if (x.signed_at || x.status === 'paid') throw new HttpError(409, 'This quote is signed, so it can’t be changed. Make a new quote instead.'); };
+    locked(q);
     const b = await json(req);
+    // A Checkout the customer still has open would charge the old amount: close it first.
+    await closeQuoteCheckouts(q.id, OWNER_PAYING_NOW);
+    q = scoped('quotes', q.id, t.id); locked(q);
     db.prepare(`UPDATE quotes SET title = ?, customer_name = ?, customer_phone = ?, customer_email = ?, location = ?, rig = ?, notes = ?, terms = ?, tax_rate_bp = ?, updated_at = ? WHERE id = ?`).run(
       clean(b.title, 200) || 'Repair proposal', clean(b.customer_name, 120), clean(b.customer_phone, 40), clean(b.customer_email, 200),
       clean(b.location, 1000), clean(b.rig, 200), clean(b.notes, 4000), clean(b.terms, 4000), Math.min(3000, cents(b.tax_rate_bp)), now(), q.id);
@@ -891,27 +1000,33 @@ export function createApp(env = process.env) {
       db.prepare('UPDATE quotes SET photos = ? WHERE id = ?').run(JSON.stringify(jparse(q.photos, []).map((ph) => ({ file: ph.file, show: show.has(ph.file) ? show.get(ph.file) : ph.show }))), q.id);
     }
     refreshCredits(q.request_id);
-    const fresh = scoped('quotes', q.id, t.id);
-    send(res, 200, { ...quoteFull(fresh), proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, quoteTotals(fresh, getItems(q.id)).balance) });
+    const fresh = quoteFull(scoped('quotes', q.id, t.id));
+    send(res, 200, { ...fresh, proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, fresh.due_cents) });
   }, { auth: 'tenant' });
 
   route('POST', '/api/quotes/:id/status', async (req, res, p, url, { tenant: t }) => {
     const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
     const b = await json(req);
-    if (b.status === 'void' && q.status !== 'paid') db.prepare(`UPDATE quotes SET status = 'void', updated_at = ? WHERE id = ?`).run(now(), q.id);
-    else if (b.status === 'draft' && q.status === 'void' && !q.signed_at) db.prepare(`UPDATE quotes SET status = 'draft', updated_at = ? WHERE id = ?`).run(now(), q.id);
+    if (b.status === 'void' && q.status !== 'paid') {
+      await closeQuoteCheckouts(q.id, OWNER_PAYING_NOW); // so a voided quote can't be paid
+      db.prepare(`UPDATE quotes SET status = 'void', updated_at = ? WHERE id = ? AND status != 'paid'`).run(now(), q.id);
+    } else if (b.status === 'draft' && q.status === 'void' && !q.signed_at) db.prepare(`UPDATE quotes SET status = 'draft', updated_at = ? WHERE id = ?`).run(now(), q.id);
     send(res, 200, quoteFull(scoped('quotes', q.id, t.id)));
   }, { auth: 'tenant' });
 
   route('POST', '/api/quotes/:id/payments', async (req, res, p, url, { tenant: t }) => {
-    const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
+    let q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
     if (q.status === 'paid') throw new HttpError(409, 'Already paid.');
+    if (q.status === 'void') throw new HttpError(409, `This ${q.kind === 'invoice' ? 'invoice' : 'quote'} is void. Restore it first.`);
     const b = await json(req);
     const method = ['cash', 'check', 'other'].includes(b.method) ? b.method : 'cash';
-    const { balance } = quoteTotals(q, getItems(q.id));
+    await closeQuoteCheckouts(q.id, OWNER_PAYING_NOW); // so the customer can't pay online as well
+    q = scoped('quotes', q.id, t.id);
+    if (q.status === 'paid') throw new HttpError(409, 'Already paid.');
+    const { due } = quoteDue(q);
     const tok = randomToken();
     db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, ?)`)
-      .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance, method);
+      .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, due, method);
     markPaid(getPayment(tok), method);
     send(res, 200, quoteFull(scoped('quotes', q.id, t.id)));
   }, { auth: 'tenant' });
@@ -983,7 +1098,7 @@ export function createApp(env = process.env) {
     const rs = owner.reviewSettings(t);
     return {
       timezone: owner.tzOf(t), timezones: owner.US_TIMEZONES,
-      review: { link: rs.link, enabled: rs.enabled, active: rs.active, delay_hours: rs.delayHours, delays: owner.REVIEW_DELAYS, message: rs.message, default_message: owner.DEFAULT_REVIEW_MESSAGE, repeat_days: owner.REVIEW_REPEAT_DAYS },
+      review: { link: rs.link, enabled: rs.enabled, active: rs.active, delay_hours: rs.delayHours, delays: owner.REVIEW_DELAYS, message: rs.message, default_message: owner.DEFAULT_REVIEW_MESSAGE, repeat_days: owner.REVIEW_REPEAT_DAYS, address_ok: owner.postalAddress(t).ok },
       pay_over_time: Boolean(t.pay_over_time),
       email_enabled: notify.emailEnabled, sms_enabled: notify.smsEnabled,
     };
@@ -1052,8 +1167,10 @@ export function createApp(env = process.env) {
       const name = q?.signer_name || q?.customer_name || c.name;
       if (m.channel === 'email') {
         if (!c.email_opt_in || normEmail(c.email) !== m.to_addr) return { skip: 'The customer unsubscribed from emails.' };
+        const address = owner.postalAddress(t);
+        if (!address.ok) return { skip: 'The business mailing address is missing.' };
         const unsub = `${publicBase()}/u/${c.unsub_token}`;
-        return { to: m.to_addr, ...owner.reviewMessage('email', { t, name, link: rs.link, message: rs.message, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+        return { to: m.to_addr, ...owner.reviewMessage('email', { t, name, link: rs.link, message: rs.message, unsubUrl: unsub, address }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
       }
       if (!c.sms_opt_in || phoneKey(c.phone) !== phoneKey(m.to_addr)) return { skip: 'The customer didn’t agree to texts.' };
       if (smsStopped(m.to_addr)) return { skip: 'This number replied STOP.' };
@@ -1074,23 +1191,36 @@ export function createApp(env = process.env) {
 
   function finishMessage(m, status, error, at) {
     db.prepare('UPDATE scheduled_messages SET status = ?, error = ?, sent_at = ? WHERE id = ?').run(status, error || null, status === 'sent' ? owner.utcString(at) : null, m.id);
-    if (m.kind === 'campaign') {
-      const col = status === 'sent' ? 'sent' : status === 'skipped' ? 'skipped' : 'failed';
-      db.prepare(`UPDATE campaigns SET ${col} = ${col} + 1 WHERE id = ?`).run(m.ref_id);
-      const left = db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'campaign' AND ref_id = ? AND status IN ('pending','sending')`).get(m.ref_id).n;
-      if (!left) db.prepare(`UPDATE campaigns SET status = 'done', finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(now(), m.ref_id);
+    if (m.kind === 'campaign') campaignTally(m.ref_id, status);
+  }
+  function campaignTally(campaignId, status) {
+    const col = status === 'sent' ? 'sent' : status === 'skipped' || status === 'canceled' ? 'skipped' : 'failed';
+    db.prepare(`UPDATE campaigns SET ${col} = ${col} + 1 WHERE id = ?`).run(campaignId);
+    const left = db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'campaign' AND ref_id = ? AND status IN ('pending','sending')`).get(campaignId).n;
+    if (!left) db.prepare(`UPDATE campaigns SET status = 'done', finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(now(), campaignId);
+  }
+  // A business that isn't active sends nothing: its queued messages are canceled.
+  function cancelMessagesOfInactive() {
+    const rows = db.prepare(`SELECT m.id, m.kind, m.ref_id FROM scheduled_messages m JOIN tenants t ON t.id = m.tenant_id WHERE m.status = 'pending' AND t.status != 'active'`).all();
+    for (const m of rows) {
+      if (db.prepare(`UPDATE scheduled_messages SET status = 'canceled', error = 'business suspended' WHERE id = ? AND status = 'pending'`).run(m.id).changes && m.kind === 'campaign') campaignTally(m.ref_id, 'canceled');
     }
+    return rows.length;
   }
 
   // Sends what's due at `nowOverride` (default: now), up to `limit` messages per run (update emails
-  // go out in batches this way). Returns counts. Tests call this directly instead of waiting for the timer.
+  // go out in batches this way). Returns counts. Tests call this directly instead of waiting for the timer;
+  // they can pass a function as `nowOverride` to make the clock move during a run.
   async function runDueMessages(nowOverride, { limit = 50 } = {}) {
-    const at = nowOverride ? new Date(nowOverride) : new Date();
-    const out = { sent: 0, skipped: 0, deferred: 0, failed: 0 };
-    const due = db.prepare(`SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_after <= ? ORDER BY send_after, id LIMIT ?`).all(owner.utcString(at), limit);
+    // The time is read again for every message, so texting hours are checked right before each text.
+    const clock = typeof nowOverride === 'function' ? () => new Date(nowOverride()) : () => (nowOverride ? new Date(nowOverride) : new Date());
+    const out = { sent: 0, skipped: 0, deferred: 0, failed: 0, canceled: cancelMessagesOfInactive() };
+    const due = db.prepare(`SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_after <= ? ORDER BY send_after, id LIMIT ?`).all(owner.utcString(clock()), limit);
     for (const m of due) {
       const t = getTenant(m.tenant_id);
       if (!t) continue;
+      if (t.status !== 'active') { out.canceled += cancelMessagesOfInactive(); continue; }
+      const at = clock();
       const tz = owner.tzOf(t);
       if (m.channel === 'sms' && !owner.inTextHours(at, tz)) {
         if (db.prepare(`UPDATE scheduled_messages SET send_after = ? WHERE id = ? AND status = 'pending'`).run(owner.utcString(owner.nextTextWindow(at, tz)), m.id).changes) out.deferred++;
@@ -1277,6 +1407,7 @@ export function createApp(env = process.env) {
   // "On my way": a text right now, with the ETA the technician picked.
   route('POST', '/api/jobs/:id/on-my-way', async (req, res, p, url, { tenant: t }) => {
     const job = scoped('jobs', p.id, t.id); if (!job) throw new HttpError(404, 'Not found');
+    if (!['scheduled', 'en_route'].includes(job.status)) throw new HttpError(409, 'This appointment is done or canceled, so we didn’t text the customer.');
     const b = await json(req);
     const minutes = Math.trunc(Number(b.minutes));
     if (!(minutes >= 1 && minutes <= 240)) throw new HttpError(400, 'Enter about how many minutes away you are, from 1 to 240.');
@@ -1366,17 +1497,18 @@ export function createApp(env = process.env) {
     if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Check your email address.');
     if (phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
     if (b.subscribe_sms && !phoneKey(phone)) throw new HttpError(400, 'Add your mobile number to get texts, or uncheck that box.');
-    const { balance } = quoteTotals(q, getItems(q.id));
-    if (balance < 50) throw new HttpError(409, 'Nothing is due on this invoice.');
+    const { due } = quoteDue(q);
+    if (due < 50) throw new HttpError(409, 'Nothing is due on this invoice.');
     db.prepare('UPDATE quotes SET customer_phone = ?, customer_email = ?, updated_at = ? WHERE id = ?').run(phone || '', email || '', now(), q.id);
     if (b.subscribe_email !== undefined || b.subscribe_sms) {
       upsertCustomer(t, { name: q.customer_name, phone, email, emailOptIn: Boolean(b.subscribe_email), smsOptIn: Boolean(b.subscribe_sms), source: `Invoice #${q.id}`, ip: clientIp(req), ua: clean(req.headers['user-agent'], 400) });
     }
-    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, balance);
+    await closeQuoteCheckouts(q.id, PAYING_NOW, due); // an open Checkout for another amount can't be paid
+    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, due);
     if (!pay) {
       const tok = randomToken();
       db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, 'card')`)
-        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
+        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, due);
       pay = getPayment(tok);
     }
     const checkoutUrl = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email, termsVersion: latest?.version });
@@ -1433,7 +1565,7 @@ export function createApp(env = process.env) {
   }, { auth: 'owner' });
 
   // ---------- owner features: accounting export ----------
-  // Paid payments for a date range (in the business's time zone), ready to import into QuickBooks.
+  // Paid payments and refunds for a date range (in the business's time zone), ready to import into QuickBooks.
   route('GET', '/api/exports/quickbooks.csv', async (req, res, p, url, { tenant: t }) => {
     const tz = owner.tzOf(t);
     const today = owner.todayIn(tz);
@@ -1441,18 +1573,28 @@ export function createApp(env = process.env) {
     const to = owner.validDate(url.searchParams.get('to')) ? url.searchParams.get('to') : today;
     if (to < from) throw new HttpError(400, 'The end date is before the start date.');
     const lo = owner.utcString(owner.zonedTimeToUtc(from, '00:00', tz)), hi = owner.utcString(owner.zonedTimeToUtc(owner.addDays(to, 1), '00:00', tz));
-    const rows = db.prepare(`SELECT p.*, q.signer_name, q.customer_name AS q_name, r.name AS r_name FROM payments p LEFT JOIN quotes q ON q.id = p.quote_id LEFT JOIN requests r ON r.id = p.request_id
-      WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at >= ? AND p.paid_at < ? ORDER BY p.paid_at, p.id`).all(t.id, lo, hi);
-    const d = (c) => (c / 100).toFixed(2);
+    // Payments made in the range, and refunds made in the range (their own negative rows).
+    const pick = `SELECT p.*, q.signer_name, q.customer_name AS q_name, r.name AS r_name FROM payments p LEFT JOIN quotes q ON q.id = p.quote_id LEFT JOIN requests r ON r.id = p.request_id WHERE p.tenant_id = ? AND p.status = 'paid'`;
+    const paidRows = db.prepare(`${pick} AND p.paid_at >= ? AND p.paid_at < ?`).all(t.id, lo, hi).map((r) => ({ r, at: r.paid_at, refund: 0 }));
+    const refundRows = db.prepare(`${pick} AND p.refunded_cents > 0 AND p.refunded_at >= ? AND p.refunded_at < ?`).all(t.id, lo, hi).map((r) => ({ r, at: r.refunded_at, refund: 1 }));
+    const rows = [...paidRows, ...refundRows].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.r.id - b.r.id || a.refund - b.refund));
+    const amt = (c) => ({ usd: c }); // money cell
     const METHOD = { card: 'Card or bank (online)', cash: 'Cash', check: 'Check', other: 'Other' };
     const lines = [['Date', 'Customer', 'Description', 'Amount', 'Method', 'Processing fees', 'Net', 'Reference']];
-    for (const r of rows) {
-      const lp = owner.localParts(owner.parseUtc(r.paid_at), tz);
+    for (const { r, at, refund } of rows) {
+      const lp = owner.localParts(owner.parseUtc(at), tz);
+      const date = `${String(lp.month).padStart(2, '0')}/${String(lp.day).padStart(2, '0')}/${lp.year}`;
+      const who = r.signer_name || r.q_name || r.r_name || '', method = METHOD[r.method] || r.method;
+      if (refund) {
+        lines.push([date, who, `Refund: ${r.description}`, amt(-r.refunded_cents), method, amt(0), amt(-r.refunded_cents), `Refund of receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}`]);
+        continue;
+      }
       const card = r.method === 'card';
       const settled = !card || ['direct', 'sent'].includes(r.transfer_status);
+      // Net = amount − Stripe's fee − (platform fee − the part of it returned on refunds).
       const fees = card ? r.stripe_fee_cents + r.fee_cents - (r.fee_refunded_cents || 0) : 0;
-      lines.push([`${String(lp.month).padStart(2, '0')}/${String(lp.day).padStart(2, '0')}/${lp.year}`, r.signer_name || r.q_name || r.r_name || '', r.description, d(r.amount_cents), METHOD[r.method] || r.method,
-        settled ? d(fees) : '', settled ? d(r.amount_cents - fees) : '', `Receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}${settled ? '' : ' (fees not settled yet)'}`]);
+      lines.push([date, who, r.description, amt(r.amount_cents), method,
+        settled ? amt(fees) : '', settled ? amt(r.amount_cents - fees) : '', `Receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}${settled ? '' : ' (fees not settled yet)'}`]);
     }
     const name = `payments-${from}-to-${to}.csv`;
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
@@ -1561,6 +1703,731 @@ export function createApp(env = process.env) {
     if (old) try { fs.unlinkSync(path.join(uploads, path.basename(old))); } catch { /* gone */ }
     send(res, 200, websiteState(req, getTenant(t.id)));
   }, { auth: 'owner' });
+
+  // ---------- affiliates ----------
+  // Agilities pays affiliates (businesses on the platform) a share of HitchPoint's net platform fee on
+  // online payments from businesses they referred. Each payment's share lives in an append-only ledger:
+  // syncAffiliateLedger(paymentId) adds an earning or a reversal for whatever changed. Earnings wait
+  // HOLD_DAYS after the payment (refunds, disputes), then become available. Payouts are recorded by hand.
+  const usd = (c) => (c < 0 ? '-' : '') + '$' + (Math.abs(c) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const preciseNow = () => new Date().toISOString().replace('T', ' ').slice(0, 23);
+  const sqlTime = (ts, modifier) => db.prepare('SELECT datetime(?, ?) AS d').get(ts, modifier).d;
+  const getAffiliate = (id) => db.prepare('SELECT * FROM affiliates WHERE id = ?').get(id);
+  const affiliateOfTenant = (tid) => db.prepare('SELECT * FROM affiliates WHERE tenant_id = ?').get(tid);
+  const affiliateOfUser = (uid) => db.prepare('SELECT * FROM affiliates WHERE user_id = ?').get(uid);
+  // A business affiliate goes by its business name and owner's email; a person or group by its own.
+  const ownerEmailOf = (tid) => db.prepare(`SELECT email FROM users WHERE tenant_id = ? AND role = 'owner' ORDER BY id LIMIT 1`).get(tid)?.email || '';
+  const affiliateName = (a) => (a.tenant_id ? getTenant(a.tenant_id)?.name : '') || a.name || '';
+  const affiliateEmail = (a) => (a.tenant_id ? ownerEmailOf(a.tenant_id) : a.user_id ? getUser(a.user_id)?.email : '') || a.email || '';
+  const affiliateByCode = (code) => { const c = AFF.normalizeCode(code); return AFF.CODE_RE.test(c) ? db.prepare('SELECT * FROM affiliates WHERE code = ?').get(c) : null; };
+  const affiliateLink = (req, a) => `${siteOrigin(req)}/a/${a.code}`;
+  // A code that credits new sign-ups: active, terms accepted, and the affiliate's own business (if it
+  // is one) is active.
+  function liveAffiliate(code) {
+    const a = affiliateByCode(code);
+    if (!a || a.status !== 'active' || !a.terms_accepted_at) return null;
+    if (a.tenant_id) return getTenant(a.tenant_id)?.status === 'active' ? a : null;
+    return a.user_id && getUser(a.user_id) ? a : null;
+  }
+
+  // Share history: a payment always uses the share and duration in effect when it was paid.
+  const logRate = (a) => db.prepare('INSERT INTO affiliate_rates (affiliate_id, share_bp, months, effective_at) VALUES (?,?,?,?)').run(a.id, a.share_bp, a.months ?? null, preciseNow());
+  function rateAt(affId, at) {
+    return db.prepare('SELECT share_bp, months FROM affiliate_rates WHERE affiliate_id = ? AND effective_at <= ? ORDER BY effective_at DESC, id DESC LIMIT 1').get(affId, at)
+      || db.prepare('SELECT share_bp, months FROM affiliate_rates WHERE affiliate_id = ? ORDER BY effective_at, id LIMIT 1').get(affId);
+  }
+
+  // What the referrer should have earned on a payment: a paid direct (online) payment from a referred
+  // business, made on or after the referral and inside the share window, at the share in effect then.
+  function affiliateTarget(pay) {
+    if (!pay || pay.status !== 'paid' || pay.charge_type !== 'direct' || pay.method !== 'card' || !pay.paid_at) return null;
+    const t = getTenant(pay.tenant_id);
+    if (!t || !t.referred_by_affiliate_id || !t.referred_at || pay.paid_at < t.referred_at) return null;
+    const a = getAffiliate(t.referred_by_affiliate_id);
+    if (!a || a.tenant_id === t.id) return null;
+    const rate = rateAt(a.id, pay.paid_at);
+    if (!rate) return null;
+    if (rate.months != null && pay.paid_at >= sqlTime(t.created_at, `+${rate.months} months`)) return null;
+    const net = Math.max(0, (pay.fee_cents || 0) - (pay.fee_refunded_cents || 0));
+    return { affiliateId: a.id, cents: Math.floor((net * rate.share_bp) / 10000), shareBp: rate.share_bp };
+  }
+
+  // Idempotent: brings the ledger for one payment to its target with one earning (or reversal) for the
+  // difference. Runs whenever a direct payment is paid or its fee changes, and when a referral changes.
+  function syncAffiliateLedger(paymentId) {
+    try {
+      const pay = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+      if (!pay) return;
+      const target = affiliateTarget(pay);
+      const have = new Map(db.prepare(`SELECT affiliate_id, SUM(amount_cents) AS s, MAX(share_bp) AS bp FROM affiliate_ledger WHERE payment_id = ? AND type IN ('earning','reversal') GROUP BY affiliate_id`).all(pay.id).map((r) => [r.affiliate_id, r]));
+      if (target && !have.has(target.affiliateId)) have.set(target.affiliateId, { s: 0, bp: target.shareBp });
+      if (!have.size) return;
+      const ts = now();
+      const holdEnd = sqlTime(pay.paid_at || ts, `+${AFF.HOLD_DAYS} days`);
+      const ins = db.prepare('INSERT INTO affiliate_ledger (affiliate_id, tenant_id, payment_id, type, amount_cents, status, available_at, share_bp, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)');
+      for (const [affId, h] of have) {
+        const mine = target && target.affiliateId === affId;
+        const diff = (mine ? target.cents : 0) - (h.s || 0);
+        if (!diff) continue;
+        // A reversal is never available before the earning it reduces, and never later than now if that has passed.
+        const availableAt = diff > 0 || holdEnd > ts ? holdEnd : ts;
+        ins.run(affId, pay.tenant_id, pay.id, diff > 0 ? 'earning' : 'reversal', diff, availableAt <= ts ? 'available' : 'pending', availableAt,
+          mine ? target.shareBp : h.bp ?? null, diff > 0 ? null : mine ? 'Customer refund' : 'Referral changed', ts);
+      }
+    } catch (e) { console.error('Affiliate ledger sync failed for payment', paymentId, e.message); }
+  }
+  function resyncTenantLedger(tid) {
+    const ids = db.prepare(`SELECT id FROM payments WHERE tenant_id = ? AND status = 'paid' UNION SELECT payment_id FROM affiliate_ledger WHERE tenant_id = ? AND payment_id IS NOT NULL`).all(tid, tid);
+    for (const r of ids) syncAffiliateLedger(r.id);
+  }
+  // Pending earnings become available once the hold has passed.
+  const sweepAffiliateLedger = () => db.prepare(`UPDATE affiliate_ledger SET status = 'available' WHERE status = 'pending' AND available_at <= ?`).run(now());
+  const affiliateTotals = (affId) => db.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN type != 'payout' AND status = 'pending' THEN amount_cents END), 0) AS pending_cents,
+      COALESCE(SUM(CASE WHEN type != 'payout' AND status = 'available' THEN amount_cents END), 0) AS available_cents,
+      COALESCE(-SUM(CASE WHEN type = 'payout' THEN amount_cents END), 0) AS paid_cents
+    FROM affiliate_ledger WHERE affiliate_id = ?`).get(affId);
+  function clickStats(affId) {
+    const since = sqlTime(now(), '-29 days').slice(0, 10);
+    return db.prepare(`SELECT COALESCE(SUM(clicks), 0) AS all_clicks, COALESCE(SUM(uniques), 0) AS all_uniques,
+      COALESCE(SUM(CASE WHEN day >= ? THEN clicks END), 0) AS clicks_30, COALESCE(SUM(CASE WHEN day >= ? THEN uniques END), 0) AS uniques_30
+      FROM affiliate_clicks WHERE affiliate_id = ?`).get(since, since, affId);
+  }
+  const referralState = (t) => (t.status !== 'active' ? 'inactive' : isMerchant(t) && t.stripe_payouts_enabled && latestTerms(t.id) ? 'taking_payments' : 'setting_up');
+  function referralsOf(a) {
+    return db.prepare(`SELECT t.*, (SELECT COALESCE(SUM(l.amount_cents), 0) FROM affiliate_ledger l WHERE l.affiliate_id = ? AND l.tenant_id = t.id AND l.type IN ('earning','reversal')) AS earned_cents
+      FROM tenants t WHERE t.referred_by_affiliate_id = ? ORDER BY t.created_at DESC, t.id DESC`).all(a.id, a.id)
+      .map((t) => ({ id: t.id, name: t.name, joined: t.created_at, referred_at: t.referred_at, how: t.referred_how, state: referralState(t), earned_cents: t.earned_cents, share_ends: a.months == null ? null : sqlTime(t.created_at, `+${a.months} months`) }));
+  }
+  // shown_at: the day a row is about (an earning: when the customer paid; a payout: when it was paid).
+  const ledgerOf = (affId) => db.prepare(`SELECT l.*, t.name AS business, p.method AS payout_method, p.reference AS payout_reference, p.paid_at AS payout_paid_at,
+      CASE WHEN l.type = 'payout' THEN COALESCE(p.paid_at, l.created_at) WHEN l.type = 'earning' THEN COALESCE(pm.paid_at, l.created_at) ELSE l.created_at END AS shown_at
+    FROM affiliate_ledger l LEFT JOIN tenants t ON t.id = l.tenant_id LEFT JOIN affiliate_payouts p ON p.id = l.payout_id AND l.type = 'payout' LEFT JOIN payments pm ON pm.id = l.payment_id
+    WHERE l.affiliate_id = ? ORDER BY shown_at DESC, l.id DESC LIMIT 2000`).all(affId);
+  // What the affiliate sees: earnings from each business added up by calendar month (UTC), net of
+  // anything taken back that month, plus payouts and adjustments. Never a single payment or its date,
+  // so a referred business's payments can't be worked out. Status: pending | available | paid |
+  // partly_paid (some paid, some not) | partly_available (some available, some still pending).
+  function ownerLedger(affId) {
+    const months = new Map(), lines = [];
+    for (const l of ledgerOf(affId)) {
+      if (l.type === 'earning' || l.type === 'reversal') {
+        const month = String(l.shown_at).slice(0, 7), key = `${month}|${l.tenant_id ?? ''}`;
+        let g = months.get(key);
+        if (!g) months.set(key, (g = { sort: l.shown_at, line: { date: null, month, business: l.business || '', type: 'earnings', note: '', method: '', reference: '', amount_cents: 0, status: '' }, statuses: new Set() }));
+        g.line.amount_cents += l.amount_cents;
+        g.statuses.add(l.status);
+        if (l.shown_at > g.sort) g.sort = l.shown_at;
+      } else {
+        lines.push({ sort: l.shown_at, line: { date: String(l.shown_at).slice(0, 10), month: null, business: '', type: l.type, note: l.type === 'adjustment' ? l.note || '' : '', method: l.payout_method || '', reference: l.payout_reference || '', amount_cents: l.amount_cents, status: l.status } });
+      }
+    }
+    for (const g of months.values()) {
+      const s = g.statuses;
+      g.line.status = s.size === 1 ? [...s][0] : s.has('paid') ? 'partly_paid' : 'partly_available';
+      lines.push(g);
+    }
+    return lines.sort((a, b) => (a.sort < b.sort ? 1 : a.sort > b.sort ? -1 : 0)).map((x) => x.line);
+  }
+
+  // ---- tax forms and payout details ----
+  const TAX_NOT_READY = 'Secure storage for tax forms isn’t set up yet, so we can’t take W-9s or bank details. An Agilities admin needs to add DATA_ENCRYPTION_KEY in Render first.';
+  const latestW9 = (affId) => db.prepare('SELECT * FROM affiliate_w9 WHERE affiliate_id = ? ORDER BY id DESC LIMIT 1').get(affId);
+  const tinContext = (affId) => `w9-tin:${affId}`;
+  const bankContext = (affId) => `payout-bank:${affId}`;
+  // W-9 and bank checks throw W9Error(field, message); turn those into a 400 that names the field.
+  function formCheck(fn) {
+    try { return fn(); } catch (e) { if (e instanceof W9.W9Error) throw new HttpError(400, e.message, e.field); throw e; }
+  }
+  function checkPayout(b = {}) {
+    const method = ['ach', 'check'].includes(b.method) ? b.method : '';
+    if (!method) throw new HttpError(400, 'Choose how you want to be paid: direct deposit or a mailed check.', 'payout_method');
+    return { method, bank: method === 'ach' ? formCheck(() => W9.checkBank(b.bank || {})) : null };
+  }
+  const logSensitive = (req, user, affId, what) => db.prepare('INSERT INTO sensitive_access_log (user_id, user_email, affiliate_id, what, ip, ua, at) VALUES (?,?,?,?,?,?,?)')
+    .run(user?.id ?? null, user?.email ?? null, affId, what, clientIp(req), clean(req.headers['user-agent'], 400), now());
+  // Stores a signed W-9 (the number encrypted, the last 4 readable) and marks the W-9 as on file.
+  function saveW9(req, a, w, user) {
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const signedAt = now();
+    db.prepare(`INSERT INTO affiliate_w9 (affiliate_id, form_revision, legal_name, business_name, tax_class, llc_class, other_class, foreign_owners, exempt_payee_code, fatca_code,
+        address, city, state, zip, tin_type, tin_sealed, tin_last4, backup_withholding, signature, signed_at, user_id, signer_email, ip, ua, record_sha256)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(a.id, W9.FORM_REVISION, w.legal_name, w.business_name || null, w.tax_class, w.llc_class || null, w.other_class || null,
+      w.foreign_owners, w.exempt_payee_code || null, w.fatca_code || null, w.address, w.city, w.state, w.zip, w.tin_type, sealed.seal(w.tin, tinContext(a.id)), W9.tinLast4(w.tin),
+      w.backup_withholding, w.signature, signedAt, user.id, user.email, clientIp(req), clean(req.headers['user-agent'], 400), W9.recordHash(w, signedAt, sealed.fingerprint));
+    db.prepare('UPDATE affiliates SET w9_on_file = 1, w9_on_file_at = ?, updated_at = ? WHERE id = ?').run(signedAt, signedAt, a.id);
+    logSensitive(req, user, a.id, 'w9_submitted');
+  }
+  function savePayout(req, a, pay, user) {
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const box = pay.bank ? sealed.seal(JSON.stringify(pay.bank), bankContext(a.id)) : null;
+    db.prepare('UPDATE affiliates SET payout_method = ?, payout_sealed = ?, payout_last4 = ?, payout_updated_at = ?, updated_at = ? WHERE id = ?')
+      .run(pay.method, box, pay.bank ? pay.bank.account.slice(-4) : null, now(), now(), a.id);
+    logSensitive(req, user, a.id, 'payout_changed');
+  }
+  // What the affiliate (and the admin list) sees: never a full tax ID or bank number.
+  function taxSummary(a) {
+    const w = latestW9(a.id);
+    return {
+      w9: w ? { legal_name: w.legal_name, business_name: w.business_name || '', classification: W9.classText(w), tin: W9.maskedTin(w.tin_type, w.tin_last4), city: w.city, state: w.state, signed_at: w.signed_at, backup_withholding: Boolean(w.backup_withholding) } : null,
+      w9_on_paper: Boolean(a.w9_on_file && !w),
+      payout: a.payout_method ? { method: a.payout_method, last4: a.payout_last4 || '', updated_at: a.payout_updated_at } : null,
+      ready: Boolean(sealed),
+    };
+  }
+
+  function ownerAffiliate(req, a) {
+    sweepAffiliateLedger();
+    const accepted = Boolean(a.terms_accepted_at);
+    const affiliate = {
+      name: affiliateName(a), kind: a.tenant_id ? 'business' : 'person', tax: taxSummary(a),
+      code: a.code, status: a.status, share_bp: a.share_bp, months: a.months, w9_on_file: Boolean(a.w9_on_file), link: accepted ? affiliateLink(req, a) : null,
+      terms: { url: '/legal/affiliate-terms', version: AFF.AFFILIATE_TERMS_VERSION, accepted_at: a.terms_accepted_at, accepted_version: a.terms_version, needs_accept: a.terms_version !== AFF.AFFILIATE_TERMS_VERSION },
+      hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS,
+    };
+    if (!accepted) return { affiliate };
+    const c = clickStats(a.id);
+    return {
+      affiliate,
+      clicks: { last_30_days: c.clicks_30, all_time: c.all_clicks },
+      totals: affiliateTotals(a.id),
+      // Names and earnings only: never a referred business's payment volume or revenue.
+      referrals: referralsOf(a).map(({ name, joined, state, earned_cents, share_ends }) => ({ name, joined, state, earned_cents, share_ends })),
+      ledger: ownerLedger(a.id),
+    };
+  }
+  function superAffiliateRow(a) {
+    const t = a.tenant_id ? getTenant(a.tenant_id) : null;
+    const w = latestW9(a.id);
+    return {
+      id: a.id, tenant_id: a.tenant_id, kind: t ? 'business' : 'person', name: affiliateName(a), email: affiliateEmail(a), tenant_status: t?.status || '', code: a.code, share_bp: a.share_bp, months: a.months, status: a.status,
+      w9_on_file: Boolean(a.w9_on_file), w9_on_file_at: a.w9_on_file_at, w9: w ? 'electronic' : a.w9_on_file ? 'paper' : null, backup_withholding: Boolean(w?.backup_withholding), payout_method: a.payout_method || null,
+      terms_accepted_at: a.terms_accepted_at, terms_version: a.terms_version,
+      terms_current: a.terms_version === AFF.AFFILIATE_TERMS_VERSION, created_at: a.created_at,
+      referrals: db.prepare('SELECT COUNT(*) AS n FROM tenants WHERE referred_by_affiliate_id = ?').get(a.id).n,
+      ...affiliateTotals(a.id), clicks: clickStats(a.id),
+    };
+  }
+  function payoutBlock(a, available) {
+    if (!a.terms_accepted_at) return 'They haven’t accepted the Affiliate Program Terms yet. Ask them to accept on their referral page.';
+    if (!a.w9_on_file) return 'We need their W-9 before a payout. Ask them to fill it out (button above), or tick “Paper W-9 on file” if you have a signed paper copy.';
+    if (available < AFF.MIN_PAYOUT_CENTS) return `The available balance is ${usd(available)}. Payouts start at ${usd(AFF.MIN_PAYOUT_CENTS)}.`;
+    return '';
+  }
+  function superAffiliateDetail(req, a) {
+    sweepAffiliateLedger();
+    const row = superAffiliateRow(a);
+    return {
+      affiliate: { ...row, link: affiliateLink(req, a), owner_email: row.email, phone: a.tenant_id ? getTenant(a.tenant_id)?.phone || '' : a.phone || '', audience: a.audience || '' },
+      tax: taxSummary(a),
+      w9_history: db.prepare('SELECT id, signed_at, legal_name, tin_type, tin_last4, signer_email FROM affiliate_w9 WHERE affiliate_id = ? ORDER BY id DESC').all(a.id)
+        .map((w) => ({ id: w.id, signed_at: w.signed_at, legal_name: w.legal_name, tin: W9.maskedTin(w.tin_type, w.tin_last4), signer_email: w.signer_email })),
+      access_log: db.prepare('SELECT user_email, what, at FROM sensitive_access_log WHERE affiliate_id = ? ORDER BY id DESC LIMIT 20').all(a.id),
+      referrals: referralsOf(a),
+      ledger: ledgerOf(a.id).map((l) => ({ id: l.id, date: l.shown_at, created_at: l.created_at, business: l.business || '', tenant_id: l.tenant_id, payment_id: l.payment_id, type: l.type, amount_cents: l.amount_cents, status: l.status, available_at: l.available_at, share_bp: l.share_bp, note: l.note || '', payout_id: l.payout_id, payout_method: l.payout_method || '', reference: l.payout_reference || '' })),
+      payouts: db.prepare('SELECT p.id, p.amount_cents, p.method, p.reference, p.paid_at, p.created_at, u.email AS created_by FROM affiliate_payouts p LEFT JOIN users u ON u.id = p.created_by WHERE p.affiliate_id = ? ORDER BY p.paid_at DESC, p.id DESC').all(a.id),
+      rates: db.prepare('SELECT share_bp, months, effective_at FROM affiliate_rates WHERE affiliate_id = ? ORDER BY effective_at DESC, id DESC').all(a.id),
+      payout_block: payoutBlock(a, row.available_cents), min_payout_cents: AFF.MIN_PAYOUT_CENTS, methods: AFF.PAYOUT_METHODS,
+    };
+  }
+
+  // Input checks for the super admin forms.
+  function cleanShare(v) {
+    const n = Number(v);
+    if (v === '' || v == null || !Number.isInteger(n) || n < 0 || n > 10000) throw new HttpError(400, 'Enter a share between 0% and 100%, like 20.');
+    return n;
+  }
+  function cleanMonths(v) {
+    if (v === null || v === undefined || String(v).trim() === '') return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > 600) throw new HttpError(400, 'Enter a whole number of months, like 12. Leave it empty for as long as they stay.');
+    return n;
+  }
+  function cleanCode(v, selfId = 0) {
+    const c = AFF.normalizeCode(v);
+    if (!AFF.CODE_RE.test(c)) throw new HttpError(400, 'Use 3 to 40 lowercase letters, numbers or dashes for the code, like mike-stevens.');
+    if (db.prepare('SELECT 1 FROM affiliates WHERE code = ? AND id != ?').get(c, selfId)) throw new HttpError(409, 'Another affiliate already uses that code. Try a different one.');
+    return c;
+  }
+  function uniqueCode(base) {
+    let c = base, i = 2;
+    while (db.prepare('SELECT 1 FROM affiliates WHERE code = ?').get(c)) { const s = `-${i++}`; c = base.slice(0, 40 - s.length).replace(/-+$/, '') + s; }
+    return c;
+  }
+  // A past or present date typed as YYYY-MM-DD.
+  function pastDay(v, label) {
+    const s = String(v ?? '').trim();
+    if (!s) return '';
+    const d = new Date(s + 'T00:00:00Z');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) throw new HttpError(400, `Enter the ${label} as a date, like 2026-11-02.`);
+    if (s > now().slice(0, 10)) throw new HttpError(400, `The ${label} can’t be in the future. Pick today or an earlier day.`);
+    return s;
+  }
+
+  // Link clicks: daily counts, plus a keyed hash of the IP kept only for the current day (unique visitors).
+  const pruneClickVisitors = () => db.prepare('DELETE FROM affiliate_click_visitors WHERE day < ?').run(now().slice(0, 10));
+  pruneClickVisitors();
+  setInterval(() => { try { pruneClickVisitors(); sweepAffiliateLedger(); } catch { /* database closed */ } }, 3600_000).unref();
+  function recordClick(affId, ip) {
+    const day = now().slice(0, 10);
+    const hash = crypto.createHmac('sha256', secret).update(`affiliate-click|${day}|${ip}`).digest('hex').slice(0, 32);
+    pruneClickVisitors();
+    const fresh = db.prepare('INSERT OR IGNORE INTO affiliate_click_visitors (affiliate_id, day, ip_hash) VALUES (?,?,?)').run(affId, day, hash).changes;
+    db.prepare(`INSERT INTO affiliate_clicks (affiliate_id, day, clicks, uniques) VALUES (?, ?, 1, ?)
+      ON CONFLICT (affiliate_id, day) DO UPDATE SET clicks = clicks + 1, uniques = uniques + excluded.uniques`).run(affId, day, fresh ? 1 : 0);
+  }
+  // GET /a/<code>: count the click, remember the code for 90 days (first click wins), go to the landing page.
+  function affiliateClick(req, res, raw) {
+    const a = liveAffiliate(raw);
+    if (!a) { res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' }); return res.end(); }
+    const headers = { Location: `/?ref=${a.code}`, 'Cache-Control': 'no-store' };
+    if (!liveAffiliate(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE))) {
+      const secure = baseUrl(req).startsWith('https') ? '; Secure' : '';
+      headers['Set-Cookie'] = `${AFF.REF_COOKIE}=${a.code}; Max-Age=${AFF.REF_COOKIE_DAYS * 86400}; Path=/; SameSite=Lax; HttpOnly${secure}`;
+    }
+    const ip = clientIp(req);
+    if (req.method === 'GET' && !AFF.isBot(req.headers['user-agent']) && !limited('aff-click:' + ip, AFF.CLICKS_PER_IP_HOUR, 3600_000)) recordClick(a.id, ip);
+    res.writeHead(302, headers);
+    res.end();
+  }
+
+  // Sign-up credit: a code typed on the form wins, then the link cookie. An affiliate can't refer itself.
+  function selfReferral(a, { email, phone }) {
+    const emails = new Set(), phones = [];
+    if (a.tenant_id) {
+      const t = getTenant(a.tenant_id);
+      if (!t) return false;
+      for (const u of db.prepare('SELECT email FROM users WHERE tenant_id = ?').all(t.id)) emails.add(normEmail(u.email));
+      if (t.email) emails.add(normEmail(t.email));
+      phones.push(t.phone, t.notify_phone);
+    } else {
+      const u = a.user_id ? getUser(a.user_id) : null;
+      if (u) emails.add(normEmail(u.email));
+      if (a.email) emails.add(normEmail(a.email));
+      phones.push(a.phone);
+    }
+    if (email && emails.has(normEmail(email))) return true;
+    const k = phoneKey(phone);
+    return Boolean(k && phones.some((x) => phoneKey(x) === k));
+  }
+  function signupReferral(req, b, who) {
+    const typed = AFF.normalizeCode(b.referral_code);
+    const fromCookie = AFF.normalizeCode(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE));
+    if (typed) {
+      const a = liveAffiliate(typed);
+      if (!a) throw new HttpError(400, 'We don’t recognize that referral code. Check it, or leave the box empty.');
+      if (selfReferral(a, who)) throw new HttpError(400, 'You can’t use your own referral code. Leave the box empty to continue.');
+      return { affiliate: a, how: typed === fromCookie ? 'link' : 'code' };
+    }
+    const a = liveAffiliate(fromCookie);
+    return a && !selfReferral(a, who) ? { affiliate: a, how: 'link' } : null;
+  }
+  // Super admin adding a business with a referral code (for owners an affiliate signs up in person).
+  function adminReferralCode(code) {
+    if (!AFF.normalizeCode(code)) return null;
+    const a = affiliateByCode(code);
+    if (!a) throw new HttpError(400, 'No affiliate has that referral code. Check it on the Affiliates page, or leave it empty.');
+    return a;
+  }
+  const setReferral = (tid, affId, how, at = now()) => db.prepare('UPDATE tenants SET referred_by_affiliate_id = ?, referred_at = ?, referred_how = ? WHERE id = ?')
+    .run(affId || null, affId ? at : null, affId ? how : null, tid);
+
+  // Sign-up form: who referred this visitor (the link cookie first, then ?ref / a code being checked).
+  route('GET', '/api/public/referral', async (req, res, p, url) => {
+    if (limited('ref-lookup:' + clientIp(req), 120, 3600_000)) throw new HttpError(429, 'Too many requests. Try again in a few minutes.');
+    const a = liveAffiliate(AFF.readCookie(req.headers.cookie, AFF.REF_COOKIE)) || liveAffiliate(url.searchParams.get('code'));
+    send(res, 200, a ? { code: a.code, name: affiliateName(a) } : { code: null });
+  });
+
+  // The affiliate's own referral page: a person or group signed in with its own login, or the owner
+  // of a business that's an affiliate.
+  const ownAffiliate = ({ tenant: t, user, isSuper }) => {
+    if (user.role === 'affiliate') return affiliateOfUser(user.id);
+    if (!isSuper && user.role !== 'owner') throw new HttpError(403, 'Only the business owner can see the referral program.');
+    return affiliateOfTenant(t.id);
+  };
+  route('GET', '/api/affiliate', async (req, res, p, url, ctx) => {
+    const a = ownAffiliate(ctx);
+    send(res, 200, a ? ownerAffiliate(req, a) : { affiliate: null });
+  }, { auth: 'affiliate' });
+  route('POST', '/api/affiliate/terms', async (req, res, p, url, ctx) => {
+    if (ctx.isSuper) throw new HttpError(403, 'Only the business owner can accept the Affiliate Program Terms.');
+    const a = ownAffiliate(ctx);
+    if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.');
+    const ts = now();
+    db.prepare('UPDATE affiliates SET terms_accepted_at = ?, terms_version = ?, updated_at = ? WHERE id = ?').run(ts, AFF.AFFILIATE_TERMS_VERSION, ts, a.id);
+    db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(ctx.user.id, ctx.tenant?.id ?? null, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+    send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
+  }, { auth: 'affiliate' });
+  route('GET', '/api/affiliate/ledger.csv', async (req, res, p, url, ctx) => {
+    const a = ownAffiliate(ctx);
+    if (!a) throw new HttpError(404, 'Not found');
+    sweepAffiliateLedger();
+    const method = { ach: 'ACH', check: 'check', stripe: 'Stripe', other: 'other' };
+    const what = (l) => ({
+      earnings: `Your share of ${platformName}’s fees`, adjustment: `Adjustment${l.note ? ': ' + l.note : ''}`,
+      payout: `Paid to you by ${method[l.method] || 'payout'}${l.reference ? ` (${l.reference})` : ''}`,
+    }[l.type] || l.type);
+    const rows = ownerLedger(a.id).map((l) => AFF.csvLine([l.month || l.date, l.business, what(l), { usd: l.amount_cents }, l.status.replace('_', ' ')]));
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="referral-earnings.csv"', 'Cache-Control': 'no-store' });
+    res.end([AFF.csvLine(['Month or date', 'Business', 'What it is', 'Amount', 'Status']), ...rows].join('\n') + '\n');
+  }, { auth: 'affiliate' });
+
+  // The W-9 form's choices and wording, for the invitation page and the affiliate's details page.
+  route('GET', '/api/public/w9-form', async (req, res) => send(res, 200, {
+    revision: W9.FORM_REVISION, classes: W9.TAX_CLASSES, llc_classes: W9.LLC_CLASSES, states: W9.STATES,
+    exempt_payee_codes: W9.EXEMPT_PAYEE_CODES, fatca_codes: W9.FATCA_CODES, certification: W9.CERTIFICATION, requester: `Agilities Tech, LLC (${platformName})`,
+  }, { 'Cache-Control': 'public, max-age=3600' }));
+
+  // The affiliate updates its own W-9 or payout details. Both need the account password again, so a
+  // borrowed or stolen session can't redirect payouts or change the tax record.
+  function affiliateForChange(ctx, b) {
+    if (ctx.isSuper) throw new HttpError(403, 'Only the affiliate can change its own tax form and payout details.');
+    const a = ownAffiliate(ctx);
+    if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    if (limited('aff-change:' + ctx.user.id, 10, 3600_000)) throw new HttpError(429, 'Too many tries. Wait an hour and try again.');
+    if (!verifyPassword(String(b.password || ''), ctx.user.password_hash)) throw new HttpError(400, 'That password isn’t right. Enter the password you log in with.', 'password');
+    return a;
+  }
+  route('POST', '/api/affiliate/w9', async (req, res, p, url, ctx) => {
+    const b = await json(req);
+    const a = affiliateForChange(ctx, b);
+    const w = formCheck(() => W9.checkW9(b.w9 || {}));
+    saveW9(req, a, w, ctx.user);
+    notify.email(affiliateEmail(a), `We got your new W-9 for ${platformName}`, `A new W-9 (tax ID ending in ${W9.tinLast4(w.tin)}) was submitted for your referral account on ${now()} UTC.\n\nIf you didn't do this, reply to this email right away.\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(platformEmail, `${affiliateName(a)} sent a new W-9`, `${affiliateName(a)} (code ${a.code}) submitted a new W-9 on ${now()} UTC.${w.backup_withholding ? '\n\nThey say the IRS has them on backup withholding. Talk to your accountant before the next payout.' : ''}\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
+    send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
+  }, { auth: 'affiliate' });
+  route('POST', '/api/affiliate/payout', async (req, res, p, url, ctx) => {
+    const b = await json(req);
+    const a = affiliateForChange(ctx, b);
+    const pay = checkPayout(b.payout || {});
+    savePayout(req, a, pay, ctx.user);
+    const how = pay.method === 'ach' ? `direct deposit to the account ending in ${pay.bank.account.slice(-4)}` : 'a check mailed to the address on your W-9';
+    // Tell them right away, so a change they didn't make is caught before money moves.
+    notify.email(affiliateEmail(a), `Your ${platformName} payout details changed`, `Your referral payouts will now go by ${how}. This change was made on ${now()} UTC.\n\nIf you didn't make this change, reply to this email right away so we can hold your payouts.\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(platformEmail, `${affiliateName(a)} changed payout details`, `${affiliateName(a)} (code ${a.code}) changed payout details to ${pay.method === 'ach' ? 'ACH, account ending ' + pay.bank.account.slice(-4) : 'check'} on ${now()} UTC. Confirm with them before the next payout if this looks unexpected.\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
+    send(res, 200, ownerAffiliate(req, getAffiliate(a.id)));
+  }, { auth: 'affiliate' });
+
+  // ---- invitations ----
+  // An Agilities admin invites someone by email. The emailed link (valid INVITE_DAYS, one use) opens
+  // a page where they set up a login (or confirm their business login), sign a W-9, give payout
+  // details, accept the Affiliate Program Terms, and get their referral link.
+  const INVITE_DAYS = 14;
+  const inviteLink = (req, token) => `${siteOrigin(req)}/admin/#/join/${token}`;
+  const userByEmail = (email) => db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const inviteRow = (i) => ({
+    id: i.id, email: i.email, share_bp: i.share_bp, months: i.months, status: i.status === 'pending' && i.expires_at <= now() ? 'expired' : i.status,
+    expires_at: i.expires_at, sent_count: i.sent_count, last_sent_at: i.last_sent_at, created_at: i.created_at, accepted_at: i.accepted_at, affiliate_id: i.affiliate_id,
+  });
+  const shareSpan = (months) => (months ? `for ${months} month${months === 1 ? '' : 's'} after each one signs up` : `for as long as each one uses ${platformName}`);
+  // Who can't be invited: anyone already in the program, and logins that aren't a business owner's.
+  function inviteBlock(email) {
+    const u = userByEmail(email);
+    if (u && u.role === 'super') return 'That’s an Agilities admin login. Use a different email.';
+    if (u && u.role === 'staff') return 'That email is a staff login at a business. Invite the business owner, or use a different email.';
+    if (u && u.role === 'affiliate' && affiliateOfUser(u.id)) return 'That person is already an affiliate. Open them from the list.';
+    if (u && u.role === 'owner' && u.tenant_id && affiliateOfTenant(u.tenant_id)) return `${getTenant(u.tenant_id)?.name || 'That business'} is already an affiliate. Open it from the list, then use “Ask for W-9 and payout details”.`;
+    if (db.prepare('SELECT 1 FROM affiliates WHERE email = ? COLLATE NOCASE').get(email)) return 'That email already belongs to an affiliate. Open them from the list.';
+    return '';
+  }
+  async function sendInvite(req, inv, token) {
+    const link = inviteLink(req, token);
+    const emailed = await notify.email(inv.email, `You’re invited to the ${platformName} referral program`,
+      `Hi,\n\n${platformName} helps mobile RV repair businesses run their jobs, quotes and payments. You’re invited to refer businesses to it and earn ${inv.share_bp / 100}% of the fee ${platformName} keeps on their card payments, ${shareSpan(inv.months)}.\n\n`
+      + `Set up your account, fill out a W-9 tax form, and get your referral link here. It takes about 10 minutes:\n${link}\n\n`
+      + `Have your Social Security number or EIN ready, and your bank’s routing and account numbers if you want direct deposit. The link works for ${INVITE_DAYS} days and is just for you.\n\nQuestions? Reply to this email.\n\n${platformName}`,
+      { replyTo: platformEmail });
+    db.prepare('UPDATE affiliate_invites SET sent_count = sent_count + ?, last_sent_at = CASE WHEN ? THEN ? ELSE last_sent_at END WHERE id = ?').run(emailed ? 1 : 0, emailed ? 1 : 0, now(), inv.id);
+    return { emailed, link };
+  }
+  route('POST', '/api/super/affiliate-invites', async (req, res, p, url, ctx) => {
+    if (!sealed) throw new HttpError(409, TAX_NOT_READY);
+    const b = await json(req);
+    const email = clean(b.email, 200).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Enter the email address to send the invitation to.', 'email');
+    const share = formField('share', () => cleanShare(b.share_bp)), months = formField('months', () => cleanMonths(b.months));
+    const blocked = inviteBlock(email);
+    if (blocked) throw new HttpError(409, blocked, 'email');
+    const token = randomToken(24);
+    db.prepare(`UPDATE affiliate_invites SET status = 'canceled' WHERE email = ? AND status = 'pending'`).run(email); // a new invitation replaces an old one
+    const r = db.prepare('INSERT INTO affiliate_invites (email, share_bp, months, token_hash, expires_at, created_by) VALUES (?,?,?,?,?,?)')
+      .run(email, share, months, sha256(token), sqlTime(now(), `+${INVITE_DAYS} days`), ctx.user.id);
+    const inv = db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(Number(r.lastInsertRowid));
+    const sent = await sendInvite(req, inv, token);
+    send(res, 201, { invite: inviteRow(db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(inv.id)), ...sent });
+  }, { auth: 'super' });
+  // A fresh link (the old one stops working) and another 14 days.
+  route('POST', '/api/super/affiliate-invites/:id/resend', async (req, res, p) => {
+    const inv = db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(p.id);
+    if (!inv) throw new HttpError(404, 'Not found');
+    if (inv.status !== 'pending') throw new HttpError(409, inv.status === 'accepted' ? 'They already joined.' : 'This invitation was canceled. Send a new one.');
+    const blocked = inviteBlock(inv.email);
+    if (blocked) throw new HttpError(409, blocked);
+    const token = randomToken(24);
+    db.prepare('UPDATE affiliate_invites SET token_hash = ?, expires_at = ? WHERE id = ?').run(sha256(token), sqlTime(now(), `+${INVITE_DAYS} days`), inv.id);
+    const sent = await sendInvite(req, db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(inv.id), token);
+    send(res, 200, { invite: inviteRow(db.prepare('SELECT * FROM affiliate_invites WHERE id = ?').get(inv.id)), ...sent });
+  }, { auth: 'super' });
+  route('POST', '/api/super/affiliate-invites/:id/cancel', async (req, res, p) => {
+    const ch = db.prepare(`UPDATE affiliate_invites SET status = 'canceled' WHERE id = ? AND status = 'pending'`).run(p.id).changes;
+    if (!ch) throw new HttpError(409, 'That invitation isn’t waiting anymore. Reload the page.');
+    send(res, 200, { ok: true });
+  }, { auth: 'super' });
+
+  // Field-specific messages for checks that throw plain HttpErrors.
+  function formField(field, fn) {
+    try { return fn(); } catch (e) { if (e instanceof HttpError && !e.field) e.field = field; throw e; }
+  }
+  // An invitation that can still be used: the token matches, it's pending, and it hasn't expired.
+  function openInvite(token) {
+    const inv = /^[\w-]{20,64}$/.test(token || '') ? db.prepare('SELECT * FROM affiliate_invites WHERE token_hash = ?').get(sha256(token)) : null;
+    if (!inv || inv.status !== 'pending' || inv.expires_at <= now()) throw new HttpError(404, `This invitation link has expired or was already used. Ask ${platformName} to send a new one.`);
+    return inv;
+  }
+  // Who is accepting: a new login, the owner of a business (signs in with their password), or nobody
+  // (an email we can't use for an affiliate).
+  function inviteAccount(inv) {
+    const u = userByEmail(inv.email);
+    if (!u) return { kind: 'new' };
+    if (u.role === 'owner' && u.tenant_id && getTenant(u.tenant_id)) return { kind: 'business', user: u, tenant: getTenant(u.tenant_id) };
+    return { kind: 'blocked', user: u };
+  }
+  function codeCheck(raw, fallback) {
+    const c = AFF.normalizeCode(raw);
+    if (!c) return { code: fallback, ok: true, message: '' };
+    if (!AFF.CODE_RE.test(c)) return { code: c, ok: false, message: 'Use 3 to 40 lowercase letters, numbers or dashes, like utah-rv-club.' };
+    if (db.prepare('SELECT 1 FROM affiliates WHERE code = ?').get(c)) return { code: c, ok: false, message: 'That one’s taken. Try another.' };
+    return { code: c, ok: true, message: '' };
+  }
+  // The token travels in the request body, never the URL, so it doesn't land in request logs. (In the
+  // browser it's after the #, which isn't sent to the server.)
+  route('POST', '/api/public/affiliate-invites/lookup', async (req, res) => {
+    if (limited('aff-invite:' + clientIp(req), 120, 3600_000)) throw new HttpError(429, 'Too many requests. Try again in a few minutes.');
+    const q = await json(req);
+    const inv = openInvite(q.token);
+    const acct = inviteAccount(inv);
+    const base = acct.kind === 'business' ? acct.tenant.slug : slugify(inv.email.split('@')[0].replace(/[._+]+/g, '-'));
+    const suggested = uniqueCode(AFF.codeFromSlug(base));
+    const check = q.code !== undefined ? codeCheck(q.code, suggested) : null;
+    send(res, 200, {
+      email: inv.email, share_bp: inv.share_bp, months: inv.months, expires_at: inv.expires_at, platform: platformName,
+      account: acct.kind, business_name: acct.kind === 'business' ? acct.tenant.name : null, suggested_code: suggested, link_base: `${siteOrigin(req)}/a/`,
+      hold_days: AFF.HOLD_DAYS, min_payout_cents: AFF.MIN_PAYOUT_CENTS, terms_url: '/legal/affiliate-terms', terms_version: AFF.AFFILIATE_TERMS_VERSION,
+      tax_ready: Boolean(sealed), ...(check ? { code_check: check } : {}),
+    });
+  });
+  route('POST', '/api/public/affiliate-invites/accept', async (req, res) => {
+    if (limited('aff-join:' + clientIp(req), 30, 3600_000)) throw new HttpError(429, 'Too many tries from this network. Wait an hour and try again.');
+    const b = await json(req);
+    const inv = openInvite(b.token);
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const acct = inviteAccount(inv);
+    if (acct.kind === 'blocked') throw new HttpError(409, `This email already has a ${platformName} login that can’t be used for the referral program. Email support for help.`);
+    if (acct.kind === 'business') {
+      if (limited('aff-join-pw:' + inv.id, 10, 3600_000)) throw new HttpError(429, 'Too many password tries. Wait an hour and try again.');
+      if (!verifyPassword(String(b.password || ''), acct.user.password_hash)) throw new HttpError(400, `That password doesn’t match your ${platformName} login. Use the password you log in with.`, 'password');
+    } else if (String(b.password || '').length < 10) throw new HttpError(400, 'Choose a password of at least 10 characters.', 'password');
+    const name = acct.kind === 'business' ? acct.tenant.name : clean(b.name, 120);
+    if (name.length < 2) throw new HttpError(400, 'Enter your name, or your group’s or company’s name.', 'name');
+    const phone = clean(b.phone, 40), audience = clean(b.audience, 500);
+    const cc = codeCheck(b.code, '');
+    if (!cc.code || !cc.ok) throw new HttpError(400, cc.message || 'Choose your link name.', 'code');
+    const w = formCheck(() => W9.checkW9(b.w9 || {}));
+    const pay = checkPayout(b.payout || {});
+    if (!b.agree) throw new HttpError(400, 'Check the box to accept the Affiliate Program Terms.', 'agree');
+    if (acct.kind === 'business' && affiliateOfTenant(acct.tenant.id)) throw new HttpError(409, `${acct.tenant.name} is already in the referral program. Log in to see your link.`);
+    let user = acct.user, a;
+    const ts = now();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // The same link, still pending and unexpired at this moment (not just when the request started).
+      if (!db.prepare(`UPDATE affiliate_invites SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending' AND token_hash = ? AND expires_at > ?`).run(ts, inv.id, inv.token_hash, ts).changes) throw new HttpError(409, 'This invitation link was already used, replaced or expired. Log in, or ask for a new link.');
+      if (!user) {
+        const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role, last_login_at) VALUES (NULL, ?, ?, ?, 'affiliate', ?)`).run(inv.email, name, hashPassword(b.password), ts);
+        user = getUser(Number(u.lastInsertRowid));
+      } else db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(ts, user.id);
+      const isBiz = acct.kind === 'business';
+      const r = db.prepare(`INSERT INTO affiliates (tenant_id, user_id, code, share_bp, months, name, email, phone, audience, terms_accepted_at, terms_version, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(isBiz ? acct.tenant.id : null, isBiz ? null : user.id, cc.code, inv.share_bp, inv.months, isBiz ? null : name, isBiz ? null : inv.email, phone || null, audience || null, ts, AFF.AFFILIATE_TERMS_VERSION, ts, ts);
+      a = getAffiliate(Number(r.lastInsertRowid));
+      logRate(a);
+      db.prepare('UPDATE affiliate_invites SET affiliate_id = ? WHERE id = ?').run(a.id, inv.id);
+      db.prepare('INSERT INTO agreements (user_id, tenant_id, doc, version, ip, ua) VALUES (?,?,?,?,?,?)').run(user.id, isBiz ? acct.tenant.id : null, 'affiliate-terms', AFF.AFFILIATE_TERMS_VERSION, clientIp(req), clean(req.headers['user-agent'], 400));
+      saveW9(req, a, w, user);
+      savePayout(req, a, pay, user);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+    a = getAffiliate(a.id);
+    const link = affiliateLink(req, a);
+    notify.email(inv.email, `Your ${platformName} referral link`, `You’re in. Here’s your referral link:\n${link}\n\nYou earn ${a.share_bp / 100}% of the fee ${platformName} keeps on card payments from each business that signs up through it, ${shareSpan(a.months)}. Businesses can also type your code, ${a.code}, when they sign up.\n\nWhen you share your link, say that you earn a share if they sign up.\n\nSee your clicks, referrals and earnings any time: ${siteOrigin(req)}/admin/\n\n${platformName}`, { replyTo: platformEmail });
+    notify.email(platformEmail, `New affiliate: ${affiliateName(a)}`, `${affiliateName(a)} <${inv.email}> accepted the invitation and joined the referral program (code ${a.code}, ${a.share_bp / 100}%${a.months ? `, ${a.months} months` : ''}). W-9 received; payouts by ${a.payout_method === 'ach' ? 'ACH' : 'check'}.\n\n${siteOrigin(req)}/admin/#/affiliates/${a.id}`);
+    send(res, 201, { link, code: a.code, name: affiliateName(a), share_bp: a.share_bp, months: a.months }, { 'Set-Cookie': cookie(req, sess.create(user.id), sess.maxAge) });
+  });
+
+  // Super admin: the full W-9 (printable hard copy) and bank details. Every view is logged.
+  route('GET', '/api/super/affiliates/:id/w9', async (req, res, p, url, ctx) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    const wid = Number(url.searchParams.get('w')) || 0;
+    const w = wid ? db.prepare('SELECT * FROM affiliate_w9 WHERE id = ? AND affiliate_id = ?').get(wid, a.id) : latestW9(a.id);
+    if (!w) throw new HttpError(404, 'No W-9 has been submitted online for this affiliate.');
+    let tin;
+    try { tin = sealed.open(w.tin_sealed, tinContext(a.id)); } catch { throw new HttpError(409, 'This W-9 can’t be read with the current DATA_ENCRYPTION_KEY. Was the key changed?'); }
+    logSensitive(req, ctx.user, a.id, 'w9_viewed');
+    const fields = { ...w, tin, llc_class: w.llc_class || '', other_class: w.other_class || '', business_name: w.business_name || '', exempt_payee_code: w.exempt_payee_code || '', fatca_code: w.fatca_code || '' };
+    const intact = W9.recordHash(fields, w.signed_at, sealed.fingerprint) === w.record_sha256;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex', ...securityHeaders });
+    res.end(W9.renderW9Record({ w, tin, requester: `Agilities Tech, LLC (${platformName})`, viewedBy: ctx.user.email, viewedAt: now(), intact }));
+  }, { auth: 'super' });
+  route('POST', '/api/super/affiliates/:id/bank', async (req, res, p, url, ctx) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(503, TAX_NOT_READY);
+    if (a.payout_method !== 'ach' || !a.payout_sealed) throw new HttpError(404, 'They chose to be paid by check, so there are no bank details.');
+    let bank;
+    try { bank = JSON.parse(sealed.open(a.payout_sealed, bankContext(a.id))); } catch { throw new HttpError(409, 'These bank details can’t be read with the current DATA_ENCRYPTION_KEY. Was the key changed?'); }
+    logSensitive(req, ctx.user, a.id, 'bank_viewed');
+    send(res, 200, { holder: bank.holder, routing: bank.routing, account: bank.account, type: bank.type, updated_at: a.payout_updated_at });
+  }, { auth: 'super' });
+  // Email an existing affiliate a link to fill out (or update) their W-9 and payout details.
+  route('POST', '/api/super/affiliates/:id/request-details', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    if (!sealed) throw new HttpError(409, TAX_NOT_READY);
+    const to = affiliateEmail(a);
+    const link = `${siteOrigin(req)}/admin/#/${a.tenant_id ? 'affiliate/details' : 'account'}`;
+    const emailed = await notify.email(to, `Add your W-9 and payout details for ${platformName} referrals`, `Hi,\n\nTo pay your referral earnings, we need a W-9 tax form and how you’d like to be paid. Log in and fill them out here (about 5 minutes):\n${link}\n\nHave your Social Security number or EIN ready, and your bank’s routing and account numbers if you want direct deposit.\n\n${platformName}`, { replyTo: platformEmail });
+    send(res, 200, { emailed, link, to });
+  }, { auth: 'super' });
+
+  // Super admin: affiliates, referrals, payouts.
+  route('GET', '/api/super/affiliates', async (req, res) => {
+    sweepAffiliateLedger();
+    const affiliates = db.prepare('SELECT a.* FROM affiliates a LEFT JOIN tenants t ON t.id = a.tenant_id ORDER BY COALESCE(t.name, a.name) COLLATE NOCASE').all().map(superAffiliateRow);
+    const businesses = db.prepare('SELECT id, name, slug FROM tenants WHERE id NOT IN (SELECT tenant_id FROM affiliates WHERE tenant_id IS NOT NULL) ORDER BY name COLLATE NOCASE').all();
+    const years = db.prepare(`SELECT DISTINCT substr(paid_at, 1, 4) AS y FROM affiliate_payouts ORDER BY y DESC`).all().map((r) => r.y);
+    const invites = db.prepare(`SELECT * FROM affiliate_invites WHERE status = 'pending' OR (status = 'accepted' AND accepted_at >= ?) ORDER BY id DESC LIMIT 200`).all(sqlTime(now(), '-30 days')).map(inviteRow);
+    send(res, 200, { affiliates, businesses, invites, tax_ready: Boolean(sealed), email_enabled: notify.emailEnabled, years: [...new Set([now().slice(0, 4), ...years])], min_payout_cents: AFF.MIN_PAYOUT_CENTS });
+  }, { auth: 'super' });
+  route('POST', '/api/super/affiliates', async (req, res) => {
+    const b = await json(req);
+    const t = getTenant(Number(b.tenant_id));
+    if (!t) throw new HttpError(400, 'Pick the business to make an affiliate.');
+    if (affiliateOfTenant(t.id)) throw new HttpError(409, 'That business is already an affiliate. Open it from the list to make changes.');
+    const share = cleanShare(b.share_bp), months = cleanMonths(b.months);
+    const code = AFF.normalizeCode(b.code) ? cleanCode(b.code) : uniqueCode(AFF.codeFromSlug(t.slug));
+    const ts = now();
+    const r = db.prepare('INSERT INTO affiliates (tenant_id, code, share_bp, months, created_at, updated_at) VALUES (?,?,?,?,?,?)').run(t.id, code, share, months, ts, ts);
+    const a = getAffiliate(Number(r.lastInsertRowid));
+    logRate(a);
+    send(res, 201, superAffiliateDetail(req, a));
+  }, { auth: 'super' });
+  route('GET', '/api/super/affiliate-payouts.csv', async (req, res, p, url) => {
+    const year = /^\d{4}$/.test(url.searchParams.get('year') || '') ? url.searchParams.get('year') : now().slice(0, 4);
+    const rows = db.prepare(`SELECT a.*, t.legal_profile, COUNT(p.id) AS payouts, SUM(p.amount_cents) AS total
+      FROM affiliate_payouts p JOIN affiliates a ON a.id = p.affiliate_id LEFT JOIN tenants t ON t.id = a.tenant_id
+      WHERE substr(p.paid_at, 1, 4) = ? GROUP BY a.id ORDER BY COALESCE(t.name, a.name) COLLATE NOCASE`).all(year);
+    // Form 1099-NEC/MISC threshold: $600 through 2025 payments, $2,000 for 2026 payments (indexed after 2026).
+    const threshold = Number(year) <= 2025 ? 60000 : 200000;
+    const lines = rows.map((r) => {
+      const w = latestW9(r.id);
+      const lp = customerTerms.parseProfile(r.legal_profile) || {};
+      const address = w ? `${w.address}, ${w.city}, ${w.state} ${W9.zipText(w.zip)}` : [lp.addressLine1, lp.addressLine2, lp.city, [lp.state, lp.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+      return AFF.csvLine([year, affiliateName(r), w ? w.legal_name : lp.legalName || '', w?.business_name || '', w ? W9.classText(w) : '', w ? W9.maskedTin(w.tin_type, w.tin_last4) : '', address, affiliateEmail(r), r.code,
+        w ? `electronic (${w.signed_at.slice(0, 10)})` : r.w9_on_file ? `paper (${(r.w9_on_file_at || '').slice(0, 10)})` : 'no', w?.backup_withholding ? 'yes' : '', String(r.payouts), { usd: r.total }, r.total >= threshold ? 'yes' : 'no']);
+    });
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="affiliate-payouts-${year}.csv"`, 'Cache-Control': 'no-store' });
+    res.end([AFF.csvLine(['Year', 'Affiliate', 'Legal name (W-9 line 1)', 'Business name (line 2)', 'Tax classification', 'Tax ID (last 4)', 'Address', 'Email', 'Affiliate code', 'W-9', 'Backup withholding', 'Payouts', 'Total paid', `At or over ${usd(threshold).replace('.00', '')} (1099 likely)`]), ...lines].join('\n') + '\n');
+  }, { auth: 'super' });
+  route('GET', '/api/super/affiliates/:id', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    send(res, 200, superAffiliateDetail(req, a));
+  }, { auth: 'super' });
+  route('PATCH', '/api/super/affiliates/:id', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const code = b.code !== undefined ? cleanCode(b.code, a.id) : a.code;
+    const share = b.share_bp !== undefined ? cleanShare(b.share_bp) : a.share_bp;
+    const months = b.months !== undefined ? cleanMonths(b.months) : a.months;
+    const status = ['active', 'paused'].includes(b.status) ? b.status : a.status;
+    const w9 = b.w9_on_file !== undefined ? (b.w9_on_file ? 1 : 0) : a.w9_on_file;
+    const w9Day = w9 && b.w9_date !== undefined ? pastDay(b.w9_date, 'W-9 date') : '';
+    const w9At = !w9 ? null : w9Day ? `${w9Day} 00:00:00` : a.w9_on_file_at || now();
+    db.prepare('UPDATE affiliates SET code = ?, share_bp = ?, months = ?, status = ?, w9_on_file = ?, w9_on_file_at = ?, updated_at = ? WHERE id = ?').run(code, share, months, status, w9, w9At, now(), a.id);
+    if (share !== a.share_bp || months !== a.months) logRate(getAffiliate(a.id));
+    send(res, 200, superAffiliateDetail(req, getAffiliate(a.id)));
+  }, { auth: 'super' });
+  // Record a payout of the whole available balance (paid outside the app: ACH, check, Stripe or other).
+  // The form sends the amount the admin saw (and paid); if the balance has changed since, it's refused.
+  const BALANCE_CHANGED = 'The available balance changed. Reload and check the amount.';
+  route('POST', '/api/super/affiliates/:id/payouts', async (req, res, p, url, ctx) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    if (!AFF.PAYOUT_METHODS.includes(b.method)) throw new HttpError(400, 'Choose how you paid them: ACH, check, Stripe or other.');
+    const day = pastDay(b.paid_on, 'payout date');
+    const paidAt = day ? `${day} 12:00:00` : now();
+    sweepAffiliateLedger();
+    const available = affiliateTotals(a.id).available_cents;
+    const blocked = payoutBlock(a, available);
+    if (blocked) throw new HttpError(409, blocked);
+    if (!Number.isInteger(b.amount_cents)) throw new HttpError(400, 'Reload the page and check the amount, then record the payout again.');
+    if (b.amount_cents !== available) throw new HttpError(409, BALANCE_CHANGED);
+    // Synchronous from here: nothing else can touch the ledger between the total and the update.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const pid = Number(db.prepare('INSERT INTO affiliate_payouts (affiliate_id, amount_cents, method, reference, paid_at, created_by) VALUES (?,?,?,?,?,?)').run(a.id, available, b.method, clean(b.reference, 120) || null, paidAt, ctx.user.id).lastInsertRowid);
+      const marked = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS s FROM affiliate_ledger WHERE affiliate_id = ? AND status = 'available' AND type != 'payout'`).get(a.id).s;
+      if (marked !== available) throw new HttpError(409, BALANCE_CHANGED);
+      db.prepare(`UPDATE affiliate_ledger SET status = 'paid', payout_id = ? WHERE affiliate_id = ? AND status = 'available' AND type != 'payout'`).run(pid, a.id);
+      db.prepare(`INSERT INTO affiliate_ledger (affiliate_id, type, amount_cents, status, available_at, payout_id, note, created_at) VALUES (?, 'payout', ?, 'paid', ?, ?, ?, ?)`).run(a.id, -available, paidAt, pid, clean(b.reference, 120) || null, now());
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+    send(res, 201, superAffiliateDetail(req, getAffiliate(a.id)));
+  }, { auth: 'super' });
+  // A manual credit (+) or debit (-), available right away. The affiliate sees the note.
+  route('POST', '/api/super/affiliates/:id/adjustments', async (req, res, p) => {
+    const a = getAffiliate(p.id); if (!a) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const amount = Number(b.amount_cents), note = clean(b.note, 300);
+    if (!Number.isInteger(amount) || amount === 0 || Math.abs(amount) > 10_000_000) throw new HttpError(400, 'Enter an amount, like 10.00 to add or -10.00 to take away.');
+    if (note.length < 3) throw new HttpError(400, 'Add a short note. The affiliate sees it.');
+    const ts = now();
+    db.prepare(`INSERT INTO affiliate_ledger (affiliate_id, type, amount_cents, status, available_at, note, created_at) VALUES (?, 'adjustment', ?, 'available', ?, ?, ?)`).run(a.id, amount, ts, note, ts);
+    send(res, 201, superAffiliateDetail(req, a));
+  }, { auth: 'super' });
+
+  // Super admin: who referred a business. Changing it recalculates that business's earnings.
+  function tenantReferral(t) {
+    const a = t.referred_by_affiliate_id ? getAffiliate(t.referred_by_affiliate_id) : null;
+    return {
+      referred_by: a ? { id: a.id, code: a.code, name: affiliateName(a) } : null,
+      referred_at: t.referred_at, how: t.referred_how, joined: t.created_at, own_affiliate_id: affiliateOfTenant(t.id)?.id ?? null,
+      affiliates: db.prepare('SELECT a.id, a.code, a.status, COALESCE(t.name, a.name) AS name FROM affiliates a LEFT JOIN tenants t ON t.id = a.tenant_id WHERE a.tenant_id IS NULL OR a.tenant_id != ? ORDER BY COALESCE(t.name, a.name) COLLATE NOCASE').all(t.id),
+    };
+  }
+  route('GET', '/api/super/tenants/:id/referral', async (req, res, p) => {
+    const t = getTenant(p.id); if (!t) throw new HttpError(404, 'Not found');
+    send(res, 200, tenantReferral(t));
+  }, { auth: 'super' });
+  route('PUT', '/api/super/tenants/:id/referral', async (req, res, p) => {
+    const t = getTenant(p.id); if (!t) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const affId = Number(b.affiliate_id) || null;
+    if (affId) {
+      const a = getAffiliate(affId);
+      if (!a) throw new HttpError(404, 'That affiliate doesn’t exist. Reload the page and pick again.');
+      if (a.tenant_id === t.id) throw new HttpError(400, 'A business can’t refer itself. Pick a different affiliate.');
+      // Payments from this day on count (never before the business signed up).
+      const day = pastDay(b.from, 'start date');
+      const at = day ? (`${day} 00:00:00` < t.created_at ? t.created_at : `${day} 00:00:00`) : now();
+      if (affId !== t.referred_by_affiliate_id || day) setReferral(t.id, affId, 'admin', at);
+    } else setReferral(t.id, null);
+    resyncTenantLedger(t.id);
+    send(res, 200, tenantReferral(getTenant(t.id)));
+  }, { auth: 'super' });
 
   // Team
   route('GET', '/api/team', async (req, res, p, url, { tenant: t }) => {
@@ -1742,8 +2609,10 @@ export function createApp(env = process.env) {
     const business = clean(b.business_name, 120), email = clean(b.owner_email, 200).toLowerCase();
     if (!business || !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Business name and owner email are required.');
     if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) throw new HttpError(409, 'That email already has an account.');
+    const ref = adminReferralCode(b.referral_code);
     const t = db.prepare(`INSERT INTO tenants (slug, name, email, phone, notify_phone) VALUES (?,?,?,?,?)`).run(uniqueSlug(business), business, email, clean(b.phone, 40), clean(b.phone, 40));
     const tid = Number(t.lastInsertRowid);
+    if (ref) setReferral(tid, ref.id, 'admin');
     const u = db.prepare(`INSERT INTO users (tenant_id, email, name, password_hash, role) VALUES (?,?,?,?, 'owner')`).run(tid, email, clean(b.owner_name, 120), hashPassword(randomToken(24)));
     const tok = randomToken(24);
     db.prepare('INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?,?,?)').run(sha256(tok), Number(u.lastInsertRowid), Date.now() + 7 * 864e5);
@@ -1932,7 +2801,9 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
             if (!ctx) throw new HttpError(401, 'Please log in.');
             if (req.method !== 'GET' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) throw new HttpError(403, 'Forbidden');
             if (r.auth === 'super' && !ctx.isSuper) throw new HttpError(403, 'Forbidden');
-            if (r.auth === 'tenant' || r.auth === 'owner') {
+            // 'affiliate': a referral partner's own login (no business), or a business user as for 'tenant'.
+            if (r.auth === 'affiliate' && ctx.user.role === 'affiliate') { /* no business to check */ }
+            else if (r.auth === 'tenant' || r.auth === 'owner' || r.auth === 'affiliate') {
               if (!ctx.tenant) throw new HttpError(ctx.isSuper ? 409 : 403, ctx.isSuper ? 'Choose a business to view first.' : 'Forbidden');
               if (!ctx.isSuper && ctx.tenant.status !== 'active') throw new HttpError(403, 'This account is suspended. Contact support.');
               if (!ctx.isSuper && needsAgreements(ctx.user)) throw new HttpError(428, 'Please accept the updated agreements.');
@@ -1973,6 +2844,10 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders });
         return res.end(renderReceipt({ t, pay, quote: q, items, totals: q ? quoteTotals(q, items) : null, proposalUrl: q ? `/p/${q.token}` : '' }));
       }
+      // Affiliate referral links, sign-up links that carry a code, and the Affiliate Program Terms.
+      if ((um = /^\/a\/([^/]{1,80})\/?$/.exec(pathname))) return affiliateClick(req, res, um[1]);
+      if (pathname === '/signup' && AFF.CODE_RE.test(AFF.normalizeCode(url.searchParams.get('ref')))) { res.writeHead(302, { Location: `/admin/?ref=${AFF.normalizeCode(url.searchParams.get('ref'))}#/signup`, 'Cache-Control': 'no-store' }); return res.end(); }
+      if (pathname === '/legal/affiliate-terms' && serveFile(res, 'legal/affiliate-terms.html')) return;
 
       if (ownerFeaturePage(req, res, pathname)) return; // owner features: calendar feed, app manifest, offline page
       const host = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
@@ -2031,7 +2906,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
     } catch (e) {
       const status = e.status || 500;
       if (status === 500) console.error(e);
-      if (!res.headersSent) send(res, status, { error: status === 500 ? 'Something went wrong. Try again.' : e.message });
+      if (!res.headersSent) send(res, status, { error: status === 500 ? 'Something went wrong. Try again.' : e.message, ...(e.field && status !== 500 ? { field: e.field } : {}) });
       else res.end();
     }
   }

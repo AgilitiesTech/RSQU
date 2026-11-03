@@ -24,6 +24,11 @@ const v2Requests = [];
 const appFees = new Map(); // application fees (platform account) for refund tests
 const appFeeRefunds = [];
 const stripeFee = (amt) => Math.round(amt * 0.029) + 30;
+// A Checkout Session is open until it's paid (tests set payment_status = 'paid') or expired.
+const sessionStatus = (s) => (s.expired ? 'expired' : s.payment_status === 'paid' ? 'complete' : 'open');
+const expired = []; // sessions the app expired: [id, Stripe-Account]
+// The charge.refunded event Stripe sends from a business's account after a refund in its Dashboard.
+const chargeRefunded = (sess, amountRefunded, applicationFee) => ({ type: 'charge.refunded', account: sess.account, data: { object: { id: 'ch_' + sess.id, object: 'charge', amount: sess.amount_total, amount_refunded: amountRefunded, refunded: amountRefunded >= sess.amount_total, application_fee: applicationFee } } });
 const stripeMock = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -90,7 +95,16 @@ const stripeMock = http.createServer((req, res) => {
         terms_version: p.get('metadata[customer_terms_version]'), pi_terms_version: p.get('payment_intent_data[metadata][customer_terms_version]'), payment_status: 'unpaid',
       };
       sessions.set(id, s);
-      return ok(s);
+      return ok({ ...s, status: 'open' });
+    }
+    // Only an open session can be expired, and only on the account it belongs to.
+    if (req.method === 'POST' && (m = /^\/v1\/checkout\/sessions\/([^/]+)\/expire$/.exec(req.url))) {
+      const s = sessions.get(m[1]);
+      if (!s || (s.account || null) !== onAccount) return bad('No such checkout.session');
+      if (sessionStatus(s) !== 'open') return bad(`Only Checkout Sessions with a status in ["open"] can be expired. This one is ${sessionStatus(s)}.`);
+      s.expired = true;
+      expired.push([s.id, onAccount]);
+      return ok({ ...s, status: 'expired', url: null });
     }
     if (req.method === 'GET' && (m = /^\/v1\/checkout\/sessions\/([^?]+)\?expand\[\]=payment_intent\.latest_charge\.balance_transaction$/.exec(req.url)) && sessions.has(m[1])) {
       const s = sessions.get(m[1]);
@@ -101,7 +115,7 @@ const stripeMock = http.createServer((req, res) => {
       const bt = s.account
         ? { id: 'txn_' + s.id, fee: sf + app, net: s.amount_total - sf - app, fee_details: [{ type: 'stripe_fee', amount: sf }, { type: 'application_fee', amount: app }] }
         : { id: 'txn_' + s.id, fee: sf };
-      return ok({ ...s, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, latest_charge: { id: 'ch_' + s.id, balance_transaction: bt } } : null });
+      return ok({ ...s, status: sessionStatus(s), url: sessionStatus(s) === 'open' ? s.url : null, payment_intent: s.payment_status === 'paid' ? { id: 'pi_' + s.id, status: 'succeeded', latest_charge: { id: 'ch_' + s.id, amount_refunded: s.amount_refunded || 0, balance_transaction: bt } } : null });
     }
     if (req.method === 'POST' && req.url === '/v1/transfers') {
       const dest = accounts.get(p.get('destination'));
@@ -1257,6 +1271,44 @@ test('emails to subscribers: address required, opted-in only, unsubscribe link a
   assert.equal((await other('GET', '/api/campaigns')).json.campaigns.length, 0, 'each business sees only its own');
 });
 
+test('review fixes: invoice edits close open checkouts, voided invoices can’t be paid quietly, On my way only for live jobs', async () => {
+  const inv = (await mike('POST', '/api/invoices', {})).json;
+  const body = (cents) => ({ title: 'Water pump', customer_name: 'Rae Cole', customer_phone: '801-555-0166', customer_email: '', rig: '', notes: '', terms: '', tax_rate_bp: 0, items: [{ name: 'Water pump', qty: 1, unit_cents: cents, taxable: 0 }] });
+  await mike('PUT', `/api/quotes/${inv.id}`, body(10000));
+  const pay = () => anon('POST', `/api/public/invoices/${inv.token}/checkout`, { terms_version: 1, phone: '801-555-0166', email: 'rae@example.test', subscribe_email: false });
+  assert.equal((await pay()).status, 200);
+  const first = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  // Editing the amount closes the customer's open checkout and cancels that payment
+  const ex = expired.length;
+  assert.equal((await mike('PUT', `/api/quotes/${inv.id}`, body(30000))).status, 200);
+  assert.ok(expired.slice(ex).some(([id]) => id === first.stripe_session_id), 'old checkout expired');
+  assert.equal(appDb.prepare('SELECT status FROM payments WHERE id = ?').get(first.id).status, 'canceled');
+  // The same amount in a second tab gets the same checkout back
+  const a = (await pay()).json.url, b = (await pay()).json.url;
+  assert.equal(a, b);
+  // Paid while the owner tries to edit: refused, not silently changed
+  const live = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv.id);
+  sessions.get(live.stripe_session_id).payment_status = 'paid';
+  assert.equal((await mike('PUT', `/api/quotes/${inv.id}`, body(5000))).status, 409);
+  // A payment that lands on a voided invoice is recorded with a note for the owner, and the invoice stays void
+  const inv2 = (await mike('POST', '/api/invoices', {})).json;
+  await mike('PUT', `/api/quotes/${inv2.id}`, body(7000));
+  await anon('POST', `/api/public/invoices/${inv2.token}/checkout`, { terms_version: 1, phone: '801-555-0166', email: 'rae@example.test' });
+  const p2 = appDb.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending'`).get(inv2.id);
+  appDb.prepare(`UPDATE quotes SET status = 'void' WHERE id = ?`).run(inv2.id); // voided while the customer was in checkout
+  sessions.get(p2.stripe_session_id).payment_status = 'paid';
+  await anon('POST', `/api/public/payments/${p2.token}/confirm`, { session_id: p2.stripe_session_id });
+  assert.equal(appDb.prepare('SELECT status FROM quotes WHERE id = ?').get(inv2.id).status, 'void');
+  assert.match(appDb.prepare('SELECT note FROM payments WHERE id = ?').get(p2.id).note, /after you voided/);
+
+  // On my way: refused for a canceled appointment
+  const date = new Date(Date.now() + 3 * 864e5).toISOString().slice(0, 10);
+  const job = await mike('POST', '/api/jobs', { customer_name: 'Rae Cole', customer_phone: '801-555-0166', address: 'Ogden', date, time: '10:00', duration_min: 60, notify: false });
+  assert.equal(job.status, 201, JSON.stringify(job.json));
+  assert.equal((await mike('POST', `/api/jobs/${job.json.id}/status`, { status: 'canceled' })).status, 200);
+  assert.equal((await mike('POST', `/api/jobs/${job.json.id}/on-my-way`, { minutes: 20 })).status, 409);
+});
+
 test('pay over time: Checkout uses each business’s own payment methods; the note shows at $50 or more once the owner turns it on', async () => {
   // createCheckout never forces payment_method_types, so Affirm and Klarna appear when the business turns them on in Stripe.
   const seen = [];
@@ -1305,10 +1357,11 @@ test('QuickBooks download: paid payments for a date range, every cell quoted, fo
   const cell = /"(?:[^"]|"")*"/.source;
   assert.ok(lines.every((l) => new RegExp(`^${cell}(,${cell}){7}$`).test(l)), 'eight quoted cells on every line');
   const paidCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid'`).get(mikeId).n;
-  assert.equal(lines.length, paidCount + 1);
+  const refundCount = appDb.prepare(`SELECT COUNT(*) AS n FROM payments WHERE tenant_id = ? AND status = 'paid' AND refunded_cents > 0`).get(mikeId).n;
+  assert.equal(lines.length, paidCount + refundCount + 1, 'a row per payment, and one per refund');
   const evil = lines.find((l) => l.includes('HYPERLINK'));
   assert.match(evil, /^"\d{2}\/\d{2}\/\d{4}","'=HYPERLINK\(""http:\/\/evil\.test"",""Click""\)","'-2\+3 cmd \(#\d+\)","12\.34","Check","0\.00","12\.34","Receipt #\d+"$/);
-  assert.ok(!lines.some((l) => /(^|,)"[=+\-@]/.test(l)), 'no cell starts with a formula character');
+  assert.ok(!lines.some((l) => /(^|,)"(?!-\d+\.\d\d")[=+\-@]/.test(l)), 'no cell starts with a formula character (a refund amount is a plain negative number)');
   // A card payment shows Stripe's fee plus the platform share, and what the business kept.
   const card = appDb.prepare(`SELECT * FROM payments WHERE tenant_id = ? AND status = 'paid' AND method = 'card' AND transfer_status = 'direct' ORDER BY id DESC LIMIT 1`).get(mikeId);
   const row = lines.find((l) => l.includes(`"Receipt #${card.id} ${card.charge_id}"`));
@@ -1415,6 +1468,246 @@ test('bold look: banner, service tiles, highlights, service pages', async () => 
   await mike('POST', `/api/products/${svc.id}/image`, { image: null });
   assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 404);
   await mike('PUT', '/api/website', { ...ok.json.profile, theme: 'classic' });
+});
+
+test('affiliate program: links, sign-up credit, earnings, payouts and privacy', async () => {
+  const IP = { 'X-Forwarded-For': '198.51.100.7' }; // its own rate-limit buckets
+  const loc = (r) => r.headers.get('location');
+  const setCookie = (r) => r.headers.get('set-cookie') || '';
+  const mikeName = appDb.prepare('SELECT name FROM tenants WHERE id = ?').get(mikeId).name;
+
+  // Super admin makes Mike's business an affiliate: 20% of HitchPoint's fee, 12 months per referral.
+  assert.equal((await mike('GET', '/api/super/affiliates')).status, 403);
+  const made = await superA('POST', '/api/super/affiliates', { tenant_id: mikeId, share_bp: 2000, months: '12' });
+  assert.equal(made.status, 201, JSON.stringify(made.json));
+  const affId = made.json.affiliate.id;
+  assert.equal(made.json.affiliate.code, mikeSlug, 'the code defaults from the business slug');
+  assert.equal((await superA('POST', '/api/super/affiliates', { tenant_id: mikeId, share_bp: 2000 })).status, 409);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { share_bp: 20000 })).status, 400);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { months: '1.5' })).status, 400);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { code: 'Mike Stevens!' })).status, 400);
+  assert.equal((await superA('PATCH', `/api/super/affiliates/${affId}`, { code: 'mike-stevens' })).json.affiliate.code, 'mike-stevens');
+
+  // The link works only after the owner accepts the Affiliate Program Terms.
+  let r = await anon('GET', '/a/mike-stevens', null, IP);
+  assert.deepEqual([r.status, loc(r), setCookie(r)], [302, '/', '']);
+  let page = (await mike('GET', '/api/affiliate')).json;
+  assert.deepEqual([page.affiliate.link, page.affiliate.terms.needs_accept, page.referrals], [null, true, undefined]);
+  await superA('POST', '/api/super/view-as', { tenant_id: mikeId });
+  assert.equal((await superA('GET', '/api/affiliate')).status, 200, 'super admin can look');
+  assert.equal((await superA('POST', '/api/affiliate/terms', { agree: true })).status, 403, 'only the owner accepts');
+  await superA('POST', '/api/super/view-as', { tenant_id: 0 });
+  assert.equal((await mike('POST', '/api/affiliate/terms', { agree: false })).status, 400);
+  page = (await mike('POST', '/api/affiliate/terms', { agree: true })).json;
+  assert.match(page.affiliate.link, /\/a\/mike-stevens$/);
+  assert.equal(page.affiliate.terms.needs_accept, false);
+  assert.ok(appDb.prepare(`SELECT 1 FROM agreements WHERE tenant_id = ? AND doc = 'affiliate-terms' AND version = ?`).get(mikeId, page.affiliate.terms.version));
+  assert.match((await anon('GET', '/legal/affiliate-terms')).text, /Affiliate Program Terms[\s\S]*Morgan County/);
+
+  // A click sets a 90-day first-party cookie and lands on the home page with ?ref. First click wins.
+  r = await anon('GET', '/a/MIKE-STEVENS', null, IP);
+  assert.deepEqual([r.status, loc(r)], [302, '/?ref=mike-stevens']);
+  assert.equal(setCookie(r), 'hp_ref=mike-stevens; Max-Age=7776000; Path=/; SameSite=Lax; HttpOnly');
+  assert.match(setCookie(await anon('GET', '/a/mike-stevens', null, { ...IP, 'X-Forwarded-Proto': 'https' })), /; Secure$/);
+  const otherId = (await other('GET', '/api/me')).json.tenant.id;
+  const oaff = (await superA('POST', '/api/super/affiliates', { tenant_id: otherId, share_bp: 1000, code: 'other-co' })).json.affiliate;
+  await other('POST', '/api/affiliate/terms', { agree: true });
+  r = await anon('GET', '/a/other-co', null, { ...IP, Cookie: 'hp_ref=mike-stevens' });
+  assert.deepEqual([loc(r), setCookie(r)], ['/?ref=other-co', ''], 'an existing working code is kept');
+  assert.match(setCookie(await anon('GET', '/a/other-co', null, { ...IP, Cookie: 'hp_ref=no-such-code' })), /^hp_ref=other-co;/, 'a code that no longer works is replaced');
+  r = await anon('GET', '/a/no-such-code', null, IP);
+  assert.deepEqual([r.status, loc(r), setCookie(r)], [302, '/', '']);
+  assert.equal(loc(await anon('GET', '/a/x', null, IP)), '/');
+  await superA('PATCH', `/api/super/affiliates/${oaff.id}`, { status: 'paused' });
+  r = await anon('GET', '/a/other-co', null, IP);
+  assert.deepEqual([loc(r), setCookie(r)], ['/', ''], 'paused codes stop working');
+
+  // Clicks: daily counts; unique visitors from a keyed hash, never the raw IP; previews, HEAD and floods don't count.
+  const burst = { 'X-Forwarded-For': '203.0.113.9' };
+  for (let i = 0; i < 25; i++) await anon('GET', '/a/mike-stevens', null, burst);
+  await anon('HEAD', '/a/mike-stevens', null, IP);
+  await anon('GET', '/a/mike-stevens', null, { ...IP, 'User-Agent': 'Slackbot-LinkExpanding 1.0' });
+  const clicks = appDb.prepare('SELECT * FROM affiliate_clicks WHERE affiliate_id = ?').all(affId);
+  assert.deepEqual(clicks.map((c) => [c.clicks, c.uniques]), [[2 + 20, 2]]);
+  const visitors = appDb.prepare('SELECT * FROM affiliate_click_visitors').all();
+  assert.ok(visitors.length && visitors.every((v) => /^[0-9a-f]{32}$/.test(v.ip_hash)));
+  assert.doesNotMatch(JSON.stringify(visitors), /198\.51|203\.0|127\.0|::1/);
+
+  // Who referred this visitor (sign-up form and landing note): the cookie first, else ?code; paused codes don't show.
+  assert.deepEqual((await anon('GET', '/api/public/referral?code=other-co', null, { ...IP, Cookie: 'hp_ref=mike-stevens' })).json, { code: 'mike-stevens', name: mikeName });
+  assert.equal((await anon('GET', '/api/public/referral?code=other-co', null, IP)).json.code, null);
+  assert.equal(loc(await anon('GET', '/signup?ref=Mike-Stevens', null, IP)), '/admin/?ref=mike-stevens#/signup');
+
+  // Sign-ups: the link cookie or a typed code is credited; unknown, paused and own codes are refused with a fix.
+  const signup = (who, body, headers = {}) => who('POST', '/api/signup', { name: 'Owner', password: 'long-enough-pw', agree: true, ...body }, { ...IP, ...headers });
+  const tenantOf = async (who) => appDb.prepare('SELECT * FROM tenants WHERE id = ?').get((await who('GET', '/api/me')).json.tenant.id);
+  const ref1 = client(), ref2 = client(), self2 = client();
+  assert.equal((await signup(ref1, { business_name: 'Referred RV One', email: 'one@ref.test', phone: '801-555-0161' }, { Cookie: 'hp_ref=mike-stevens' })).status, 201);
+  const t1 = await tenantOf(ref1);
+  assert.deepEqual([t1.referred_by_affiliate_id, t1.referred_how, Boolean(t1.referred_at)], [affId, 'link', true]);
+  assert.match((await signup(client(), { business_name: 'Nope Co', email: 'nope@ref.test', referral_code: 'no-such-code' })).json.error, /don’t recognize that referral code/);
+  assert.equal((await signup(client(), { business_name: 'Paused Co', email: 'paused@ref.test', referral_code: 'other-co' })).status, 400);
+  const self = await signup(client(), { business_name: 'Mike Two', email: 'mike2@ref.test', phone: '(801) 232-4995', referral_code: 'mike-stevens' });
+  assert.equal(self.status, 400);
+  assert.match(self.json.error, /can’t use your own referral code/);
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM tenants WHERE name IN ('Nope Co', 'Paused Co', 'Mike Two')`).get().n, 0);
+  assert.equal((await signup(self2, { business_name: 'Mike Three', email: 'mike3@ref.test', phone: '801-232-4995' }, { Cookie: 'hp_ref=mike-stevens' })).status, 201);
+  assert.equal((await tenantOf(self2)).referred_by_affiliate_id, null, 'the link cookie never credits an affiliate for itself');
+  assert.equal((await signup(ref2, { business_name: '=Referred Two', email: 'two@ref.test', phone: '801-555-0162', referral_code: ' MIKE-STEVENS ' })).status, 201);
+  const t2 = await tenantOf(ref2);
+  assert.deepEqual([t2.referred_by_affiliate_id, t2.referred_how], [affId, 'code']);
+  assert.equal((await superA('PUT', `/api/super/tenants/${mikeId}/referral`, { affiliate_id: affId })).status, 400, 'a business can’t refer itself');
+  // Super admin adds a business Mike signed up in person, with his code.
+  const grp = await superA('POST', '/api/super/tenants', { business_name: 'Group Shop', owner_email: 'group@ref.test', referral_code: 'mike-stevens' });
+  assert.equal(grp.status, 201);
+  assert.equal(appDb.prepare('SELECT referred_how FROM tenants WHERE id = ?').get(grp.json.tenant.id).referred_how, 'admin');
+  assert.equal((await superA('POST', '/api/super/tenants', { business_name: 'Bad Code Shop', owner_email: 'bad@ref.test', referral_code: 'nope-nope' })).status, 400);
+
+  // A referred business goes live: its own Stripe account and approved customer terms.
+  async function goLive(who) {
+    const acct = (await who('POST', '/api/stripe/connect')).json.url.split('/').pop();
+    Object.assign(merchants.get(acct), { due: null, submitted: true, card: 'active' });
+    await who('POST', '/api/stripe/refresh');
+    const details = { legalName: 'Referred RV LLC', addressLine1: '2 Main St', city: 'Ogden', state: 'UT', postalCode: '84401', warrantyDays: 30, venueCounty: 'Weber County', taxConfirmed: true };
+    assert.equal((await who('PUT', '/api/legal-profile', { profile: details, tax_rate_bp: 0 })).status, 200);
+    const draft = (await who('GET', '/api/customer-terms')).json.draft;
+    assert.equal((await who('POST', '/api/customer-terms/approve', { markdown: draft, name: 'Owner', title: 'Owner', authorized: true, reviewed: true, seller_of_record: true })).status, 201);
+    return acct;
+  }
+  async function cardPayment(who, acct, amountCents) {
+    const slug = (await who('GET', '/api/me')).json.tenant.slug;
+    await who('PUT', '/api/settings', { deposit_cents: amountCents });
+    const rq = await anon('POST', `/api/public/t/${slug}/requests`, { name: 'Cam', phone: '801-555-0111', location: 'Ogden' }, IP);
+    const dep = await who('POST', `/api/requests/${rq.json.id}/deposit`, { method: 'card' });
+    assert.ok((await anon('POST', `/api/public/payments/${dep.json.token}/checkout`, {})).json.url);
+    const sess = [...sessions.values()].find((s) => s.client_reference_id === dep.json.token);
+    sess.payment_status = 'paid';
+    await post(anon, { type: 'checkout.session.completed', account: acct, data: { object: sess } });
+    return { sess, pay: appDb.prepare('SELECT * FROM payments WHERE token = ?').get(dep.json.token) };
+  }
+  const ledgerFor = (paymentId) => appDb.prepare('SELECT * FROM affiliate_ledger WHERE payment_id = ? ORDER BY id').all(paymentId);
+
+  // $5,000.00 paid online: HitchPoint's 3% is $150.00 and Mike earns 20% of it, $30.00, held for 30 days.
+  const acct1 = await goLive(ref1);
+  const A = await cardPayment(ref1, acct1, 500000);
+  assert.deepEqual([A.pay.status, A.pay.charge_type, A.pay.fee_cents], ['paid', 'direct', 15000]);
+  let rows = ledgerFor(A.pay.id);
+  assert.deepEqual(rows.map((x) => [x.affiliate_id, x.tenant_id, x.type, x.amount_cents, x.status, x.share_bp]), [[affId, t1.id, 'earning', 3000, 'pending', 2000]]);
+  assert.equal(rows[0].available_at, appDb.prepare(`SELECT datetime(?, '+30 days') AS d`).get(A.pay.paid_at).d);
+  // Replays and re-runs don't double count.
+  await post(anon, { type: 'checkout.session.completed', account: acct1, data: { object: A.sess } });
+  await superA('POST', `/api/super/payments/${A.pay.id}/settle`);
+  assert.equal(ledgerFor(A.pay.id).length, 1);
+  // 10% refunded (and replayed): $15.00 of HitchPoint's fee goes back, so $3.00 comes off Mike's share.
+  appFees.set('fee_aff1', { id: 'fee_aff1', amount: 15000, amount_refunded: 0 });
+  const refund = (amt) => post(anon, { type: 'charge.refunded', account: acct1, data: { object: { id: 'ch_' + A.sess.id, object: 'charge', amount: 500000, amount_refunded: amt, application_fee: 'fee_aff1' } } });
+  await refund(50000); await refund(50000);
+  assert.deepEqual(ledgerFor(A.pay.id).map((x) => [x.type, x.amount_cents, x.status]), [['earning', 3000, 'pending'], ['reversal', -300, 'pending']]);
+  // A later share change doesn't rewrite this payment: the next refund still uses 20%.
+  await superA('PATCH', `/api/super/affiliates/${affId}`, { share_bp: 5000 });
+  await refund(100000);
+  assert.deepEqual(ledgerFor(A.pay.id).map((x) => [x.type, x.amount_cents, x.share_bp]), [['earning', 3000, 2000], ['reversal', -300, 2000], ['reversal', -300, 2000]]);
+  await superA('PATCH', `/api/super/affiliates/${affId}`, { share_bp: 2000 });
+  // Outside the 12-month window (counted from the business's sign-up): nothing.
+  appDb.prepare(`UPDATE tenants SET created_at = datetime('now', '-13 months') WHERE id = ?`).run(t1.id);
+  const late = await cardPayment(ref1, acct1, 10000);
+  assert.equal(late.pay.status, 'paid');
+  assert.equal(ledgerFor(late.pay.id).length, 0);
+
+  // Payments made before the referral earn nothing; counting from an earlier day picks them up. Cash never earns.
+  const acct2 = await goLive(ref2);
+  assert.equal((await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: null })).json.referred_by, null);
+  const B = await cardPayment(ref2, acct2, 10000);
+  const walkIn = await ref2('POST', '/api/requests', { name: 'Walk-up', phone: '1', location: 'Shop' });
+  const cash = await ref2('POST', `/api/requests/${walkIn.json.id}/deposit`, { method: 'cash' });
+  assert.equal(ledgerFor(B.pay.id).length, 0);
+  appDb.prepare(`UPDATE tenants SET created_at = datetime('now', '-3 days') WHERE id = ?`).run(t2.id);
+  appDb.prepare(`UPDATE payments SET paid_at = datetime('now', '-2 days') WHERE tenant_id = ?`).run(t2.id);
+  let refd = await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId });
+  assert.deepEqual([refd.json.referred_by.code, refd.json.how], ['mike-stevens', 'admin']);
+  assert.equal(ledgerFor(B.pay.id).length, 0, 'paid before the referral');
+  const threeDaysAgo = appDb.prepare(`SELECT date('now', '-3 days') AS d`).get().d;
+  refd = await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId, from: threeDaysAgo });
+  assert.equal(refd.status, 200);
+  assert.deepEqual(ledgerFor(B.pay.id).map((x) => [x.type, x.amount_cents]), [['earning', 60]]);
+  assert.equal(ledgerFor(cash.json.id).length, 0);
+  assert.equal((await superA('PUT', `/api/super/tenants/${t2.id}/referral`, { affiliate_id: affId, from: '2999-01-01' })).status, 400);
+
+  // Payouts: blocked without a W-9 and under $25.00; then the whole available balance is paid and marked.
+  const shown = async () => (await superA('GET', `/api/super/affiliates/${affId}`)).json.affiliate.available_cents;
+  const payout = async (body = {}) => superA('POST', `/api/super/affiliates/${affId}/payouts`, { method: 'ach', reference: 'ACH-1001', amount_cents: await shown(), ...body });
+  let po = await payout();
+  assert.equal(po.status, 409);
+  assert.match(po.json.error, /W-9/);
+  await superA('PATCH', `/api/super/affiliates/${affId}`, { w9_on_file: true });
+  assert.match((await payout()).json.error, /available balance is \$0\.00\. Payouts start at \$25\.00/);
+  appDb.prepare(`UPDATE affiliate_ledger SET available_at = datetime('now', '-1 minute') WHERE affiliate_id = ?`).run(affId); // 30 days later
+  assert.match((await payout()).json.error, /\$24\.60/); // $30.00 - $3.00 - $3.00 + $0.60
+  assert.equal((await payout({ method: 'cash' })).status, 400);
+  assert.equal((await superA('POST', `/api/super/affiliates/${affId}/adjustments`, { amount_cents: 1000, note: '' })).status, 400);
+  assert.equal((await superA('POST', `/api/super/affiliates/${affId}/adjustments`, { amount_cents: 1000, note: 'Welcome bonus' })).status, 201);
+  po = await payout();
+  assert.equal(po.status, 201, JSON.stringify(po.json));
+  assert.deepEqual([po.json.affiliate.available_cents, po.json.affiliate.pending_cents, po.json.affiliate.paid_cents], [0, 0, 3460]);
+  assert.equal(appDb.prepare(`SELECT COUNT(*) AS n FROM affiliate_ledger WHERE affiliate_id = ? AND (status != 'paid' OR payout_id IS NULL)`).get(affId).n, 0, 'every row is marked paid');
+  assert.deepEqual(appDb.prepare(`SELECT amount_cents, status FROM affiliate_ledger WHERE affiliate_id = ? AND type = 'payout'`).all(affId).map((x) => [x.amount_cents, x.status]), [[-3460, 'paid']]);
+  assert.equal((await payout()).status, 409, 'nothing left to pay');
+  assert.throws(() => appDb.prepare('DELETE FROM affiliate_ledger').run(), /append-only/);
+  assert.throws(() => appDb.prepare('UPDATE affiliate_ledger SET amount_cents = 1').run(), /never change/);
+  // Yearly totals for 1099s.
+  const year = new Date().toISOString().slice(0, 4);
+  const y1099 = await superA('GET', `/api/super/affiliate-payouts.csv?year=${year}`);
+  assert.match(y1099.text, /^"Year","Affiliate","Legal name \(W-9 line 1\)","Business name \(line 2\)","Tax classification","Tax ID \(last 4\)","Address","Email","Affiliate code","W-9","Backup withholding","Payouts","Total paid","At or over \$2,000 \(1099 likely\)"\n/);
+  assert.match(y1099.text, new RegExp(`"${year}","Mike Stevens Emergency RV & Trailer Repair","Mike Stevens RV Repair LLC","","","","1 Main St, Ogden, UT 84401","mike@rv.test","mike-stevens","paper \\(${year}-\\d\\d-\\d\\d\\)","","1","34.60","no"`));
+  assert.equal((await mike('GET', '/api/super/affiliate-payouts.csv')).status, 403);
+
+  // Mike's page: names and his earnings only, never a referred business's payment volume.
+  page = (await mike('GET', '/api/affiliate')).json;
+  assert.deepEqual(page.totals, { pending_cents: 0, available_cents: 0, paid_cents: 3460 });
+  assert.deepEqual(page.clicks, { last_30_days: 22, all_time: 22 });
+  assert.deepEqual(page.referrals.map((x) => x.name).sort(), ['=Referred Two', 'Group Shop', 'Referred RV One']);
+  for (const x of page.referrals) assert.deepEqual(Object.keys(x).sort(), ['earned_cents', 'joined', 'name', 'share_ends', 'state']);
+  const one = page.referrals.find((x) => x.name === 'Referred RV One');
+  assert.deepEqual([one.earned_cents, one.state], [2400, 'taking_payments']);
+  assert.equal(page.referrals.find((x) => x.name === 'Group Shop').state, 'setting_up');
+  for (const x of page.ledger) assert.deepEqual(Object.keys(x).sort(), ['amount_cents', 'business', 'date', 'method', 'month', 'note', 'reference', 'status', 'type']);
+  // Earnings come as one line per business per month, never single payments.
+  assert.ok(page.ledger.filter((x) => x.type === 'earnings').every((x) => /^\d{4}-\d\d$/.test(x.month) && x.date === null));
+  assert.equal(page.ledger.some((x) => x.type === 'earning' || x.type === 'reversal'), false);
+  assert.equal('platform_fee_bp' in page.affiliate, false);
+  assert.doesNotMatch(JSON.stringify(page), /500000|15000|13500|amount_refunded|fee_cents|payment_id|description|"Cam"/);
+
+  // Staff, other businesses, referred businesses and visitors can't see Mike's referral data.
+  await mike('POST', '/api/team', { email: 'tech@rv.test', name: 'Tech', password: 'tech-long-password' });
+  const staff = client();
+  assert.equal((await staff('POST', '/api/login', { email: 'tech@rv.test', password: 'tech-long-password' })).status, 200);
+  assert.equal((await staff('GET', '/api/affiliate')).status, 403);
+  assert.equal((await staff('GET', '/api/affiliate/ledger.csv')).status, 403);
+  const theirs = (await other('GET', '/api/affiliate')).json;
+  assert.deepEqual([theirs.affiliate.code, theirs.referrals, theirs.ledger], ['other-co', [], []]);
+  assert.doesNotMatch(JSON.stringify(theirs), /Referred RV One|mike-stevens/);
+  assert.doesNotMatch((await other('GET', '/api/affiliate/ledger.csv')).text, /Referred/);
+  assert.equal((await other('GET', `/api/super/affiliates/${affId}`)).status, 403);
+  assert.equal((await ref1('GET', '/api/affiliate')).json.affiliate, null);
+  assert.equal((await anon('GET', '/api/affiliate')).status, 401);
+
+  // CSV: every cell quoted, formula-looking text neutralized.
+  const csv = (await mike('GET', '/api/affiliate/ledger.csv')).text;
+  assert.match(csv, /^"Month or date","Business","What it is","Amount","Status"\n/);
+  assert.match(csv, /"\d{4}-\d\d","'=Referred Two","Your share of HitchPoint’s fees","0.60","paid"/);
+  assert.match(csv, /"\d{4}-\d\d","Referred RV One","Your share of HitchPoint’s fees","24.00","paid"/); // net of the refund taken back
+  assert.doesNotMatch(csv, /(^|,)"=/m);
+  assert.match(csv, /"Paid to you by ACH \(ACH-1001\)","-34.60","paid"/);
+  assert.doesNotMatch(csv, /Taken back/);
+
+  // Super admin detail: how each business was credited, payouts and share history.
+  const det = (await superA('GET', `/api/super/affiliates/${affId}`)).json;
+  assert.deepEqual(det.referrals.map((x) => [x.name, x.how]).sort(), [['=Referred Two', 'admin'], ['Group Shop', 'admin'], ['Referred RV One', 'link']]);
+  assert.deepEqual([det.payouts[0].amount_cents, det.payouts[0].method, det.payouts[0].created_by], [3460, 'ach', 'aaron@agilities.test']);
+  assert.deepEqual(det.rates.map((x) => x.share_bp), [2000, 5000, 2000]);
+  const list = (await superA('GET', '/api/super/affiliates')).json;
+  assert.deepEqual(list.affiliates.map((x) => x.code).sort(), ['mike-stevens', 'other-co']);
+  assert.ok(!list.businesses.some((b) => b.id === mikeId || b.id === otherId));
 });
 
 test('static pages, legal pages and seed script', async () => {
