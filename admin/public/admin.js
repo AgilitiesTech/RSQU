@@ -86,7 +86,7 @@
   function buildChrome() {
     const tenantMode = Boolean(me.tenant);
     const items = tenantMode
-      ? [['requests', 'Requests', 'requests'], ['quotes', 'Quotes', 'quotes'], ['products', 'Products', 'products'], ['business', 'Business', 'business'], ['settings', 'Settings', 'settings']]
+      ? [['requests', 'Requests', 'requests'], ['schedule', 'Schedule', 'calendar'], ['quotes', 'Quotes', 'quotes'], ['business', 'Business', 'business'], ['settings', 'Settings', 'settings']]
       : [['super', 'Businesses', 'grid'], ['leads', 'Leads', 'requests'], ['platform', 'Platform', 'settings']];
     const badge = (k) => (k === 'requests' ? '<span class="badge" data-newcount hidden></span>' : '');
     document.getElementById('topnav').innerHTML = items.map(([k, l]) => `<a href="#/${k}" data-nav="${k}">${l} ${badge(k)}</a>`).join('');
@@ -307,6 +307,7 @@
         <a class="btn primary" href="${telHref(r.phone)}">Call ${esc(r.phone)}</a>
         <a class="btn" href="${smsHref(r.phone, `Hi ${r.name || ''}, this is ${bizName()}. I got your request and I'm on it.`)}">Text</a>
         <a class="btn ghost" href="${mapHref(r.location)}" target="_blank" rel="noopener">Map</a>
+        <a class="btn ghost" href="#/schedule/new/request/${r.id}">Schedule this job</a>
       </div>
       <p class="alert" id="rq-msg" hidden></p>
       <div class="grid2">
@@ -395,6 +396,7 @@
     view.innerHTML = `
       <a href="${q.request_id ? '#/requests/' + q.request_id : '#/quotes'}" class="small">← ${q.request_id ? 'Request #' + q.request_id : 'Quotes'}</a>
       <div class="row between"><h1>Quote #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
+      ${q.status !== 'void' ? `<div class="row"><a class="btn ghost sm" href="#/schedule/new/quote/${q.id}">Schedule this job</a></div>` : ''}
       <p class="alert" id="q-msg" hidden></p>
       ${q.signed_at ? `<p class="alert ok">Signed by ${esc(q.signer_name)} on ${esc(new Date(q.signed_at.replace(' ', 'T') + 'Z').toLocaleString())}. Signed quotes can’t be edited.</p>` : ''}
       ${aiCard(q, locked)}
@@ -622,10 +624,11 @@
 
   // ---------- products ----------
   async function productsView() {
-    setNav('products');
+    setNav('business');
     const rows = await api('/api/products');
     const flags = (p) => `${p.active ? '' : '<span class="tag void">Hidden</span>'} ${p.on_site ? '<span class="tag">On website</span>' : ''} ${p.bookable ? '<span class="tag winterize">Bookable</span>' : ''} ${p.taxable ? '<span class="tag">Taxable</span>' : ''} ${p.image ? '<span class="tag">Tile picture</span>' : ''} ${p.details && p.on_site ? '<span class="tag">Own page</span>' : ''}`;
     view.innerHTML = `
+      <a href="#/business" class="small">← Business</a>
       <h1>Products and services</h1>
       <p class="muted">These show up when you build a quote. Turn on “Show on website” to list one on your site, and “Customers can book it” for fixed-price packages.</p>
       <form class="card stack" id="pf">
@@ -1405,6 +1408,7 @@
     const f = document.getElementById('bf');
     const area = document.getElementById('b-area');
     if (!f || !area) return;
+    productsCard();
     let st;
     try { st = await api('/api/owner-settings'); } catch { return; }
     area.parentElement.insertAdjacentHTML('afterend', `<div style="max-width:420px"><label for="b-tz">Time zone</label>
@@ -1456,6 +1460,205 @@
     });
   }
 
+  // ---------- owner features: scheduling ----------
+  ICON.calendar = '<rect x="3" y="4" width="18" height="18" rx="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line>';
+  const JSTATUS = { scheduled: 'Scheduled', en_route: 'On the way', done: 'Done', canceled: 'Canceled' };
+  const DURATIONS = [[30, '30 minutes'], [60, '1 hour'], [90, '1½ hours'], [120, '2 hours'], [180, '3 hours'], [240, '4 hours'], [360, '6 hours'], [480, 'All day (8 hours)']];
+  const dayAdd = (d, n) => { const [y, m, dd] = d.split('-').map(Number); return new Date(Date.UTC(y, m - 1, dd + n)).toISOString().slice(0, 10); };
+  const dayLabel = (d, opts = { weekday: 'short', month: 'short', day: 'numeric' }) => new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { ...opts, timeZone: 'UTC' });
+  let schedMode = 'week';
+
+  async function scheduleView(mode, date) {
+    setNav('schedule');
+    mode = mode === 'day' || mode === 'week' ? mode : schedMode;
+    schedMode = mode;
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : '';
+    const data = await api(`/api/jobs?days=${mode === 'day' ? 1 : 7}${mode === 'week' ? '&snap=week' : ''}${day ? '&from=' + day : ''}`);
+    const step = mode === 'day' ? 1 : 7;
+    const days = Array.from({ length: data.days }, (_, i) => dayAdd(data.from, i));
+    const tzName = (TZ_NAMES[data.tz] || data.tz).replace(/ \(.*\)$/, '');
+    const range = mode === 'day' ? dayLabel(data.from, { weekday: 'long', month: 'long', day: 'numeric' }) : `${dayLabel(days[0], { month: 'short', day: 'numeric' })} to ${dayLabel(days[6], { month: 'short', day: 'numeric' })}`;
+    const jobItem = (j) => `
+      <a class="item sched-item ${j.status}" href="#/schedule/job/${j.id}">
+        <div class="sched-time"><strong>${esc(j.start_label)}</strong><span class="small muted">${esc(j.end_label)}</span></div>
+        <div class="grow stack" style="gap:2px">
+          <span class="item-title">${esc(j.customer_name || 'Customer')}</span>
+          ${j.address ? `<span class="small">${esc(j.address.split('\n')[0]).slice(0, 120)}</span>` : ''}
+          <span class="small muted">${j.assignee_name || j.assignee_email ? esc(j.assignee_name || j.assignee_email) + ' · ' : ''}${JSTATUS[j.status]}</span>
+        </div>
+      </a>`;
+    view.innerHTML = `
+      <div class="row between"><h1>Schedule</h1><a class="btn primary sm" href="#/schedule/new">+ New appointment</a></div>
+      <div class="row between">
+        <div class="tabs" role="group" aria-label="Show"><button type="button" data-mode="day" aria-pressed="${mode === 'day'}">Day</button><button type="button" data-mode="week" aria-pressed="${mode === 'week'}">Week</button></div>
+        <div class="row" style="gap:6px">
+          <a class="btn ghost sm" href="#/schedule/${mode}/${dayAdd(data.from, -step)}" aria-label="Previous ${mode}">‹ Back</a>
+          <a class="btn ghost sm" href="#/schedule/${mode}/${data.today}">Today</a>
+          <a class="btn ghost sm" href="#/schedule/${mode}/${dayAdd(data.from, step)}" aria-label="Next ${mode}">Next ›</a>
+        </div>
+      </div>
+      <p class="small muted">${esc(range)} · ${esc(tzName)}</p>
+      <div class="stack sched">${days.map((d) => {
+        const jobs = data.jobs.filter((j) => j.date === d);
+        const isToday = d === data.today;
+        return `<section class="sched-day${isToday ? ' today' : ''}" ${isToday ? 'aria-current="date"' : ''}>
+          ${mode === 'week' ? `<h2 class="sched-date"><a href="#/schedule/day/${d}">${esc(dayLabel(d))}</a>${isToday ? ' <span class="tag new">Today</span>' : ''}</h2>` : isToday ? '<p><span class="tag new">Today</span></p>' : ''}
+          ${jobs.length ? `<div class="list">${jobs.map(jobItem).join('')}</div>` : `<p class="small muted sched-none">No appointments.${mode === 'day' ? ` <a href="#/schedule/new/date/${d}">Add one</a>` : ''}</p>`}
+        </section>`;
+      }).join('')}</div>
+      <section class="card stack" id="cal-card">
+        <h2>See your schedule in your phone’s calendar</h2>
+        <p class="small">Add your appointments to Google Calendar or Apple Calendar. They update on their own about once an hour.</p>
+        <div><button class="btn" type="button" id="cal-show">Get my calendar link</button></div>
+        <div id="cal-box" class="stack" hidden></div>
+      </section>`;
+    view.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => { location.hash = `#/schedule/${b.dataset.mode}/${mode === 'week' && b.dataset.mode === 'day' && days.includes(data.today) ? data.today : data.from}`; }));
+    document.getElementById('cal-show').addEventListener('click', () => calendarBox());
+  }
+  const TZ_NAMES = { 'America/New_York': 'Eastern time', 'America/Chicago': 'Central time', 'America/Denver': 'Mountain time', 'America/Phoenix': 'Arizona time (no daylight saving)', 'America/Los_Angeles': 'Pacific time', 'America/Anchorage': 'Alaska time', 'Pacific/Honolulu': 'Hawaii time' };
+
+  async function calendarBox(reset) {
+    const box = document.getElementById('cal-box');
+    let c;
+    try { c = await api('/api/calendar' + (reset ? '/reset' : ''), reset ? { method: 'POST' } : {}); }
+    catch (err) { box.hidden = false; box.innerHTML = `<p class="alert err">${esc(err.message)}</p>`; return; }
+    const webcal = c.url.replace(/^https?:/, 'webcal:');
+    document.getElementById('cal-show').hidden = true;
+    box.hidden = false;
+    box.innerHTML = `
+      <p class="small">${c.owner ? 'Shows every appointment.' : 'Shows the appointments assigned to you.'} Anyone with this link can see your schedule, so keep it private.</p>
+      <div><label for="cal-url">Your private calendar link</label><input id="cal-url" readonly value="${esc(c.url)}"></div>
+      <div class="row">
+        <a class="btn sm" href="${esc('https://calendar.google.com/calendar/render?cid=' + encodeURIComponent(webcal))}" target="_blank" rel="noopener">Add to Google Calendar</a>
+        <a class="btn sm" href="${esc(webcal)}">Add to Apple Calendar</a>
+        <button class="btn ghost sm" type="button" data-copy="${esc(c.url)}">Copy link</button>
+      </div>
+      <p class="small muted">Shared it by mistake? <button class="linkbtn" type="button" id="cal-reset">Make a new link</button> The old one stops working.</p>`;
+    box.querySelector('[data-copy]').addEventListener('click', (e) => copy(c.url, e.target));
+    document.getElementById('cal-reset').addEventListener('click', () => { if (confirm('Make a new link? Calendars using the old link stop updating, so you’ll need to add the new one.')) calendarBox(true); });
+  }
+
+  // New appointment (blank, or from a request or quote), or edit one.
+  async function jobFormView(id, srcType, srcId) {
+    setNav('schedule');
+    const editing = Boolean(id);
+    const src = srcType === 'request' ? `request_id=${encodeURIComponent(srcId)}` : srcType === 'quote' ? `quote_id=${encodeURIComponent(srcId)}` : '';
+    const j = editing ? await api('/api/jobs/' + id) : await api('/api/jobs/new' + (src ? '?' + src : ''));
+    const date = editing ? j.date : srcType === 'date' && /^\d{4}-\d{2}-\d{2}$/.test(srcId || '') ? srcId : j.today;
+    const back = editing ? `#/schedule/job/${j.id}` : j.quote_id ? `#/quotes/${j.quote_id}` : j.request_id ? `#/requests/${j.request_id}` : '#/schedule';
+    const dur = editing ? j.duration_min : 60;
+    view.innerHTML = `
+      <a href="${back}" class="small">← ${editing ? 'Appointment' : j.quote_id ? 'Quote #' + j.quote_id : j.request_id ? 'Request #' + j.request_id : 'Schedule'}</a>
+      <h1>${editing ? 'Change appointment' : 'New appointment'}</h1>
+      <form class="stack" id="jf">
+        <section class="card stack">
+          <h2>When</h2>
+          <div class="grid3">
+            <div><label for="jf-date">Date</label><input id="jf-date" name="date" type="date" required value="${esc(date)}"></div>
+            <div><label for="jf-time">Start time</label><input id="jf-time" name="time" type="time" step="900" required value="${esc(editing ? j.time : '09:00')}"></div>
+            <div><label for="jf-dur">How long</label><select id="jf-dur" name="duration_min">${DURATIONS.map(([v, l]) => `<option value="${v}" ${v === dur ? 'selected' : ''}>${l}</option>`).join('')}${DURATIONS.some(([v]) => v === dur) ? '' : `<option value="${dur}" selected>${dur} minutes</option>`}</select></div>
+          </div>
+          <div style="max-width:420px"><label for="jf-user">Who’s going</label><select id="jf-user" name="user_id"><option value="">Not assigned</option>${j.team.map((u) => `<option value="${u.id}" ${editing && j.user_id === u.id ? 'selected' : !editing && u.id === me.user.id ? 'selected' : ''}>${esc(u.name || u.email)}</option>`).join('')}</select></div>
+        </section>
+        <section class="card stack">
+          <h2>Customer</h2>
+          <div class="grid2">
+            <div><label for="jf-name">Name</label><input id="jf-name" name="customer_name" autocomplete="off" value="${esc(j.customer_name)}"></div>
+            <div><label for="jf-phone">Mobile phone</label><input id="jf-phone" name="customer_phone" type="tel" autocomplete="off" value="${esc(j.customer_phone)}"></div>
+            <div><label for="jf-email">Email</label><input id="jf-email" name="customer_email" type="email" autocomplete="off" value="${esc(j.customer_email)}"></div>
+          </div>
+          <div><label for="jf-addr">Address or location</label><textarea id="jf-addr" name="address" rows="2">${esc(j.address)}</textarea></div>
+          <div><label for="jf-notes">Notes for the tech</label><textarea id="jf-notes" name="notes" rows="3">${esc(j.notes)}</textarea></div>
+        </section>
+        <label class="check"><input type="checkbox" name="notify" checked> <span>${editing ? 'If the time changes, text and email the customer the new time and a new reminder' : 'Text and email the customer a confirmation now, and a reminder the day before at 9am'}</span></label>
+        <p class="small muted">These are appointment messages, so customers get them even if they didn’t sign up for offers. Texts only go out 8am to 8pm. Customers who replied STOP don’t get texts.</p>
+        <p class="alert err" id="jf-err" hidden></p>
+        <div class="sticky-actions row"><button class="btn primary" type="submit">${editing ? 'Save changes' : 'Book appointment'}</button><a class="btn ghost" href="${back}">Cancel</a></div>
+      </form>`;
+    const f = document.getElementById('jf');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = Object.fromEntries(new FormData(f));
+      body.notify = f.elements.notify.checked;
+      body.duration_min = Number(body.duration_min);
+      body.user_id = body.user_id ? Number(body.user_id) : null;
+      if (!editing) { body.request_id = j.request_id; body.quote_id = j.quote_id; }
+      const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
+      try { const saved = await api(editing ? '/api/jobs/' + id : '/api/jobs', { method: editing ? 'PUT' : 'POST', body }); location.hash = '#/schedule/job/' + saved.id; }
+      catch (err) { flash(document.getElementById('jf-err'), err.message, 'err'); btn.disabled = false; }
+    });
+  }
+
+  async function jobView(id) {
+    setNav('schedule');
+    const j = await api('/api/jobs/' + id);
+    const open = j.status === 'scheduled' || j.status === 'en_route';
+    const KIND = { job_confirm: 'Confirmation', job_reminder: 'Reminder', job_on_way: '“On my way”' };
+    const CH = { email: 'email', sms: 'text' };
+    const mstate = (m) => (m.status === 'sent' ? `Sent ${esc(m.when_label)}` : m.status === 'pending' ? (m.soon ? 'Going out now' : `Goes out ${esc(m.when_label)}`) : m.status === 'canceled' ? 'Not sent: the time changed' : m.status === 'skipped' ? `Not sent: ${esc(m.error || '')}` : m.status === 'failed' ? 'Didn’t go through' : 'Sending');
+    const canText = j.customer_phone && !j.stopped;
+    view.innerHTML = `
+      <a href="#/schedule/day/${esc(j.date)}" class="small">← Schedule</a>
+      <div class="row between"><h1>${esc(j.customer_name || 'Customer')}</h1><span class="tag ${j.status === 'done' ? 'paid' : j.status === 'canceled' ? 'void' : j.status === 'en_route' ? 'new' : ''}">${JSTATUS[j.status]}</span></div>
+      <p class="big-num" style="font-size:24px">${esc(j.when_label)} to ${esc(j.end_label)}</p>
+      <div class="row">
+        ${j.customer_phone ? `<a class="btn primary" href="${telHref(j.customer_phone)}">Call ${esc(j.customer_phone)}</a><a class="btn" href="${smsHref(j.customer_phone)}">Text</a>` : ''}
+        ${j.address ? `<a class="btn ghost" href="${mapHref(j.address)}" target="_blank" rel="noopener">Map</a>` : ''}
+      </div>
+      <p class="alert" id="jv-msg" hidden></p>
+      ${open ? `<section class="card stack">
+        <h2>On my way</h2>
+        ${!j.customer_phone ? '<p class="small">Add the customer’s mobile number to text them.</p>' : j.stopped ? '<p class="small">This customer replied STOP to texts. Give them a call instead.</p>' : !j.sms_enabled ? '<p class="small">Texting isn’t set up yet. Give the customer a call instead.</p>' : `
+        <div class="row" style="align-items:flex-end">
+          <div style="width:150px"><label for="omw-min">Minutes away</label><input id="omw-min" inputmode="numeric" maxlength="3" value="30"></div>
+          <button class="btn primary" type="button" id="omw-send" ${j.in_text_hours ? '' : 'disabled'}>Text “On my way”</button>
+        </div>
+        <p class="small muted" id="omw-preview"></p>
+        ${j.in_text_hours ? '' : '<p class="small">It’s outside texting hours (8am to 8pm). Give the customer a call instead.</p>'}`}
+      </section>` : ''}
+      <section class="card stack">
+        <h2>Details</h2>
+        <dl class="facts">
+          ${j.address ? `<dt>Where</dt><dd>${esc(j.address)}</dd>` : ''}
+          ${j.customer_phone ? `<dt>Phone</dt><dd>${esc(j.customer_phone)}</dd>` : ''}
+          ${j.customer_email ? `<dt>Email</dt><dd>${esc(j.customer_email)}</dd>` : ''}
+          <dt>Who’s going</dt><dd>${esc(j.assignee_name || j.assignee_email || 'Not assigned')}</dd>
+          ${j.notes ? `<dt>Notes</dt><dd>${esc(j.notes)}</dd>` : ''}
+          ${j.request ? `<dt>Request</dt><dd><a href="#/requests/${j.request.id}">#${j.request.id}${j.request.name ? ' · ' + esc(j.request.name) : ''}</a></dd>` : ''}
+          ${j.quote ? `<dt>${j.quote.kind === 'invoice' ? 'Invoice' : 'Quote'}</dt><dd><a href="#/quotes/${j.quote.id}">#${j.quote.id} · ${esc(j.quote.title)}</a></dd>` : ''}
+        </dl>
+      </section>
+      <section class="card stack">
+        <h2>Messages to the customer</h2>
+        ${j.messages.length ? `<ul class="small" style="margin:0;padding-left:20px">${j.messages.map((m) => `<li>${KIND[m.kind] || esc(m.kind)} ${CH[m.channel]}: ${mstate(m)}</li>`).join('')}</ul>` : '<p class="small muted">None. Add a phone number or email to send a confirmation and reminder.</p>'}
+      </section>
+      ${open ? `<div class="row">
+        <a class="btn" href="#/schedule/edit/${j.id}">Change time or details</a>
+        <button class="btn" type="button" data-js="done">Mark done</button>
+        <button class="linkbtn" type="button" data-js="canceled">Cancel appointment</button>
+      </div>` : ''}`;
+    const msg = document.getElementById('jv-msg');
+    const mins = document.getElementById('omw-min'), prev = document.getElementById('omw-preview');
+    const preview = () => { prev.textContent = `Sends: “${bizName()} is on the way, about ${Number(mins.value) || '?'} minutes.” with your phone number.`; };
+    if (mins) { mins.addEventListener('input', preview); preview(); }
+    const send = document.getElementById('omw-send');
+    if (send) send.addEventListener('click', async () => {
+      send.disabled = true;
+      try { await api(`/api/jobs/${id}/on-my-way`, { method: 'POST', body: { minutes: Number(mins.value) } }); await jobView(id); flash(document.getElementById('jv-msg'), 'Text sent.'); }
+      catch (err) { flash(msg, err.message, 'err'); send.disabled = false; }
+    });
+    view.querySelectorAll('[data-js]').forEach((b) => b.addEventListener('click', async () => {
+      if (b.dataset.js === 'canceled' && !confirm('Cancel this appointment? Its reminder won’t go out. We don’t tell the customer, so give them a call.')) return;
+      try { await api(`/api/jobs/${id}/status`, { method: 'POST', body: { status: b.dataset.js } }); jobView(id); } catch (err) { flash(msg, err.message, 'err'); }
+    }));
+  }
+
+  // Products moved off the phone menu: a card on the Business page links to them.
+  function productsCard() {
+    const first = view.querySelector('section.card');
+    if (first) first.insertAdjacentHTML('afterend', `<section class="card stack"><h2>Products and services</h2><p>Your prices for quotes, and the services on your website.</p><div><a class="btn" href="#/products">Edit products and services</a></div></section>`);
+  }
+
   // ---------- router ----------
   async function loadMe() { me = await api('/api/me', { quiet: true }).catch(() => ({ authed: false })); if (!me.authed) me = null; return me; }
   async function route() {
@@ -1479,6 +1682,10 @@
       else if (a === 'quotes' && b === 'photo') photoQuoteView(c);
       else if (a === 'quotes' && b) await quoteView(b);
       else if (a === 'customers') await customersView();
+      else if (a === 'schedule' && b === 'new') await jobFormView(null, c, h.split('/')[3]);
+      else if (a === 'schedule' && b === 'job' && c) await jobView(c);
+      else if (a === 'schedule' && b === 'edit' && c) await jobFormView(c);
+      else if (a === 'schedule') await scheduleView(b, c);
       else if (a === 'quotes') await quotesView();
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();

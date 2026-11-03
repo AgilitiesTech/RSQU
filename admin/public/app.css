@@ -151,3 +151,15 @@ code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background:
 .photos img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 6px; display: block; }
 fieldset.consent { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px 14px; margin: 0; }
 fieldset.consent legend { padding: 0 6px; }
+
+/* owner features: schedule */
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 16px; align-items: start; }
+.sched { gap: 16px; }
+.sched-date { font-size: 19px; margin: 0 0 6px; display: flex; gap: 8px; align-items: center; }
+.sched-date a { color: var(--ink); text-decoration: none; }
+.sched-day.today { border-left: 4px solid var(--red); padding-left: 10px; }
+.sched-day.today .list { border-color: var(--red); }
+.sched-none { padding: 2px 0; }
+.sched-time { display: flex; flex-direction: column; min-width: 88px; font-variant-numeric: tabular-nums; }
+.sched-item.done .item-title { text-decoration: line-through; color: var(--muted); }
+.sched-item.en_route { background: #FFF8E6; }

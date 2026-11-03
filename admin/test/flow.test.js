@@ -960,6 +960,166 @@ test('review requests: on with a Google review link, consent respected, quiet ho
   assert.equal((await other('GET', '/api/owner-settings')).json.review.link, '', 'settings are per business');
 });
 
+let tia, tiaId, bookedJob;
+test('scheduling: confirmation, reminder at 9am business time the day before, quiet hours, changes, once only', async () => {
+  const tz = 'America/New_York'; // Mike's time zone since the time zone test
+  const day = owner.addDays(owner.todayIn(tz), 10);
+  assert.equal((await mike('POST', '/api/team', { name: 'Tia Tech', email: 'tia@rv.test', password: 'tia-temp-password' })).status, 201);
+  tia = client();
+  assert.equal((await tia('POST', '/api/login', { email: 'tia@rv.test', password: 'tia-temp-password' })).status, 200);
+  tiaId = appDb.prepare(`SELECT id FROM users WHERE email = 'tia@rv.test'`).get().id;
+  const olaId = appDb.prepare(`SELECT id FROM users WHERE email = 'ola@other.test'`).get().id;
+
+  // "Schedule this job" from a request fills in the customer.
+  const rq = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { type: 'repair', name: 'Jo Booker', phone: '801-555-0170', email: 'jo@example.test', location: '12 Elm St, Ogden', issue: 'Slide-out stuck' });
+  const pre = (await mike('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json;
+  assert.deepEqual([pre.customer_name, pre.customer_phone, pre.customer_email, pre.address, pre.request_id], ['Jo Booker', '801-555-0170', 'jo@example.test', '12 Elm St, Ogden', rq.json.id]);
+  assert.equal((await other('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json.customer_name, '', 'another business gets nothing');
+  assert.equal((await mike('POST', '/api/jobs', { ...pre, date: 'soon', time: '14:00' })).status, 400);
+  assert.equal((await mike('POST', '/api/jobs', { ...pre, date: day, time: '14:00', user_id: olaId })).status, 400, 'only your own team');
+
+  let mark = outbox.length;
+  const made = await mike('POST', '/api/jobs', { ...pre, date: day, time: '14:00', duration_min: 90, user_id: tiaId, notes: 'Bring a slide motor' });
+  assert.equal(made.status, 201, JSON.stringify(made.json));
+  const job = bookedJob = made.json;
+  assert.deepEqual([job.date, job.time, job.start_label, job.end_label, job.start_at], [day, '14:00', '2:00 PM', '3:30 PM', owner.utcString(owner.zonedTimeToUtc(day, '14:00', tz))]);
+  const jobRows = (id) => appDb.prepare(`SELECT * FROM scheduled_messages WHERE ref_id = ? AND kind IN ('job_confirm','job_reminder','job_on_way') ORDER BY id`).all(id);
+  let rows = jobRows(job.id);
+  assert.deepEqual(rows.map((r) => `${r.kind}:${r.channel}`), ['job_confirm:email', 'job_confirm:sms', 'job_reminder:email', 'job_reminder:sms']);
+  const reminderAt = owner.zonedTimeToUtc(owner.addDays(day, -1), '09:00', tz);
+  assert.ok(rows.slice(2).every((r) => r.send_after === owner.utcString(reminderAt)), 'reminder at 9am the day before, business time');
+  assert.equal(outbox.length, mark, 'nothing is sent inside the request; the background sender does it');
+
+  // The worker runs at 9pm business time: the email goes now, the text waits for 8am.
+  const night = localAt(new Date(), '21:00', tz);
+  await runDue(night);
+  const conf = sentTo('jo@example.test', mark);
+  assert.equal(conf.length, 1);
+  assert.match(conf[0].subject, /^Your appointment with Mike Stevens Emergency RV & Trailer Repair: \w{3}, \w{3} \d+ at 2:00 PM$/);
+  assert.match(conf[0].text, /Where: 12 Elm St, Ogden/);
+  assert.match(conf[0].text, /801-232-4995/);
+  assert.equal(sentTo('+18015550170', mark).length, 0, 'no texts at 9pm');
+  const eight = owner.zonedTimeToUtc(owner.addDays(owner.localParts(night, tz).date, 1), '08:00', tz);
+  assert.equal(jobRows(job.id)[1].send_after, owner.utcString(eight));
+  await Promise.all([runDue(new Date(eight.getTime() + 60_000)), runDue(new Date(eight.getTime() + 60_000))]);
+  await runDue(new Date(eight.getTime() + 120_000));
+  const texts = sentTo('+18015550170', mark);
+  assert.equal(texts.length, 1, 'sent once');
+  assert.match(texts[0].body, /^Mike Stevens Emergency RV & Trailer Repair: You’re booked for \w{3}, \w{3} \d+ at 2:00 PM at 12 Elm St, Ogden\. Questions\? Call or text 801-232-4995\. Reply STOP to opt out\.$/);
+
+  // The owner moves it to the next day at 10am: the old reminder is dropped and the customer hears the new time.
+  const moved = await mike('PUT', `/api/jobs/${job.id}`, { ...job, date: owner.addDays(day, 1), time: '10:00', duration_min: 90, user_id: tiaId, notify: true });
+  assert.equal(moved.status, 200);
+  rows = jobRows(job.id);
+  assert.deepEqual(rows.slice(2, 4).map((r) => r.status), ['canceled', 'canceled']);
+  const newReminder = owner.zonedTimeToUtc(day, '09:00', tz);
+  assert.deepEqual(rows.slice(4).map((r) => `${r.kind}:${r.channel}:${r.status}`), ['job_confirm:email:pending', 'job_confirm:sms:pending', 'job_reminder:email:pending', 'job_reminder:sms:pending']);
+  assert.ok(rows.slice(6).every((r) => r.send_after === owner.utcString(newReminder)));
+  mark = outbox.length;
+  await runDue(localAt(new Date(eight.getTime() + 3600_000), '12:00', tz));
+  assert.match(sentTo('+18015550170', mark)[0].body, /Your appointment changed\. You’re now booked for \w{3}, \w{3} \d+ at 10:00 AM/);
+  assert.match(sentTo('jo@example.test', mark)[0].subject, /^Updated appointment/);
+
+  // The reminder: not a minute early, then once.
+  mark = outbox.length;
+  await runDue(new Date(newReminder.getTime() - 60_000));
+  assert.equal(sentTo('+18015550170', mark).length + sentTo('jo@example.test', mark).length, 0);
+  await runDue(new Date(newReminder.getTime() + 60_000));
+  await runDue(new Date(newReminder.getTime() + 3600_000));
+  assert.equal(sentTo('jo@example.test', mark).length, 1);
+  const rem = sentTo('+18015550170', mark);
+  assert.equal(rem.length, 1);
+  assert.match(rem[0].body, /Reminder, we’ll see you tomorrow, \w{3}, \w{3} \d+ at 10:00 AM at 12 Elm St, Ogden\. Need to change it\? Call 801-232-4995\./);
+
+  // A canceled appointment's reminder never goes. A number that replied STOP gets no texts at all.
+  const b = (await mike('POST', '/api/jobs', { customer_name: 'Sue Change', customer_phone: '801-555-0164', customer_email: 'sue2@example.test', address: 'Roy', date: owner.addDays(day, 3), time: '09:30' })).json;
+  assert.deepEqual(jobRows(b.id).map((r) => `${r.kind}:${r.channel}`), ['job_confirm:email', 'job_reminder:email'], 'Sue replied STOP earlier');
+  assert.equal((await mike('POST', `/api/jobs/${b.id}/on-my-way`, { minutes: 20 })).status, 409);
+  await mike('POST', `/api/jobs/${b.id}/status`, { status: 'canceled' });
+  assert.deepEqual(jobRows(b.id).map((r) => r.status), ['canceled', 'canceled']);
+  assert.equal((await mike('PUT', `/api/jobs/${b.id}`, { ...b, date: day, time: '10:00' })).status, 409);
+  const noTell = (await mike('POST', '/api/jobs', { customer_name: 'Quiet Booking', customer_phone: '801-555-0171', date: day, time: '16:00', notify: false })).json;
+  assert.equal(jobRows(noTell.id).length, 0, 'the owner can book without messaging the customer');
+
+  // Lists: day, week (from Monday), canceled hidden, only this business.
+  const list = (await mike('GET', `/api/jobs?from=${owner.addDays(day, 1)}&days=1`)).json;
+  assert.deepEqual(list.jobs.map((j) => j.customer_name), ['Jo Booker']);
+  assert.equal(list.jobs[0].assignee_name, 'Tia Tech');
+  const week = (await mike('GET', `/api/jobs?from=${day}&days=7&snap=week`)).json;
+  assert.equal(new Date(week.from + 'T00:00:00Z').getUTCDay(), 1, 'weeks start on Monday');
+  assert.equal(week.tz, tz);
+  assert.ok(!week.jobs.some((j) => j.id === b.id), 'canceled appointments are hidden');
+  assert.equal((await tia('GET', `/api/jobs/${job.id}`)).status, 200, 'the team sees the schedule');
+  assert.equal((await other('GET', `/api/jobs/${job.id}`)).status, 404);
+  assert.equal((await other('PUT', `/api/jobs/${job.id}`, { ...job })).status, 404);
+  assert.equal((await other('POST', `/api/jobs/${job.id}/on-my-way`, { minutes: 5 })).status, 404);
+  assert.equal((await other('GET', `/api/jobs?from=${day}&days=7&snap=week`)).json.jobs.length, 0);
+
+  // "On my way" texts right now, but only 8am to 8pm business time. Try a zone where it's daytime and one where it's night.
+  const zones = owner.US_TIMEZONES.map(([z]) => z);
+  const pick = [zones.find((z) => owner.inTextHours(new Date(), z)), zones.find((z) => !owner.inTextHours(new Date(), z))].filter(Boolean);
+  assert.equal((await mike('POST', `/api/jobs/${job.id}/on-my-way`, { minutes: 0 })).status, 400);
+  for (const z of pick) {
+    await mike('PUT', '/api/owner-settings', { timezone: z });
+    mark = outbox.length;
+    const r = await mike('POST', `/api/jobs/${job.id}/on-my-way`, { minutes: 25 });
+    if (owner.inTextHours(new Date(), z)) {
+      assert.equal(r.status, 200, JSON.stringify(r.json));
+      assert.deepEqual(sentTo('+18015550170', mark).map((m) => m.body), ['Mike Stevens Emergency RV & Trailer Repair is on the way, about 25 minutes. Questions? Call 801-232-4995.']);
+      assert.equal((await mike('GET', `/api/jobs/${job.id}`)).json.status, 'en_route');
+    } else {
+      assert.equal(r.status, 409);
+      assert.match(r.json.error, /outside texting hours \(8am to 8pm\)/);
+      assert.equal(sentTo('+18015550170', mark).length, 0);
+    }
+  }
+  await mike('PUT', '/api/owner-settings', { timezone: tz });
+});
+
+test('calendar feed: a private link per person, valid VCALENDAR, owners see all, team members see theirs', async () => {
+  const link = (await mike('GET', '/api/calendar')).json;
+  assert.equal(link.owner, true);
+  const feedPath = new URL(link.url).pathname;
+  assert.match(feedPath, /^\/cal\/[\w-]{32}\.ics$/);
+  assert.equal((await mike('GET', '/api/calendar')).json.url, link.url, 'the same link until you ask for a new one');
+  const res = await fetch(base + feedPath);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /^text\/calendar/);
+  const ics = await res.text();
+  assert.ok(ics.startsWith('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:'));
+  assert.ok(ics.endsWith('END:VCALENDAR\r\n'));
+  assert.ok(!/[^\r]\n/.test(ics), 'every line ends in CRLF');
+  assert.ok(ics.split('\r\n').every((l) => Buffer.byteLength(l) <= 75), 'long lines are folded');
+  assert.equal((ics.match(/BEGIN:VEVENT/g) || []).length, (ics.match(/END:VEVENT/g) || []).length);
+  const unfolded = ics.replace(/\r\n /g, '');
+  const ev = unfolded.split('BEGIN:VEVENT').find((e) => e.includes(`UID:job-${bookedJob.id}@`));
+  assert.ok(ev, 'the booked job is in the feed');
+  const start = owner.zonedTimeToUtc(owner.addDays(bookedJob.date, 1), '10:00', 'America/New_York');
+  assert.match(ev, new RegExp(`DTSTART:${start.toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`));
+  assert.match(ev, /SUMMARY:Jo Booker/);
+  assert.match(ev, /LOCATION:12 Elm St\\, Ogden/, 'commas escaped');
+  assert.match(ev, /DESCRIPTION:Phone: 801-555-0170\\nTech: Tia Tech\\nBring a slide motor/);
+  assert.doesNotMatch(unfolded, /Sue Change/, 'canceled appointments are left out');
+  assert.match(unfolded, /SUMMARY:Quiet Booking/);
+
+  // Tia's link shows only her appointments; Ola's shows none of Mike's.
+  const tiaFeed = await (await fetch(base + new URL((await tia('GET', '/api/calendar')).json.url).pathname)).text();
+  assert.match(tiaFeed, /SUMMARY:Jo Booker/);
+  assert.doesNotMatch(tiaFeed, /Quiet Booking/);
+  const olaFeed = await (await fetch(base + new URL((await other('GET', '/api/calendar')).json.url).pathname)).text();
+  assert.doesNotMatch(olaFeed, /BEGIN:VEVENT/);
+
+  // A new link turns the old one off.
+  const fresh = (await mike('POST', '/api/calendar/reset')).json.url;
+  assert.notEqual(fresh, link.url);
+  assert.equal((await fetch(base + feedPath)).status, 404);
+  assert.equal((await fetch(base + new URL(fresh).pathname)).status, 200);
+  assert.equal((await fetch(base + '/cal/not-a-real-calendar-token-at-all.ics')).status, 404);
+  await superA('POST', '/api/super/view-as', { tenant_id: mikeId });
+  assert.equal((await superA('GET', '/api/calendar')).status, 409, 'platform staff don’t get a link');
+  await superA('POST', '/api/super/view-as', { tenant_id: 0 });
+});
+
 test('bold look: banner, service tiles, highlights, service pages', async () => {
   const st = (await mike('GET', '/api/website')).json;
   assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);
