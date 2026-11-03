@@ -170,3 +170,20 @@ table.stack-sm td.nowrap { white-space: nowrap; }
   table.stack-sm td::before { content: attr(data-label); font-family: var(--cond); font-weight: 600; color: var(--muted); text-align: left; flex: 0 0 auto; }
   table.stack-sm td > div { text-align: right; }
 }
+/* owner features: schedule */
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 16px; align-items: start; }
+.sched { gap: 16px; }
+.sched-date { font-size: 19px; margin: 0 0 6px; display: flex; gap: 8px; align-items: center; }
+.sched-date a { color: var(--ink); text-decoration: none; }
+.sched-day.today { border-left: 4px solid var(--red); padding-left: 10px; }
+.sched-day.today .list { border-color: var(--red); }
+.sched-none { padding: 2px 0; }
+.sched-time { display: flex; flex-direction: column; min-width: 88px; font-variant-numeric: tabular-nums; }
+.sched-item.done .item-title { text-decoration: line-through; color: var(--muted); }
+.sched-item.en_route { background: #FFF8E6; }
+.pot { border-top: 1px solid var(--line); padding-top: 12px; }
+
+/* owner features: install tip */
+.install-tip { display: flex; gap: 12px; align-items: flex-start; border-color: var(--ink); }
+.install-tip img { border-radius: 10px; flex: none; }
+.install-tip .linkbtn { flex: none; margin: -8px -4px 0 0; }

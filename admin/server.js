@@ -14,6 +14,7 @@ import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
 import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
 import * as AFF from './src/affiliates.js';
+import * as owner from './src/owner-features.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -263,6 +264,7 @@ export function createApp(env = process.env) {
       notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
     }
     sendReceipt(payment.id).catch((e) => console.error('Receipt failed', e));
+    try { scheduleReviewRequest(payment.id); } catch (e) { console.error('Review request failed', e); } // owner features
   }
 
   function saveImage(dataUrl, prefix, maxBytes) {
@@ -586,16 +588,18 @@ export function createApp(env = process.env) {
     if (q.status === 'draft') db.prepare(`UPDATE quotes SET status = 'sent', updated_at = ? WHERE id = ?`).run(now(), q.id);
     const full = quoteFull({ ...q, status: q.status === 'draft' ? 'sent' : q.status });
     send(res, 200, {
-      id: full.id, title: full.title, status: full.status, customer_name: full.customer_name, location: full.location, rig: full.rig,
+      id: full.id, kind: full.kind || 'proposal', title: full.title, status: full.status, customer_name: full.customer_name, location: full.location, rig: full.rig,
       notes: full.notes, terms: full.terms, tax_rate_bp: full.tax_rate_bp, created_at: full.created_at,
       items: full.items.map(({ name, description, qty, unit_cents, taxable }) => ({ name, description, qty, unit_cents, taxable })),
       totals: full.totals, signer_name: full.signer_name, signature_png: full.signature_png, signed_at: full.signed_at, paid_at: full.paid_at,
       online: onlineQuote(t, full.totals.balance),
+      // The owner turned on Affirm/Klarna in Stripe (Settings > Payments): shown for $50 or more.
+      pay_over_time: Boolean(t.pay_over_time) && onlineReady(t) && full.totals.balance >= 5000 && full.status !== 'paid',
       business: brand(t),
       // The business's customer Terms & Conditions: the version signed, or the current one to accept.
       customer_terms: publicTerms(t, full.customer_terms_version),
       photos: full.photos.filter((ph) => ph.show).map((ph) => ({ url: `/api/public/proposals/${encodeURIComponent(q.token)}/photos/${encodeURIComponent(ph.file)}` })),
-      customer_phone: full.signed_at || !phoneKey(full.customer_phone) ? undefined : full.customer_phone, customer_email: full.signed_at ? undefined : full.customer_email,
+      customer_phone: full.signed_at || full.status === 'paid' || !phoneKey(full.customer_phone) ? undefined : full.customer_phone, customer_email: full.signed_at || full.status === 'paid' ? undefined : full.customer_email,
       // Unchecked for anyone who unsubscribed before, so re-subscribing takes a deliberate check.
       subscribe_email_default: (() => { const c = findCustomer(t.id, full.customer_phone, full.customer_email); return !(c && c.email_unsubscribed_at && !c.email_opt_in); })(),
       consent: { email: consentText.email(t.name), sms: consentText.sms(t.name) },
@@ -811,7 +815,7 @@ export function createApp(env = process.env) {
   // Quotes
   route('GET', '/api/quotes', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, db.prepare('SELECT * FROM quotes WHERE tenant_id = ? ORDER BY id DESC LIMIT 300').all(t.id).map((q) => ({
-      id: q.id, title: q.title, status: q.status, customer_name: q.customer_name, created_at: q.created_at, request_id: q.request_id, totals: quoteTotals(q, getItems(q.id)),
+      id: q.id, kind: q.kind, title: q.title, status: q.status, customer_name: q.customer_name, created_at: q.created_at, request_id: q.request_id, totals: quoteTotals(q, getItems(q.id)),
     })));
   }, { auth: 'tenant' });
 
@@ -967,6 +971,7 @@ export function createApp(env = process.env) {
     }
     const word = String(params.Body || '').trim().toUpperCase();
     const k = phoneKey(params.From);
+    recordSmsReply(k, word); // owner features: STOP blocks appointment texts too
     if (k && ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT', 'OPT OUT'].includes(word)) {
       for (const c of db.prepare('SELECT id, tenant_id, phone FROM customers WHERE phone_key = ? AND sms_opt_in = 1').all(k)) {
         db.prepare('UPDATE customers SET sms_opt_in = 0, updated_at = ? WHERE id = ?').run(now(), c.id);
@@ -976,6 +981,497 @@ export function createApp(env = process.env) {
     res.writeHead(200, { 'Content-Type': 'text/xml' });
     res.end('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
   });
+
+  // ---------- owner features: time zone and settings ----------
+  // Time zone, review requests and "pay over time" settings. GET is for the whole team; changes are owner-only.
+  function ownerSettings(t) {
+    const rs = owner.reviewSettings(t);
+    return {
+      timezone: owner.tzOf(t), timezones: owner.US_TIMEZONES,
+      review: { link: rs.link, enabled: rs.enabled, active: rs.active, delay_hours: rs.delayHours, delays: owner.REVIEW_DELAYS, message: rs.message, default_message: owner.DEFAULT_REVIEW_MESSAGE, repeat_days: owner.REVIEW_REPEAT_DAYS },
+      pay_over_time: Boolean(t.pay_over_time),
+      email_enabled: notify.emailEnabled, sms_enabled: notify.smsEnabled,
+    };
+  }
+  route('GET', '/api/owner-settings', async (req, res, p, url, { tenant: t }) => send(res, 200, ownerSettings(t)), { auth: 'tenant' });
+  route('PUT', '/api/owner-settings', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    if (b.timezone !== undefined && !owner.validTimezone(b.timezone)) throw new HttpError(400, 'Choose your time zone from the list.');
+    if (b.review_delay_hours !== undefined && !owner.REVIEW_DELAYS.includes(Number(b.review_delay_hours))) throw new HttpError(400, 'Choose when to send the review request from the list.');
+    const msg = b.review_message !== undefined ? clean(b.review_message, 500) : undefined;
+    if (b.review_message !== undefined && msg.length < 10) throw new HttpError(400, 'Write a short message for the review request, or press “Use the suggested message”.');
+    db.prepare('UPDATE tenants SET timezone = ?, review_requests = ?, review_delay_hours = ?, review_message = ?, pay_over_time = ? WHERE id = ?').run(
+      b.timezone !== undefined ? b.timezone : owner.tzOf(t),
+      b.review_requests !== undefined ? (b.review_requests ? 1 : 0) : t.review_requests,
+      b.review_delay_hours !== undefined ? Number(b.review_delay_hours) : t.review_delay_hours,
+      msg !== undefined ? (msg === owner.DEFAULT_REVIEW_MESSAGE ? null : msg) : t.review_message,
+      b.pay_over_time !== undefined ? (b.pay_over_time ? 1 : 0) : t.pay_over_time, t.id);
+    send(res, 200, ownerSettings(getTenant(t.id)));
+  }, { auth: 'owner' });
+
+  // ---------- owner features: background sender ----------
+  // Customer texts and emails that go out later (confirmations, reminders, review requests, update
+  // emails). Each message is claimed with a single UPDATE … WHERE status = 'pending', so it goes out
+  // once even with several workers. Texts only go out 8am to 8pm in the business's time zone; outside
+  // that they wait for 8am. The wording is built at send time, so consent and changes are respected.
+  const STOP_WORDS = ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT', 'OPT OUT'];
+  const START_WORDS = ['START', 'UNSTOP', 'YES'];
+  // Called from the Twilio reply webhook. A STOP blocks every text to that number from the platform's
+  // number (Twilio enforces it too), including appointment texts.
+  function recordSmsReply(k, word) {
+    if (!k) return;
+    if (STOP_WORDS.includes(word)) db.prepare('INSERT OR REPLACE INTO sms_stops (phone_key, word, at) VALUES (?,?,?)').run(k, word, now());
+    else if (START_WORDS.includes(word)) db.prepare('DELETE FROM sms_stops WHERE phone_key = ?').run(k);
+  }
+  const smsStopped = (phone) => Boolean(phoneKey(phone) && db.prepare('SELECT 1 FROM sms_stops WHERE phone_key = ?').get(phoneKey(phone)));
+
+  function queueMessage({ t, kind, channel, to, refId = null, customerId = null, sendAfter = new Date(), meta = null }) {
+    db.prepare('INSERT INTO scheduled_messages (tenant_id, kind, channel, to_addr, ref_id, customer_id, meta, send_after, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(t.id, kind, channel, to, refId, customerId, meta ? JSON.stringify(meta) : null, owner.utcString(sendAfter), now());
+  }
+  const cancelMessages = (tid, kinds, refId) => db.prepare(`UPDATE scheduled_messages SET status = 'canceled' WHERE tenant_id = ? AND ref_id = ? AND status = 'pending' AND kind IN (${kinds.map(() => '?').join(',')})`).run(tid, refId, ...kinds);
+  const unsubHeaders = (u) => ({ 'List-Unsubscribe': `<${u}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' });
+
+  // What to send for one queued message right now, or { skip: reason }.
+  function buildMessage(m, t, at = new Date()) {
+    const tz = owner.tzOf(t);
+    const meta = jparse(m.meta, {});
+    const emailOpts = { fromName: t.name, replyTo: t.email || undefined };
+    if (m.kind === 'job_confirm' || m.kind === 'job_reminder') {
+      const job = scoped('jobs', m.ref_id, t.id);
+      if (!job || job.status === 'canceled' || job.status === 'done') return { skip: 'The appointment was canceled or finished.' };
+      if (owner.parseUtc(job.start_at) < at) return { skip: 'The appointment already started.' };
+      const to = m.channel === 'sms' ? toE164(job.customer_phone) : normEmail(job.customer_email);
+      if (!to || (m.channel === 'email' && !/^\S+@\S+\.\S+$/.test(to))) return { skip: 'No contact for this customer.' };
+      if (m.channel === 'sms' && smsStopped(to)) return { skip: 'This number replied STOP.' };
+      const w = owner.jobMessage(m.kind, m.channel, { t, job, tz, updated: Boolean(meta.updated) });
+      return { to, ...w, opts: emailOpts };
+    }
+    if (m.kind === 'review') {
+      const rs = owner.reviewSettings(t);
+      if (!rs.active) return { skip: 'Review requests are turned off.' };
+      const c = m.customer_id ? db.prepare('SELECT * FROM customers WHERE id = ? AND tenant_id = ?').get(m.customer_id, t.id) : null;
+      if (!c) return { skip: 'Customer not found.' };
+      const pay = db.prepare('SELECT * FROM payments WHERE id = ? AND tenant_id = ?').get(m.ref_id, t.id);
+      const q = pay?.quote_id ? db.prepare('SELECT signer_name, customer_name FROM quotes WHERE id = ?').get(pay.quote_id) : null;
+      const name = q?.signer_name || q?.customer_name || c.name;
+      if (m.channel === 'email') {
+        if (!c.email_opt_in || normEmail(c.email) !== m.to_addr) return { skip: 'The customer unsubscribed from emails.' };
+        const unsub = `${publicBase()}/u/${c.unsub_token}`;
+        return { to: m.to_addr, ...owner.reviewMessage('email', { t, name, link: rs.link, message: rs.message, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+      }
+      if (!c.sms_opt_in || phoneKey(c.phone) !== phoneKey(m.to_addr)) return { skip: 'The customer didn’t agree to texts.' };
+      if (smsStopped(m.to_addr)) return { skip: 'This number replied STOP.' };
+      return { to: toE164(m.to_addr), ...owner.reviewMessage('sms', { t, name, link: rs.link, message: rs.message }) };
+    }
+    if (m.kind === 'campaign') {
+      const cp = db.prepare('SELECT * FROM campaigns WHERE id = ? AND tenant_id = ?').get(m.ref_id, t.id);
+      const c = m.customer_id ? db.prepare('SELECT * FROM customers WHERE id = ? AND tenant_id = ?').get(m.customer_id, t.id) : null;
+      if (!cp || !c) return { skip: 'Not found.' };
+      if (!c.email_opt_in || normEmail(c.email) !== m.to_addr) return { skip: 'The customer unsubscribed.' };
+      const address = owner.postalAddress(t);
+      if (!address.ok) return { skip: 'The business mailing address is missing.' };
+      const unsub = `${publicBase()}/u/${c.unsub_token}`;
+      return { to: m.to_addr, ...owner.campaignEmail({ t, subject: cp.subject, body: cp.body, address, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+    }
+    return { skip: 'Unknown message.' };
+  }
+
+  function finishMessage(m, status, error, at) {
+    db.prepare('UPDATE scheduled_messages SET status = ?, error = ?, sent_at = ? WHERE id = ?').run(status, error || null, status === 'sent' ? owner.utcString(at) : null, m.id);
+    if (m.kind === 'campaign') {
+      const col = status === 'sent' ? 'sent' : status === 'skipped' ? 'skipped' : 'failed';
+      db.prepare(`UPDATE campaigns SET ${col} = ${col} + 1 WHERE id = ?`).run(m.ref_id);
+      const left = db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE kind = 'campaign' AND ref_id = ? AND status IN ('pending','sending')`).get(m.ref_id).n;
+      if (!left) db.prepare(`UPDATE campaigns SET status = 'done', finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(now(), m.ref_id);
+    }
+  }
+
+  // Sends what's due at `nowOverride` (default: now), up to `limit` messages per run (update emails
+  // go out in batches this way). Returns counts. Tests call this directly instead of waiting for the timer.
+  async function runDueMessages(nowOverride, { limit = 50 } = {}) {
+    const at = nowOverride ? new Date(nowOverride) : new Date();
+    const out = { sent: 0, skipped: 0, deferred: 0, failed: 0 };
+    const due = db.prepare(`SELECT * FROM scheduled_messages WHERE status = 'pending' AND send_after <= ? ORDER BY send_after, id LIMIT ?`).all(owner.utcString(at), limit);
+    for (const m of due) {
+      const t = getTenant(m.tenant_id);
+      if (!t) continue;
+      const tz = owner.tzOf(t);
+      if (m.channel === 'sms' && !owner.inTextHours(at, tz)) {
+        if (db.prepare(`UPDATE scheduled_messages SET send_after = ? WHERE id = ? AND status = 'pending'`).run(owner.utcString(owner.nextTextWindow(at, tz)), m.id).changes) out.deferred++;
+        continue;
+      }
+      // Claim it. Only the worker whose UPDATE changes the row sends it.
+      if (!db.prepare(`UPDATE scheduled_messages SET status = 'sending', attempts = attempts + 1 WHERE id = ? AND status = 'pending'`).run(m.id).changes) continue;
+      try {
+        if (m.channel === 'sms' ? !notify.smsEnabled : !notify.emailEnabled) { finishMessage(m, 'skipped', m.channel === 'sms' ? 'Texting isn’t set up.' : 'Email isn’t set up.', at); out.skipped++; continue; }
+        const msg = buildMessage(m, t, at);
+        if (msg.skip) { finishMessage(m, 'skipped', msg.skip, at); out.skipped++; continue; }
+        let ok = true;
+        if (m.channel === 'sms') await notify.sms(msg.to, msg.text);
+        else ok = await notify.email(msg.to, msg.subject, msg.text, msg.opts);
+        if (ok) { finishMessage(m, 'sent', null, at); out.sent++; }
+        else if (m.attempts + 1 < 3) { db.prepare(`UPDATE scheduled_messages SET status = 'pending', send_after = ?, error = 'Email failed; trying again' WHERE id = ?`).run(owner.utcString(at.getTime() + 10 * 60_000), m.id); out.failed++; }
+        else { finishMessage(m, 'failed', 'Email failed', at); out.failed++; }
+      } catch (e) {
+        console.error('Scheduled message failed', m.id, e);
+        finishMessage(m, 'failed', String(e.message).slice(0, 300), at); out.failed++;
+      }
+    }
+    return out;
+  }
+  if (!env.DISABLE_WORKER) {
+    let busy = false;
+    setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try { await runDueMessages(); } catch (e) { console.error('Background sender failed', e); } finally { busy = false; }
+    }, Number(env.WORKER_INTERVAL_MS) || 30_000).unref();
+  }
+
+  // ---------- owner features: review requests ----------
+  // After a job is paid, ask for a Google review: by email to customers who agreed to emails, and by
+  // text only to customers who agreed to texts. At most once per customer every 90 days.
+  function scheduleReviewRequest(paymentId) {
+    const pay = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+    if (!pay || pay.kind !== 'quote' || pay.status !== 'paid' || !pay.quote_id) return;
+    const t = getTenant(pay.tenant_id);
+    const rs = owner.reviewSettings(t);
+    if (!rs.active) return;
+    if (db.prepare(`SELECT 1 FROM scheduled_messages WHERE tenant_id = ? AND kind = 'review' AND ref_id = ?`).get(t.id, pay.id)) return;
+    const q = db.prepare('SELECT * FROM quotes WHERE id = ?').get(pay.quote_id);
+    const c = findCustomer(t.id, q.customer_phone, q.customer_email);
+    if (!c) return; // never signed up for anything: receipt only
+    const since = owner.utcString(Date.now() - owner.REVIEW_REPEAT_DAYS * 864e5);
+    if (db.prepare(`SELECT 1 FROM scheduled_messages WHERE tenant_id = ? AND kind = 'review' AND customer_id = ? AND status IN ('pending','sending','sent') AND created_at >= ?`).get(t.id, c.id, since)) return;
+    const at = new Date(owner.parseUtc(pay.paid_at).getTime() + rs.delayHours * 3600_000);
+    if (c.email && c.email_opt_in) queueMessage({ t, kind: 'review', channel: 'email', to: normEmail(c.email), refId: pay.id, customerId: c.id, sendAfter: at });
+    if (c.sms_opt_in && phoneKey(c.phone) && !smsStopped(c.phone)) queueMessage({ t, kind: 'review', channel: 'sms', to: c.phone, refId: pay.id, customerId: c.id, sendAfter: at });
+  }
+
+  // ---------- owner features: scheduling ----------
+  const JOB_STATUSES = ['scheduled', 'en_route', 'done', 'canceled'];
+  function jobOut(j, tz) {
+    const start = owner.parseUtc(j.start_at), end = new Date(start.getTime() + j.duration_min * 60_000);
+    const lp = owner.localParts(start, tz);
+    return { ...j, date: lp.date, time: lp.time, start_label: owner.formatTime(start, tz), end_label: owner.formatTime(end, tz), when_label: owner.formatWhen(start, tz), end_at: owner.utcString(end) };
+  }
+  const jobRow = (id, tid) => db.prepare('SELECT j.*, u.name AS assignee_name, u.email AS assignee_email FROM jobs j LEFT JOIN users u ON u.id = j.user_id WHERE j.id = ? AND j.tenant_id = ?').get(id, tid);
+  // Confirmation now, and a reminder the day before at 9am local (if that's still ahead).
+  function queueJobMessages(t, job, { updated = false } = {}) {
+    const tz = owner.tzOf(t);
+    const start = owner.parseUtc(job.start_at);
+    const reminder = owner.zonedTimeToUtc(owner.addDays(owner.localParts(start, tz).date, -1), '09:00', tz);
+    const email = normEmail(job.customer_email), sms = toE164(job.customer_phone);
+    const meta = updated ? { updated: true } : null;
+    if (/^\S+@\S+\.\S+$/.test(email)) queueMessage({ t, kind: 'job_confirm', channel: 'email', to: email, refId: job.id, meta });
+    if (sms && !smsStopped(sms)) queueMessage({ t, kind: 'job_confirm', channel: 'sms', to: sms, refId: job.id, meta });
+    if (reminder > new Date()) {
+      if (/^\S+@\S+\.\S+$/.test(email)) queueMessage({ t, kind: 'job_reminder', channel: 'email', to: email, refId: job.id, sendAfter: reminder });
+      if (sms && !smsStopped(sms)) queueMessage({ t, kind: 'job_reminder', channel: 'sms', to: sms, refId: job.id, sendAfter: reminder });
+    }
+  }
+  // Validates the appointment form. Returns the columns to save.
+  function jobFields(b, t, cur = {}) {
+    const tz = owner.tzOf(t);
+    const date = String(b.date ?? ''), time = String(b.time ?? '');
+    if (!owner.validDate(date)) throw new HttpError(400, 'Choose a date.');
+    if (!owner.validTime(time)) throw new HttpError(400, 'Choose a start time.');
+    const duration = Math.trunc(Number(b.duration_min ?? cur.duration_min ?? 60));
+    if (!(duration >= 15 && duration <= 720)) throw new HttpError(400, 'Choose how long the job takes, between 15 minutes and 12 hours.');
+    const userId = b.user_id ? Number(b.user_id) : null;
+    if (userId && !db.prepare('SELECT 1 FROM users WHERE id = ? AND tenant_id = ?').get(userId, t.id)) throw new HttpError(400, 'Choose someone on your team.');
+    const f = {
+      customer_name: noCtl(b.customer_name, 120), customer_phone: noCtl(b.customer_phone, 40), customer_email: noCtl(b.customer_email, 200).toLowerCase(),
+      address: clean(b.address, 1000), notes: clean(b.notes, 4000), duration_min: duration, user_id: userId,
+      start_at: owner.utcString(owner.zonedTimeToUtc(date, time, tz)),
+    };
+    if (!f.customer_name && !f.customer_phone) throw new HttpError(400, 'Add the customer’s name or phone number.');
+    if (f.customer_email && !/^\S+@\S+\.\S+$/.test(f.customer_email)) throw new HttpError(400, 'Check the customer’s email address.');
+    if (f.customer_phone && !phoneKey(f.customer_phone)) throw new HttpError(400, 'Check the customer’s phone number. Use 10 digits.');
+    return f;
+  }
+
+  route('GET', '/api/jobs', async (req, res, p, url, { tenant: t }) => {
+    const tz = owner.tzOf(t);
+    const today = owner.todayIn(tz);
+    let from = owner.validDate(url.searchParams.get('from')) ? url.searchParams.get('from') : today;
+    if (url.searchParams.get('snap') === 'week') from = owner.addDays(from, -((new Date(from + 'T00:00:00Z').getUTCDay() + 6) % 7)); // Monday
+    const days = Math.max(1, Math.min(31, Math.trunc(Number(url.searchParams.get('days')) || 7)));
+    const lo = owner.utcString(owner.zonedTimeToUtc(from, '00:00', tz)), hi = owner.utcString(owner.zonedTimeToUtc(owner.addDays(from, days), '00:00', tz));
+    const rows = db.prepare(`SELECT j.*, u.name AS assignee_name, u.email AS assignee_email FROM jobs j LEFT JOIN users u ON u.id = j.user_id
+      WHERE j.tenant_id = ? AND j.start_at >= ? AND j.start_at < ? AND j.status != 'canceled' ORDER BY j.start_at, j.id`).all(t.id, lo, hi);
+    send(res, 200, { tz, today, from, days, jobs: rows.map((j) => jobOut(j, tz)) });
+  }, { auth: 'tenant' });
+
+  // Defaults for a new appointment, from a request or a quote.
+  route('GET', '/api/jobs/new', async (req, res, p, url, { tenant: t }) => {
+    const r = url.searchParams.get('request_id') ? scoped('requests', url.searchParams.get('request_id'), t.id) : null;
+    const q = url.searchParams.get('quote_id') ? scoped('quotes', url.searchParams.get('quote_id'), t.id) : null;
+    const src = q || r || {};
+    const tz = owner.tzOf(t);
+    send(res, 200, {
+      tz, today: owner.todayIn(tz), request_id: q?.request_id || r?.id || null, quote_id: q?.id || null,
+      customer_name: q?.customer_name || r?.name || '', customer_phone: (q?.customer_phone || r?.phone || '').replace(/^-$/, ''), customer_email: q?.customer_email || r?.email || '',
+      address: src.location && src.location !== '-' ? src.location : '', notes: [q?.title, r?.rig, r?.issue].filter(Boolean).join('\n').slice(0, 1000),
+      team: db.prepare('SELECT id, name, email, role FROM users WHERE tenant_id = ? ORDER BY id').all(t.id),
+    });
+  }, { auth: 'tenant' });
+
+  route('GET', '/api/jobs/:id', async (req, res, p, url, { tenant: t }) => {
+    const j = jobRow(p.id, t.id); if (!j) throw new HttpError(404, 'Not found');
+    const tz = owner.tzOf(t);
+    // When each message really goes out: pending texts wait for texting hours.
+    const nowD = new Date();
+    const messages = db.prepare(`SELECT kind, channel, status, send_after, sent_at, error FROM scheduled_messages WHERE tenant_id = ? AND ref_id = ? AND kind IN ('job_confirm','job_reminder','job_on_way') ORDER BY id`).all(t.id, j.id)
+      .map((m) => {
+        let at = owner.parseUtc(m.sent_at || m.send_after);
+        if (m.status === 'pending') {
+          if (at < nowD) at = nowD;
+          if (m.channel === 'sms' && !owner.inTextHours(at, tz)) at = owner.nextTextWindow(at, tz);
+        }
+        return { ...m, soon: m.status === 'pending' && at - nowD < 120_000, when_label: owner.formatWhen(at, tz) };
+      });
+    send(res, 200, {
+      ...jobOut(j, tz), tz, messages, sms_enabled: notify.smsEnabled, stopped: smsStopped(j.customer_phone),
+      in_text_hours: owner.inTextHours(new Date(), tz),
+      request: j.request_id ? db.prepare('SELECT id, name FROM requests WHERE id = ? AND tenant_id = ?').get(j.request_id, t.id) || null : null,
+      quote: j.quote_id ? db.prepare('SELECT id, title, kind FROM quotes WHERE id = ? AND tenant_id = ?').get(j.quote_id, t.id) || null : null,
+      team: db.prepare('SELECT id, name, email, role FROM users WHERE tenant_id = ? ORDER BY id').all(t.id),
+    });
+  }, { auth: 'tenant' });
+
+  route('POST', '/api/jobs', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    const r = b.request_id ? scoped('requests', b.request_id, t.id) : null;
+    const q = b.quote_id ? scoped('quotes', b.quote_id, t.id) : null;
+    const f = jobFields(b, t);
+    const ins = db.prepare('INSERT INTO jobs (tenant_id, request_id, quote_id, customer_name, customer_phone, customer_email, address, start_at, duration_min, user_id, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(t.id, r?.id ?? q?.request_id ?? null, q?.id ?? null, f.customer_name, f.customer_phone, f.customer_email, f.address, f.start_at, f.duration_min, f.user_id, f.notes, now(), now());
+    const job = jobRow(Number(ins.lastInsertRowid), t.id);
+    if (b.notify !== false) queueJobMessages(t, job);
+    setRequestStatus(r?.id, 'contacted', ['new']);
+    send(res, 201, jobOut(job, owner.tzOf(t)));
+  }, { auth: 'tenant' });
+
+  route('PUT', '/api/jobs/:id', async (req, res, p, url, { tenant: t }) => {
+    const cur = scoped('jobs', p.id, t.id); if (!cur) throw new HttpError(404, 'Not found');
+    if (cur.status === 'canceled' || cur.status === 'done') throw new HttpError(409, 'This appointment is closed. Make a new one instead.');
+    const b = await json(req);
+    const f = jobFields(b, t, cur);
+    db.prepare('UPDATE jobs SET customer_name = ?, customer_phone = ?, customer_email = ?, address = ?, start_at = ?, duration_min = ?, user_id = ?, notes = ?, updated_at = ? WHERE id = ?')
+      .run(f.customer_name, f.customer_phone, f.customer_email, f.address, f.start_at, f.duration_min, f.user_id, f.notes, now(), cur.id);
+    const job = jobRow(cur.id, t.id);
+    // A new time: old messages would be wrong, so they're replaced (or just dropped if the owner says not to tell the customer).
+    if (cur.start_at !== f.start_at) {
+      cancelMessages(t.id, ['job_confirm', 'job_reminder'], cur.id);
+      if (b.notify !== false) queueJobMessages(t, job, { updated: true });
+    }
+    send(res, 200, jobOut(job, owner.tzOf(t)));
+  }, { auth: 'tenant' });
+
+  route('POST', '/api/jobs/:id/status', async (req, res, p, url, { tenant: t }) => {
+    const cur = scoped('jobs', p.id, t.id); if (!cur) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    if (!JOB_STATUSES.includes(b.status)) throw new HttpError(400, 'Unknown status.');
+    db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(b.status, now(), cur.id);
+    if (b.status === 'canceled' || b.status === 'done') cancelMessages(t.id, ['job_confirm', 'job_reminder'], cur.id);
+    send(res, 200, jobOut(jobRow(cur.id, t.id), owner.tzOf(t)));
+  }, { auth: 'tenant' });
+
+  // "On my way": a text right now, with the ETA the technician picked.
+  route('POST', '/api/jobs/:id/on-my-way', async (req, res, p, url, { tenant: t }) => {
+    const job = scoped('jobs', p.id, t.id); if (!job) throw new HttpError(404, 'Not found');
+    const b = await json(req);
+    const minutes = Math.trunc(Number(b.minutes));
+    if (!(minutes >= 1 && minutes <= 240)) throw new HttpError(400, 'Enter about how many minutes away you are, from 1 to 240.');
+    const to = toE164(job.customer_phone);
+    if (!to) throw new HttpError(400, 'Add the customer’s mobile number to the appointment first.');
+    if (smsStopped(to)) throw new HttpError(409, 'This customer replied STOP, so we can’t text them. Give them a call instead.');
+    if (!notify.smsEnabled) throw new HttpError(503, 'Texting isn’t set up yet. Give the customer a call instead.');
+    const tz = owner.tzOf(t);
+    if (!owner.inTextHours(new Date(), tz)) throw new HttpError(409, 'It’s outside texting hours (8am to 8pm), so we didn’t send a text. Give the customer a call instead.');
+    if (limited('onway:' + job.id, 6, 3600_000)) throw new HttpError(429, 'You’ve sent a few already. Give the customer a call instead.');
+    const w = owner.jobMessage('job_on_way', 'sms', { t, job, tz, minutes });
+    await notify.sms(to, w.text);
+    db.prepare(`INSERT INTO scheduled_messages (tenant_id, kind, channel, to_addr, ref_id, send_after, status, attempts, sent_at, created_at) VALUES (?, 'job_on_way', 'sms', ?, ?, ?, 'sent', 1, ?, ?)`).run(t.id, to, job.id, now(), now(), now());
+    db.prepare(`UPDATE jobs SET status = 'en_route', on_way_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), job.id);
+    send(res, 200, { ok: true, text: w.text });
+  }, { auth: 'tenant' });
+
+  // Private calendar link for the logged-in team member (Google or Apple Calendar can subscribe to it).
+  function calendarUrl(user) {
+    let tok = getUser(user.id).cal_token;
+    if (!tok) { tok = randomToken(24); db.prepare('UPDATE users SET cal_token = ? WHERE id = ?').run(tok, user.id); }
+    return `${publicBase()}/cal/${tok}.ics`;
+  }
+  route('GET', '/api/calendar', async (req, res, p, url, { user, isSuper }) => {
+    if (isSuper) throw new HttpError(409, 'Calendar links are for the business’s own team.');
+    send(res, 200, { url: calendarUrl(user), owner: user.role === 'owner' });
+  }, { auth: 'tenant' });
+  route('POST', '/api/calendar/reset', async (req, res, p, url, { user, isSuper }) => {
+    if (isSuper) throw new HttpError(409, 'Calendar links are for the business’s own team.');
+    db.prepare('UPDATE users SET cal_token = NULL WHERE id = ?').run(user.id);
+    send(res, 200, { url: calendarUrl(user), owner: user.role === 'owner' });
+  }, { auth: 'tenant' });
+  // Pages outside /api/ for the owner features, as [pattern, handler(req, res, match)]. The request
+  // handler calls ownerFeaturePage() before its own page routes.
+  const ownerPages = [];
+  function ownerFeaturePage(req, res, pathname) {
+    for (const [re, fn] of ownerPages) { const m = re.exec(pathname); if (m) { fn(req, res, m); return true; } }
+    return false;
+  }
+  ownerPages.push([/^\/cal\/([\w-]{16,64})\.ics$/, (req, res, m) => serveCalendar(res, m[1])]);
+  // Owners see every appointment; team members see the ones assigned to them.
+  function serveCalendar(res, token) {
+    const u = db.prepare('SELECT * FROM users WHERE cal_token = ?').get(token);
+    const t = u && u.tenant_id ? getTenant(u.tenant_id) : null;
+    if (!u || !t || t.status !== 'active') throw new HttpError(404, 'Not found');
+    const tz = owner.tzOf(t);
+    const from = owner.utcString(Date.now() - 60 * 864e5);
+    const rows = db.prepare(`SELECT j.*, u.name AS assignee_name FROM jobs j LEFT JOIN users u ON u.id = j.user_id WHERE j.tenant_id = ? AND j.start_at >= ? AND j.status != 'canceled' ${u.role === 'owner' ? '' : 'AND j.user_id = ?'} ORDER BY j.start_at LIMIT 2000`)
+      .all(...(u.role === 'owner' ? [t.id, from] : [t.id, from, u.id]));
+    const host = (() => { try { return new URL(publicBase()).hostname; } catch { return 'hitchpoint'; } })();
+    const ics = owner.icsCalendar({
+      name: `${t.name} jobs`, tz, host,
+      events: rows.map((j) => {
+        const start = owner.parseUtc(j.start_at);
+        return {
+          id: j.id, start, end: new Date(start.getTime() + j.duration_min * 60_000), updated: owner.parseUtc(j.updated_at),
+          summary: `${j.customer_name || 'Customer'}${j.status === 'done' ? ' (done)' : ''}`, location: j.address,
+          description: [j.customer_phone && `Phone: ${j.customer_phone}`, j.assignee_name && `Tech: ${j.assignee_name}`, j.notes].filter(Boolean).join('\n'),
+        };
+      }),
+    });
+    res.writeHead(200, { 'Content-Type': 'text/calendar; charset=utf-8', 'Content-Disposition': 'inline; filename="schedule.ics"', 'Cache-Control': 'private, no-store', 'X-Robots-Tag': 'noindex', 'X-Content-Type-Options': 'nosniff' });
+    res.end(ics);
+  }
+
+  // ---------- owner features: invoices ----------
+  // A quick invoice is a quote with kind 'invoice': no signature. The customer accepts the business's
+  // Terms & Conditions by paying, like the deposit payment page.
+  route('POST', '/api/invoices', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    const r = b.request_id ? scoped('requests', b.request_id, t.id) : null;
+    const ins = db.prepare(`INSERT INTO quotes (tenant_id, token, request_id, kind, title, customer_name, customer_phone, customer_email, location, rig, terms, tax_rate_bp, deposit_credit_cents, created_at, updated_at) VALUES (?,?,?,'invoice',?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(t.id, randomToken(), r?.id ?? null, 'Invoice', r?.name || '', r?.phone || '', r?.email || '', r?.location || '', r?.rig || '', t.terms || '', t.tax_rate_bp, paidDeposits(r?.id), now(), now());
+    send(res, 201, quoteFull(scoped('quotes', Number(ins.lastInsertRowid), t.id)));
+  }, { auth: 'tenant' });
+
+  route('POST', '/api/public/invoices/:token/checkout', async (req, res, p) => {
+    const q = getQuoteByToken(p.token);
+    const t = q && getTenant(q.tenant_id);
+    if (!q || q.kind !== 'invoice' || q.status === 'void' || !t) throw new HttpError(404, 'This invoice isn’t available.');
+    if (q.status === 'paid') throw new HttpError(409, 'This invoice is already paid.');
+    const b = await json(req);
+    const latest = latestTerms(t.id);
+    if (latest && Number(b.terms_version) !== latest.version) throw new HttpError(409, 'The business updated its Terms & Conditions. Reload the page to review them, then pay.');
+    const phone = b.phone !== undefined ? noCtl(b.phone, 40) : (phoneKey(q.customer_phone) ? q.customer_phone : '');
+    const email = b.email !== undefined ? noCtl(b.email, 200).toLowerCase() : normEmail(q.customer_email);
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Check your email address.');
+    if (phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
+    if (b.subscribe_sms && !phoneKey(phone)) throw new HttpError(400, 'Add your mobile number to get texts, or uncheck that box.');
+    const { balance } = quoteTotals(q, getItems(q.id));
+    if (balance < 50) throw new HttpError(409, 'Nothing is due on this invoice.');
+    db.prepare('UPDATE quotes SET customer_phone = ?, customer_email = ?, updated_at = ? WHERE id = ?').run(phone || '', email || '', now(), q.id);
+    if (b.subscribe_email !== undefined || b.subscribe_sms) {
+      upsertCustomer(t, { name: q.customer_name, phone, email, emailOptIn: Boolean(b.subscribe_email), smsOptIn: Boolean(b.subscribe_sms), source: `Invoice #${q.id}`, ip: clientIp(req), ua: clean(req.headers['user-agent'], 400) });
+    }
+    let pay = db.prepare(`SELECT * FROM payments WHERE quote_id = ? AND status = 'pending' AND amount_cents = ? AND method = 'card' ORDER BY id DESC`).get(q.id, balance);
+    if (!pay) {
+      const tok = randomToken();
+      db.prepare(`INSERT INTO payments (tenant_id, token, kind, quote_id, request_id, description, amount_cents, method) VALUES (?, ?, 'quote', ?, ?, ?, ?, 'card')`)
+        .run(t.id, tok, q.id, q.request_id, `${q.title} (#${q.id})`, balance);
+      pay = getPayment(tok);
+    }
+    const checkoutUrl = await startCheckout(req, t, pay, { successPath: `/p/${q.token}`, cancelPath: `/p/${q.token}`, email, termsVersion: latest?.version });
+    send(res, 200, { url: checkoutUrl });
+  });
+
+  // ---------- owner features: subscriber emails ----------
+  // Update and offer emails to customers who agreed to them. Every email carries the business's name
+  // and mailing address and a one-click unsubscribe. One send per business per day. No texts here:
+  // marketing texts need state-by-state rules and carrier registration first.
+  const subscribers = (tid) => db.prepare(`SELECT MIN(id) AS id, email FROM customers WHERE tenant_id = ? AND email_opt_in = 1 AND email IS NOT NULL AND email != '' GROUP BY email ORDER BY MIN(id)`).all(tid);
+  const lastCampaign = (tid) => db.prepare('SELECT created_at FROM campaigns WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1').get(tid);
+  function campaignInput(b) {
+    const subject = noCtl(b.subject, 150), body = String(b.body ?? '').replace(/\r\n/g, '\n').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ').trim().slice(0, 10000);
+    if (!subject) throw new HttpError(400, 'Add a subject line.');
+    if (body.length < 20) throw new HttpError(400, 'Write your message. A few sentences is plenty.');
+    return { subject, body };
+  }
+  route('GET', '/api/campaigns', async (req, res, p, url, { tenant: t, user }) => {
+    const last = lastCampaign(t.id);
+    const next = last ? new Date(owner.parseUtc(last.created_at).getTime() + 864e5) : null;
+    const tz = owner.tzOf(t);
+    send(res, 200, {
+      address: owner.postalAddress(t), subscribers: subscribers(t.id).length, email_enabled: notify.emailEnabled, your_email: user.email,
+      next_allowed_at: next && next > new Date() ? owner.utcString(next) : null, next_allowed_label: next && next > new Date() ? owner.formatWhen(next, tz) : null,
+      campaigns: db.prepare('SELECT id, subject, recipients, sent, skipped, failed, status, created_at, finished_at FROM campaigns WHERE tenant_id = ? ORDER BY id DESC LIMIT 50').all(t.id)
+        .map((c) => ({ ...c, when_label: owner.formatWhen(owner.parseUtc(c.created_at), tz) })),
+    });
+  }, { auth: 'owner' });
+  route('POST', '/api/campaigns/test', async (req, res, p, url, { tenant: t, user }) => {
+    const { subject, body } = campaignInput(await json(req));
+    const address = owner.postalAddress(t);
+    if (!address.ok) throw new HttpError(409, 'Add your business mailing address first. Go to Settings, then Customer Terms & Conditions.');
+    if (!notify.emailEnabled) throw new HttpError(503, 'Email isn’t set up on the platform yet. Contact support.');
+    if (limited('camptest:' + t.id, 10, 3600_000)) throw new HttpError(429, 'You’ve sent 10 tests this hour. Try again later.');
+    const e = owner.campaignEmail({ t, subject: `[Test] ${subject}`, body, address, unsubUrl: '(each customer gets their own unsubscribe link here)' });
+    const ok = await notify.email(user.email, e.subject, e.text, { fromName: t.name, replyTo: t.email || undefined });
+    if (!ok) throw new HttpError(502, 'The test email didn’t go out. Try again in a minute.');
+    send(res, 200, { ok: true, to: user.email });
+  }, { auth: 'owner' });
+  route('POST', '/api/campaigns', async (req, res, p, url, { tenant: t, user }) => {
+    const { subject, body } = campaignInput(await json(req));
+    const address = owner.postalAddress(t);
+    if (!address.ok) throw new HttpError(409, 'Add your business mailing address first. Go to Settings, then Customer Terms & Conditions.');
+    if (!notify.emailEnabled) throw new HttpError(503, 'Email isn’t set up on the platform yet. Contact support.');
+    const last = lastCampaign(t.id);
+    if (last && owner.parseUtc(last.created_at).getTime() + 864e5 > Date.now()) throw new HttpError(429, `You can send one email to your subscribers each day. You can send the next one ${owner.formatWhen(new Date(owner.parseUtc(last.created_at).getTime() + 864e5), owner.tzOf(t))}.`);
+    const list = subscribers(t.id);
+    if (!list.length) throw new HttpError(409, 'Nobody has signed up for your emails yet.');
+    const ins = db.prepare('INSERT INTO campaigns (tenant_id, user_id, subject, body, recipients, created_at) VALUES (?,?,?,?,?,?)').run(t.id, user.id, subject, body, list.length, now());
+    const cid = Number(ins.lastInsertRowid);
+    for (const c of list) queueMessage({ t, kind: 'campaign', channel: 'email', to: normEmail(c.email), refId: cid, customerId: c.id });
+    send(res, 201, { id: cid, recipients: list.length });
+  }, { auth: 'owner' });
+
+  // ---------- owner features: accounting export ----------
+  // Paid payments for a date range (in the business's time zone), ready to import into QuickBooks.
+  route('GET', '/api/exports/quickbooks.csv', async (req, res, p, url, { tenant: t }) => {
+    const tz = owner.tzOf(t);
+    const today = owner.todayIn(tz);
+    const from = owner.validDate(url.searchParams.get('from')) ? url.searchParams.get('from') : today.slice(0, 8) + '01';
+    const to = owner.validDate(url.searchParams.get('to')) ? url.searchParams.get('to') : today;
+    if (to < from) throw new HttpError(400, 'The end date is before the start date.');
+    const lo = owner.utcString(owner.zonedTimeToUtc(from, '00:00', tz)), hi = owner.utcString(owner.zonedTimeToUtc(owner.addDays(to, 1), '00:00', tz));
+    const rows = db.prepare(`SELECT p.*, q.signer_name, q.customer_name AS q_name, r.name AS r_name FROM payments p LEFT JOIN quotes q ON q.id = p.quote_id LEFT JOIN requests r ON r.id = p.request_id
+      WHERE p.tenant_id = ? AND p.status = 'paid' AND p.paid_at >= ? AND p.paid_at < ? ORDER BY p.paid_at, p.id`).all(t.id, lo, hi);
+    const d = (c) => (c / 100).toFixed(2);
+    const METHOD = { card: 'Card or bank (online)', cash: 'Cash', check: 'Check', other: 'Other' };
+    const lines = [['Date', 'Customer', 'Description', 'Amount', 'Method', 'Processing fees', 'Net', 'Reference']];
+    for (const r of rows) {
+      const lp = owner.localParts(owner.parseUtc(r.paid_at), tz);
+      const card = r.method === 'card';
+      const settled = !card || ['direct', 'sent'].includes(r.transfer_status);
+      const fees = card ? r.stripe_fee_cents + r.fee_cents - (r.fee_refunded_cents || 0) : 0;
+      lines.push([`${String(lp.month).padStart(2, '0')}/${String(lp.day).padStart(2, '0')}/${lp.year}`, r.signer_name || r.q_name || r.r_name || '', r.description, d(r.amount_cents), METHOD[r.method] || r.method,
+        settled ? d(fees) : '', settled ? d(r.amount_cents - fees) : '', `Receipt #${r.id}${r.charge_id ? ' ' + r.charge_id : ''}${settled ? '' : ' (fees not settled yet)'}`]);
+    }
+    const name = `payments-${from}-to-${to}.csv`;
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    res.end(lines.map((l) => l.map(owner.csvCell).join(',')).join('\r\n') + '\r\n');
+  }, { auth: 'owner' });
+
+  // ---------- owner features: install on phone ----------
+  // The installable dashboard: web app manifest, service worker (scope /admin/) and offline page.
+  const APP_FILES = { '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/admin/sw.js': ['sw.js', 'text/javascript; charset=utf-8'], '/admin/offline.html': ['offline.html', 'text/html; charset=utf-8'] };
+  ownerPages.push([/^\/manifest\.webmanifest$|^\/admin\/(sw\.js|offline\.html)$/, (req, res, m) => {
+    const [file, type] = APP_FILES[m[0]];
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache', ...securityHeaders, ...(file === 'sw.js' ? { 'Service-Worker-Allowed': '/admin/' } : {}) });
+    res.end(fs.readFileSync(path.join(PUBLIC, file)));
+  }]);
 
   // Customers and who's subscribed
   route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
@@ -1887,6 +2383,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if (pathname === '/signup' && AFF.CODE_RE.test(AFF.normalizeCode(url.searchParams.get('ref')))) { res.writeHead(302, { Location: `/admin/?ref=${AFF.normalizeCode(url.searchParams.get('ref'))}#/signup`, 'Cache-Control': 'no-store' }); return res.end(); }
       if (pathname === '/legal/affiliate-terms' && serveFile(res, 'legal/affiliate-terms.html')) return;
 
+      if (ownerFeaturePage(req, res, pathname)) return; // owner features: calendar feed, app manifest, offline page
       const host = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
       // Send www.<platform domain> to the bare domain so search engines see one site.
       const platformHost = env.PLATFORM_URL ? new URL(env.PLATFORM_URL).host : '';
@@ -1948,7 +2445,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
     }
   }
 
-  return { handler, db, outbox: notify.outbox };
+  return { handler, db, outbox: notify.outbox, runDueMessages };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

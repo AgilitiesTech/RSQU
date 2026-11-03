@@ -86,7 +86,7 @@
   function buildChrome() {
     const tenantMode = Boolean(me.tenant);
     const items = tenantMode
-      ? [['requests', 'Requests', 'requests'], ['quotes', 'Quotes', 'quotes'], ['products', 'Products', 'products'], ['business', 'Business', 'business'], ['settings', 'Settings', 'settings']]
+      ? [['requests', 'Requests', 'requests'], ['schedule', 'Schedule', 'calendar'], ['quotes', 'Quotes', 'quotes'], ['business', 'Business', 'business'], ['settings', 'Settings', 'settings']]
       : [['super', 'Businesses', 'grid'], ['leads', 'Leads', 'requests'], ['affiliates', 'Affiliates', 'share'], ['platform', 'Platform', 'settings']];
     const badge = (k) => (k === 'requests' ? '<span class="badge" data-newcount hidden></span>' : '');
     document.getElementById('topnav').innerHTML = items.map(([k, l]) => `<a href="#/${k}" data-nav="${k}">${l} ${badge(k)}</a>`).join('');
@@ -265,6 +265,7 @@
         </a>`).join('') : '<p class="empty">Nothing here. Requests from your website show up here automatically.</p>'}
       </div>`;
     view.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('click', () => { reqFilter = b.dataset.filter; requestsView(); }));
+    installTip();
   }
 
   function newRequestView() {
@@ -309,6 +310,7 @@
         <a class="btn primary" href="${telHref(r.phone)}">Call ${esc(r.phone)}</a>
         <a class="btn" href="${smsHref(r.phone, `Hi ${r.name || ''}, this is ${bizName()}. I got your request and I'm on it.`)}">Text</a>
         <a class="btn ghost" href="${mapHref(r.location)}" target="_blank" rel="noopener">Map</a>
+        <a class="btn ghost" href="#/schedule/new/request/${r.id}">Schedule this job</a>
       </div>
       <p class="alert" id="rq-msg" hidden></p>
       <div class="grid2">
@@ -378,13 +380,14 @@
     setNav('quotes');
     const rows = await api('/api/quotes');
     view.innerHTML = `
-      <div class="row between"><h1>Quotes</h1><div class="row"><a class="btn ghost sm" href="#/customers">Customers</a><a class="btn sm" href="#/quotes/photo">+ From photos</a><button class="btn primary sm" id="q-new" type="button">+ New quote</button></div></div>
+      <div class="row between"><h1>Quotes</h1><div class="row"><a class="btn ghost sm" href="#/customers">Customers</a><a class="btn sm" href="#/quotes/photo">+ From photos</a><button class="btn sm" id="q-inv" type="button">+ New invoice</button><button class="btn primary sm" id="q-new" type="button">+ New quote</button></div></div>
       <div class="list">${rows.length ? rows.map((q) => `
         <a class="item" href="#/quotes/${q.id}">
-          <div class="grow"><div class="item-title">${esc(q.customer_name || 'No name')}</div><div class="small muted">${esc(q.title)} · #${q.id} · ${when(q.created_at)}</div></div>
+          <div class="grow"><div class="item-title">${esc(q.customer_name || 'No name')}</div><div class="small muted">${q.kind === 'invoice' ? '<span class="tag">Invoice</span> ' : ''}${esc(q.title)} · #${q.id} · ${when(q.created_at)}</div></div>
           <div class="stack" style="gap:4px;align-items:flex-end"><strong>${money(q.totals.total)}</strong><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
         </a>`).join('') : '<p class="empty">No quotes yet. Tap “From photos” to snap the problem and get a draft, or open a request and tap “Build a quote”.</p>'}</div>`;
     document.getElementById('q-new').addEventListener('click', async () => { const q = await api('/api/quotes', { method: 'POST', body: {} }); location.hash = '#/quotes/' + q.id; });
+    document.getElementById('q-inv').addEventListener('click', async () => { const q = await api('/api/invoices', { method: 'POST', body: {} }); location.hash = '#/quotes/' + q.id; });
   }
 
   async function quoteView(id) {
@@ -393,11 +396,14 @@
     const locked = Boolean(q.signed_at) || q.status === 'paid' || q.status === 'void';
     const items = q.items.map((it) => ({ ...it }));
     const active = products.filter((p) => p.active);
+    const inv = q.kind === 'invoice', noun = inv ? 'invoice' : 'proposal';
 
     view.innerHTML = `
       <a href="${q.request_id ? '#/requests/' + q.request_id : '#/quotes'}" class="small">← ${q.request_id ? 'Request #' + q.request_id : 'Quotes'}</a>
-      <div class="row between"><h1>Quote #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
+      <div class="row between"><h1>${inv ? 'Invoice' : 'Quote'} #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
+      ${q.status !== 'void' ? `<div class="row"><a class="btn ghost sm" href="#/schedule/new/quote/${q.id}">Schedule this job</a></div>` : ''}
       <p class="alert" id="q-msg" hidden></p>
+      ${inv && !locked ? '<p class="small muted">No signature needed. Your customer pays from the invoice page, which shows your Terms &amp; Conditions. Or record cash or a check below.</p>' : ''}
       ${q.signed_at ? `<p class="alert ok">Signed by ${esc(q.signer_name)} on ${esc(new Date(q.signed_at.replace(' ', 'T') + 'Z').toLocaleString())}. Signed quotes can’t be edited.</p>` : ''}
       ${aiCard(q, locked)}
       <form id="qf" class="stack">
@@ -405,7 +411,7 @@
         <section class="card stack">
           <h2>Customer</h2>
           <div class="grid2">
-            <div><label for="q-title">Proposal title</label><input id="q-title" name="title" value="${esc(q.title)}"></div>
+            <div><label for="q-title">${inv ? 'Invoice title' : 'Proposal title'}</label><input id="q-title" name="title" value="${esc(q.title)}"></div>
             <div><label for="q-name">Name</label><input id="q-name" name="customer_name" value="${esc(q.customer_name)}"></div>
             <div><label for="q-phone">Phone</label><input id="q-phone" name="customer_phone" type="tel" value="${esc(q.customer_phone)}"></div>
             <div><label for="q-email">Email (for the receipt)</label><input id="q-email" name="customer_email" type="email" value="${esc(q.customer_email)}"></div>
@@ -435,8 +441,8 @@
           <p class="small muted" id="fee-note"></p>
         </section>
         <div class="sticky-actions row">
-          ${locked ? `<a class="btn primary" href="${esc(q.proposal_url)}" target="_blank" rel="noopener">Open proposal</a>` : '<button class="btn" type="submit">Save</button><button class="btn primary" type="button" id="q-show">Save and show proposal</button>'}
-          <a class="btn ghost" href="${smsHref(q.customer_phone, bizName() + ': here is your proposal to review and sign: ' + q.proposal_url)}">Text link</a>
+          ${locked ? `<a class="btn primary" href="${esc(q.proposal_url)}" target="_blank" rel="noopener">Open ${noun}</a>` : `<button class="btn" type="submit">Save</button><button class="btn primary" type="button" id="q-show">Save and show ${noun}</button>`}
+          <a class="btn ghost" href="${smsHref(q.customer_phone, bizName() + (inv ? ': here is your invoice: ' : ': here is your proposal to review and sign: ') + q.proposal_url)}">Text link</a>
           <button class="btn ghost" type="button" data-copy="${esc(q.proposal_url)}">Copy link</button>
         </div>
       </form>
@@ -513,7 +519,7 @@
     f.addEventListener('submit', async (e) => { e.preventDefault(); try { await save(); await quoteView(id); flash(document.getElementById('q-msg'), 'Saved.'); } catch (err) { flash(msg, err.message, 'err'); } });
     const show = document.getElementById('q-show');
     if (show) show.addEventListener('click', async () => {
-      if (items.some((it) => it.name.trim() && !it.unit_cents) && !confirm('Some lines are $0. Show the proposal anyway?')) return;
+      if (items.some((it) => it.name.trim() && !it.unit_cents) && !confirm(`Some lines are $0. Show the ${noun} anyway?`)) return;
       const w = window.open('', '_blank');
       try { const saved = await save(); if (w) w.location = saved.proposal_url; else location.href = saved.proposal_url; quoteView(id); }
       catch (err) { if (w) w.close(); flash(msg, err.message, 'err'); }
@@ -526,16 +532,16 @@
     pay.innerHTML = `
       <h2>Payment</h2>
       ${q.status === 'paid' ? `<p class="alert ok">Paid in full. ${paidList.map((p) => `${money(p.amount_cents)} by ${esc(p.method)}`).join(', ')}.</p>${paidList.filter((p) => p.method === 'card').map(payoutLine).join('')}` :
-        q.signed_at ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. ${q.online.card_payments ? 'The customer can pay online on the proposal page, or you can' : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
+        q.signed_at || (inv && q.status !== 'void') ? `<p>Balance due: <strong>${money(q.totals.balance)}</strong>. ${q.online.card_payments ? `The customer can pay online on the ${noun} page, or you can` : 'Online payments aren’t connected yet, so'} record cash or a check here.</p>
         <div class="row"><button class="btn ghost" type="button" data-paid="cash">Got cash</button><button class="btn ghost" type="button" data-paid="check">Got a check</button></div>` :
         q.status === 'void' ? '<p class="muted">This quote is void.</p>' : '<p class="muted">The customer signs the proposal first, then pays.</p>'}
-      ${q.status !== 'paid' ? `<div class="row" style="border-top:1px solid var(--line);padding-top:12px">${q.status === 'void' ? (q.signed_at ? '' : '<button class="linkbtn" type="button" data-st="draft">Restore quote</button>') : '<button class="linkbtn" type="button" data-st="void">Void this quote</button>'}</div>` : ''}`;
+      ${q.status !== 'paid' ? `<div class="row" style="border-top:1px solid var(--line);padding-top:12px">${q.status === 'void' ? (q.signed_at ? '' : `<button class="linkbtn" type="button" data-st="draft">Restore ${inv ? 'invoice' : 'quote'}</button>`) : `<button class="linkbtn" type="button" data-st="void">Void this ${inv ? 'invoice' : 'quote'}</button>`}</div>` : ''}`;
     pay.querySelectorAll('[data-paid]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm(`Record ${money(q.totals.balance)} paid by ${b.dataset.paid}?`)) return;
       try { await api(`/api/quotes/${id}/payments`, { method: 'POST', body: { method: b.dataset.paid } }); quoteView(id); } catch (err) { flash(msg, err.message, 'err'); }
     }));
     pay.querySelectorAll('[data-st]').forEach((b) => b.addEventListener('click', async () => {
-      if (b.dataset.st === 'void' && !confirm('Void this quote? The customer link will stop working.')) return;
+      if (b.dataset.st === 'void' && !confirm(`Void this ${inv ? 'invoice' : 'quote'}? The customer link will stop working.`)) return;
       try { await api(`/api/quotes/${id}/status`, { method: 'POST', body: { status: b.dataset.st } }); quoteView(id); } catch (err) { flash(msg, err.message, 'err'); }
     }));
   }
@@ -607,7 +613,7 @@
     const yes = (on, at) => (on ? `<span class="tag" style="background:#DDF3E6;color:#14532D">Yes</span>${at ? `<div class="small muted">${when(at)}</div>` : ''}` : '<span class="small muted">No</span>');
     view.innerHTML = `
       <a href="#/quotes" class="small">← Quotes</a>
-      <div class="row between"><h1>Customers</h1>${rows.length ? '<a class="btn sm" href="/api/customers.csv">Download CSV</a>' : ''}</div>
+      <div class="row between"><h1>Customers</h1><div class="row">${isOwner() ? '<a class="btn primary sm" href="#/emails">Email subscribers</a>' : ''}${rows.length ? '<a class="btn sm" href="/api/customers.csv">Download CSV</a>' : ''}</div></div>
       <p class="small muted">Customers are added when they sign a proposal. Email updates are on unless they uncheck the box; texts only if they check that box. Every email you send them must include an unsubscribe link, and texts must honor STOP.</p>
       <div class="table-wrap" style="overflow-x:auto"><table class="items" style="min-width:640px">
         <thead><tr><th scope="col">Name</th><th scope="col">Phone</th><th scope="col">Email</th><th scope="col">Email updates</th><th scope="col">Texts</th><th scope="col">From</th></tr></thead>
@@ -624,10 +630,11 @@
 
   // ---------- products ----------
   async function productsView() {
-    setNav('products');
+    setNav('business');
     const rows = await api('/api/products');
     const flags = (p) => `${p.active ? '' : '<span class="tag void">Hidden</span>'} ${p.on_site ? '<span class="tag">On website</span>' : ''} ${p.bookable ? '<span class="tag winterize">Bookable</span>' : ''} ${p.taxable ? '<span class="tag">Taxable</span>' : ''} ${p.image ? '<span class="tag">Tile picture</span>' : ''} ${p.details && p.on_site ? '<span class="tag">Own page</span>' : ''}`;
     view.innerHTML = `
+      <a href="#/business" class="small">← Business</a>
       <h1>Products and services</h1>
       <p class="muted">These show up when you build a quote. Turn on “Show on website” to list one on your site, and “Customers can book it” for fixed-price packages.</p>
       <form class="card stack" id="pf">
@@ -778,6 +785,8 @@
       if (!confirm('Remove this team member?')) return;
       await api('/api/team/' + btn.dataset.rm, { method: 'DELETE' }); businessView();
     }));
+
+    ownerBusinessExtras();
   }
 
   // ---------- website sections and local search ----------
@@ -1380,6 +1389,8 @@
       catch (err) { flash(document.getElementById('pw-msg'), err.message, 'err'); }
     });
     document.getElementById('logout').addEventListener('click', logout);
+
+    ownerSettingsCards(cfg);
   }
 
   // ---------- customer Terms & Conditions (the business is the seller of record) ----------
@@ -1701,6 +1712,375 @@
     view.querySelectorAll('[data-lead]').forEach((sel) => sel.addEventListener('change', () => api('/api/super/leads/' + sel.dataset.lead, { method: 'PATCH', body: { status: sel.value } })));
   }
 
+  // ---------- owner features: time zone ----------
+  // Adds the time zone picker to the Business page. It saves with the page's Save button.
+  async function ownerBusinessExtras() {
+    const f = document.getElementById('bf');
+    const area = document.getElementById('b-area');
+    if (!f || !area) return;
+    productsCard();
+    let st;
+    try { st = await api('/api/owner-settings'); } catch { return; }
+    area.parentElement.insertAdjacentHTML('afterend', `<div style="max-width:420px"><label for="b-tz">Time zone</label>
+      <select id="b-tz">${st.timezones.map(([v, l]) => `<option value="${esc(v)}" ${st.timezone === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <p class="small muted">Used for receipts, reminders and texting hours.</p></div>`);
+    f.addEventListener('submit', async () => {
+      const tz = document.getElementById('b-tz').value;
+      if (tz === st.timezone || !isOwner()) return;
+      try { st = await api('/api/owner-settings', { method: 'PUT', body: { timezone: tz } }); }
+      catch (err) { flash(document.getElementById('b-msg'), err.message, 'err'); }
+    });
+  }
+
+  // ---------- owner features: settings cards ----------
+  async function ownerSettingsCards(cfg) {
+    let st;
+    try { st = await api('/api/owner-settings'); } catch { return; }
+    reviewCard(st);
+    payLaterCard(st, cfg);
+    exportCard();
+  }
+
+  // ---------- owner features: review requests ----------
+  const delayLabel = (h) => (h < 24 ? `${h} hours after they pay` : h === 24 ? '1 day after they pay' : `${h / 24} days after they pay`);
+  function reviewCard(st) {
+    const anchor = document.getElementById('sf');
+    if (!anchor) return;
+    const r = st.review, ro = isOwner() ? '' : 'disabled';
+    anchor.insertAdjacentHTML('afterend', `<section class="card stack" id="rv">
+      <h2>Google review requests</h2>
+      ${!r.link ? `<p>Add your Google review link first. Open <a href="#/website">Website sections</a> and paste it under “Google and social links”.</p>` : `
+      <fieldset ${ro} class="stack" style="border:0;padding:0;margin:0">
+        <label class="check"><input type="checkbox" id="rv-on" ${r.enabled ? 'checked' : ''}> <span>Ask customers for a Google review after they pay</span></label>
+        <div style="max-width:320px"><label for="rv-delay">When to ask</label><select id="rv-delay">${r.delays.map((h) => `<option value="${h}" ${r.delay_hours === h ? 'selected' : ''}>${delayLabel(h)}</option>`).join('')}</select></div>
+        <div><label for="rv-text">Your message</label><textarea id="rv-text" rows="3" maxlength="500">${esc(r.message)}</textarea>
+          <button class="linkbtn" type="button" id="rv-reset">Use the suggested message</button></div>
+        <p class="small muted">We add your review link and phone number. Customers who agreed to emails get an email. Customers who agreed to texts also get a text, between 8am and 8pm. Nobody gets more than one request every ${r.repeat_days} days. Your receipts also show a “Leave us a Google review” button.</p>
+        <p class="alert" id="rv-alert" hidden></p>
+        ${ro ? '' : '<div><button class="btn primary" type="button" id="rv-save">Save review settings</button></div>'}
+      </fieldset>`}
+    </section>`);
+    const save = document.getElementById('rv-save');
+    if (!save) return;
+    document.getElementById('rv-reset').addEventListener('click', () => { document.getElementById('rv-text').value = r.default_message; });
+    save.addEventListener('click', async () => {
+      const el = document.getElementById('rv-alert');
+      try {
+        await api('/api/owner-settings', { method: 'PUT', body: { review_requests: document.getElementById('rv-on').checked, review_delay_hours: Number(document.getElementById('rv-delay').value), review_message: document.getElementById('rv-text').value } });
+        flash(el, 'Saved.');
+      } catch (err) { flash(el, err.message, 'err'); }
+    });
+  }
+
+  // ---------- owner features: scheduling ----------
+  ICON.calendar = '<rect x="3" y="4" width="18" height="18" rx="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line>';
+  const JSTATUS = { scheduled: 'Scheduled', en_route: 'On the way', done: 'Done', canceled: 'Canceled' };
+  const DURATIONS = [[30, '30 minutes'], [60, '1 hour'], [90, '1½ hours'], [120, '2 hours'], [180, '3 hours'], [240, '4 hours'], [360, '6 hours'], [480, 'All day (8 hours)']];
+  const dayAdd = (d, n) => { const [y, m, dd] = d.split('-').map(Number); return new Date(Date.UTC(y, m - 1, dd + n)).toISOString().slice(0, 10); };
+  const dayLabel = (d, opts = { weekday: 'short', month: 'short', day: 'numeric' }) => new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { ...opts, timeZone: 'UTC' });
+  let schedMode = 'week';
+
+  async function scheduleView(mode, date) {
+    setNav('schedule');
+    mode = mode === 'day' || mode === 'week' ? mode : schedMode;
+    schedMode = mode;
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(date || '') ? date : '';
+    const data = await api(`/api/jobs?days=${mode === 'day' ? 1 : 7}${mode === 'week' ? '&snap=week' : ''}${day ? '&from=' + day : ''}`);
+    const step = mode === 'day' ? 1 : 7;
+    const days = Array.from({ length: data.days }, (_, i) => dayAdd(data.from, i));
+    const tzName = (TZ_NAMES[data.tz] || data.tz).replace(/ \(.*\)$/, '');
+    const range = mode === 'day' ? dayLabel(data.from, { weekday: 'long', month: 'long', day: 'numeric' }) : `${dayLabel(days[0], { month: 'short', day: 'numeric' })} to ${dayLabel(days[6], { month: 'short', day: 'numeric' })}`;
+    const jobItem = (j) => `
+      <a class="item sched-item ${j.status}" href="#/schedule/job/${j.id}">
+        <div class="sched-time"><strong>${esc(j.start_label)}</strong><span class="small muted">${esc(j.end_label)}</span></div>
+        <div class="grow stack" style="gap:2px">
+          <span class="item-title">${esc(j.customer_name || 'Customer')}</span>
+          ${j.address ? `<span class="small">${esc(j.address.split('\n')[0]).slice(0, 120)}</span>` : ''}
+          <span class="small muted">${j.assignee_name || j.assignee_email ? esc(j.assignee_name || j.assignee_email) + ' · ' : ''}${JSTATUS[j.status]}</span>
+        </div>
+      </a>`;
+    view.innerHTML = `
+      <div class="row between"><h1>Schedule</h1><a class="btn primary sm" href="#/schedule/new">+ New appointment</a></div>
+      <div class="row between">
+        <div class="tabs" role="group" aria-label="Show"><button type="button" data-mode="day" aria-pressed="${mode === 'day'}">Day</button><button type="button" data-mode="week" aria-pressed="${mode === 'week'}">Week</button></div>
+        <div class="row" style="gap:6px">
+          <a class="btn ghost sm" href="#/schedule/${mode}/${dayAdd(data.from, -step)}" aria-label="Previous ${mode}">‹ Back</a>
+          <a class="btn ghost sm" href="#/schedule/${mode}/${data.today}">Today</a>
+          <a class="btn ghost sm" href="#/schedule/${mode}/${dayAdd(data.from, step)}" aria-label="Next ${mode}">Next ›</a>
+        </div>
+      </div>
+      <p class="small muted">${esc(range)} · ${esc(tzName)}</p>
+      <div class="stack sched">${days.map((d) => {
+        const jobs = data.jobs.filter((j) => j.date === d);
+        const isToday = d === data.today;
+        return `<section class="sched-day${isToday ? ' today' : ''}" ${isToday ? 'aria-current="date"' : ''}>
+          ${mode === 'week' ? `<h2 class="sched-date"><a href="#/schedule/day/${d}">${esc(dayLabel(d))}</a>${isToday ? ' <span class="tag new">Today</span>' : ''}</h2>` : isToday ? '<p><span class="tag new">Today</span></p>' : ''}
+          ${jobs.length ? `<div class="list">${jobs.map(jobItem).join('')}</div>` : `<p class="small muted sched-none">No appointments.${mode === 'day' ? ` <a href="#/schedule/new/date/${d}">Add one</a>` : ''}</p>`}
+        </section>`;
+      }).join('')}</div>
+      <section class="card stack" id="cal-card">
+        <h2>See your schedule in your phone’s calendar</h2>
+        <p class="small">Add your appointments to Google Calendar or Apple Calendar. They update on their own about once an hour.</p>
+        <div><button class="btn" type="button" id="cal-show">Get my calendar link</button></div>
+        <div id="cal-box" class="stack" hidden></div>
+      </section>`;
+    view.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => { location.hash = `#/schedule/${b.dataset.mode}/${mode === 'week' && b.dataset.mode === 'day' && days.includes(data.today) ? data.today : data.from}`; }));
+    document.getElementById('cal-show').addEventListener('click', () => calendarBox());
+  }
+  const TZ_NAMES = { 'America/New_York': 'Eastern time', 'America/Chicago': 'Central time', 'America/Denver': 'Mountain time', 'America/Phoenix': 'Arizona time (no daylight saving)', 'America/Los_Angeles': 'Pacific time', 'America/Anchorage': 'Alaska time', 'Pacific/Honolulu': 'Hawaii time' };
+
+  async function calendarBox(reset) {
+    const box = document.getElementById('cal-box');
+    let c;
+    try { c = await api('/api/calendar' + (reset ? '/reset' : ''), reset ? { method: 'POST' } : {}); }
+    catch (err) { box.hidden = false; box.innerHTML = `<p class="alert err">${esc(err.message)}</p>`; return; }
+    const webcal = c.url.replace(/^https?:/, 'webcal:');
+    document.getElementById('cal-show').hidden = true;
+    box.hidden = false;
+    box.innerHTML = `
+      <p class="small">${c.owner ? 'Shows every appointment.' : 'Shows the appointments assigned to you.'} Anyone with this link can see your schedule, so keep it private.</p>
+      <div><label for="cal-url">Your private calendar link</label><input id="cal-url" readonly value="${esc(c.url)}"></div>
+      <div class="row">
+        <a class="btn sm" href="${esc('https://calendar.google.com/calendar/render?cid=' + encodeURIComponent(webcal))}" target="_blank" rel="noopener">Add to Google Calendar</a>
+        <a class="btn sm" href="${esc(webcal)}">Add to Apple Calendar</a>
+        <button class="btn ghost sm" type="button" data-copy="${esc(c.url)}">Copy link</button>
+      </div>
+      <p class="small muted">Shared it by mistake? <button class="linkbtn" type="button" id="cal-reset">Make a new link</button> The old one stops working.</p>`;
+    box.querySelector('[data-copy]').addEventListener('click', (e) => copy(c.url, e.target));
+    document.getElementById('cal-reset').addEventListener('click', () => { if (confirm('Make a new link? Calendars using the old link stop updating, so you’ll need to add the new one.')) calendarBox(true); });
+  }
+
+  // New appointment (blank, or from a request or quote), or edit one.
+  async function jobFormView(id, srcType, srcId) {
+    setNav('schedule');
+    const editing = Boolean(id);
+    const src = srcType === 'request' ? `request_id=${encodeURIComponent(srcId)}` : srcType === 'quote' ? `quote_id=${encodeURIComponent(srcId)}` : '';
+    const j = editing ? await api('/api/jobs/' + id) : await api('/api/jobs/new' + (src ? '?' + src : ''));
+    const date = editing ? j.date : srcType === 'date' && /^\d{4}-\d{2}-\d{2}$/.test(srcId || '') ? srcId : j.today;
+    const back = editing ? `#/schedule/job/${j.id}` : j.quote_id ? `#/quotes/${j.quote_id}` : j.request_id ? `#/requests/${j.request_id}` : '#/schedule';
+    const dur = editing ? j.duration_min : 60;
+    view.innerHTML = `
+      <a href="${back}" class="small">← ${editing ? 'Appointment' : j.quote_id ? 'Quote #' + j.quote_id : j.request_id ? 'Request #' + j.request_id : 'Schedule'}</a>
+      <h1>${editing ? 'Change appointment' : 'New appointment'}</h1>
+      <form class="stack" id="jf">
+        <section class="card stack">
+          <h2>When</h2>
+          <div class="grid3">
+            <div><label for="jf-date">Date</label><input id="jf-date" name="date" type="date" required value="${esc(date)}"></div>
+            <div><label for="jf-time">Start time</label><input id="jf-time" name="time" type="time" step="900" required value="${esc(editing ? j.time : '09:00')}"></div>
+            <div><label for="jf-dur">How long</label><select id="jf-dur" name="duration_min">${DURATIONS.map(([v, l]) => `<option value="${v}" ${v === dur ? 'selected' : ''}>${l}</option>`).join('')}${DURATIONS.some(([v]) => v === dur) ? '' : `<option value="${dur}" selected>${dur} minutes</option>`}</select></div>
+          </div>
+          <div style="max-width:420px"><label for="jf-user">Who’s going</label><select id="jf-user" name="user_id"><option value="">Not assigned</option>${j.team.map((u) => `<option value="${u.id}" ${editing && j.user_id === u.id ? 'selected' : !editing && u.id === me.user.id ? 'selected' : ''}>${esc(u.name || u.email)}</option>`).join('')}</select></div>
+        </section>
+        <section class="card stack">
+          <h2>Customer</h2>
+          <div class="grid2">
+            <div><label for="jf-name">Name</label><input id="jf-name" name="customer_name" autocomplete="off" value="${esc(j.customer_name)}"></div>
+            <div><label for="jf-phone">Mobile phone</label><input id="jf-phone" name="customer_phone" type="tel" autocomplete="off" value="${esc(j.customer_phone)}"></div>
+            <div><label for="jf-email">Email</label><input id="jf-email" name="customer_email" type="email" autocomplete="off" value="${esc(j.customer_email)}"></div>
+          </div>
+          <div><label for="jf-addr">Address or location</label><textarea id="jf-addr" name="address" rows="2">${esc(j.address)}</textarea></div>
+          <div><label for="jf-notes">Notes for the tech</label><textarea id="jf-notes" name="notes" rows="3">${esc(j.notes)}</textarea></div>
+        </section>
+        <label class="check"><input type="checkbox" name="notify" checked> <span>${editing ? 'If the time changes, text and email the customer the new time and a new reminder' : 'Text and email the customer a confirmation now, and a reminder the day before at 9am'}</span></label>
+        <p class="small muted">These are appointment messages, so customers get them even if they didn’t sign up for offers. Texts only go out 8am to 8pm. Customers who replied STOP don’t get texts.</p>
+        <p class="alert err" id="jf-err" hidden></p>
+        <div class="sticky-actions row"><button class="btn primary" type="submit">${editing ? 'Save changes' : 'Book appointment'}</button><a class="btn ghost" href="${back}">Cancel</a></div>
+      </form>`;
+    const f = document.getElementById('jf');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = Object.fromEntries(new FormData(f));
+      body.notify = f.elements.notify.checked;
+      body.duration_min = Number(body.duration_min);
+      body.user_id = body.user_id ? Number(body.user_id) : null;
+      if (!editing) { body.request_id = j.request_id; body.quote_id = j.quote_id; }
+      const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
+      try { const saved = await api(editing ? '/api/jobs/' + id : '/api/jobs', { method: editing ? 'PUT' : 'POST', body }); location.hash = '#/schedule/job/' + saved.id; }
+      catch (err) { flash(document.getElementById('jf-err'), err.message, 'err'); btn.disabled = false; }
+    });
+  }
+
+  async function jobView(id) {
+    setNav('schedule');
+    const j = await api('/api/jobs/' + id);
+    const open = j.status === 'scheduled' || j.status === 'en_route';
+    const KIND = { job_confirm: 'Confirmation', job_reminder: 'Reminder', job_on_way: '“On my way”' };
+    const CH = { email: 'email', sms: 'text' };
+    const mstate = (m) => (m.status === 'sent' ? `Sent ${esc(m.when_label)}` : m.status === 'pending' ? (m.soon ? 'Going out now' : `Goes out ${esc(m.when_label)}`) : m.status === 'canceled' ? 'Not sent: the time changed' : m.status === 'skipped' ? `Not sent: ${esc(m.error || '')}` : m.status === 'failed' ? 'Didn’t go through' : 'Sending');
+    const canText = j.customer_phone && !j.stopped;
+    view.innerHTML = `
+      <a href="#/schedule/day/${esc(j.date)}" class="small">← Schedule</a>
+      <div class="row between"><h1>${esc(j.customer_name || 'Customer')}</h1><span class="tag ${j.status === 'done' ? 'paid' : j.status === 'canceled' ? 'void' : j.status === 'en_route' ? 'new' : ''}">${JSTATUS[j.status]}</span></div>
+      <p class="big-num" style="font-size:24px">${esc(j.when_label)} to ${esc(j.end_label)}</p>
+      <div class="row">
+        ${j.customer_phone ? `<a class="btn primary" href="${telHref(j.customer_phone)}">Call ${esc(j.customer_phone)}</a><a class="btn" href="${smsHref(j.customer_phone)}">Text</a>` : ''}
+        ${j.address ? `<a class="btn ghost" href="${mapHref(j.address)}" target="_blank" rel="noopener">Map</a>` : ''}
+      </div>
+      <p class="alert" id="jv-msg" hidden></p>
+      ${open ? `<section class="card stack">
+        <h2>On my way</h2>
+        ${!j.customer_phone ? '<p class="small">Add the customer’s mobile number to text them.</p>' : j.stopped ? '<p class="small">This customer replied STOP to texts. Give them a call instead.</p>' : !j.sms_enabled ? '<p class="small">Texting isn’t set up yet. Give the customer a call instead.</p>' : `
+        <div class="row" style="align-items:flex-end">
+          <div style="width:150px"><label for="omw-min">Minutes away</label><input id="omw-min" inputmode="numeric" maxlength="3" value="30"></div>
+          <button class="btn primary" type="button" id="omw-send" ${j.in_text_hours ? '' : 'disabled'}>Text “On my way”</button>
+        </div>
+        <p class="small muted" id="omw-preview"></p>
+        ${j.in_text_hours ? '' : '<p class="small">It’s outside texting hours (8am to 8pm). Give the customer a call instead.</p>'}`}
+      </section>` : ''}
+      <section class="card stack">
+        <h2>Details</h2>
+        <dl class="facts">
+          ${j.address ? `<dt>Where</dt><dd>${esc(j.address)}</dd>` : ''}
+          ${j.customer_phone ? `<dt>Phone</dt><dd>${esc(j.customer_phone)}</dd>` : ''}
+          ${j.customer_email ? `<dt>Email</dt><dd>${esc(j.customer_email)}</dd>` : ''}
+          <dt>Who’s going</dt><dd>${esc(j.assignee_name || j.assignee_email || 'Not assigned')}</dd>
+          ${j.notes ? `<dt>Notes</dt><dd>${esc(j.notes)}</dd>` : ''}
+          ${j.request ? `<dt>Request</dt><dd><a href="#/requests/${j.request.id}">#${j.request.id}${j.request.name ? ' · ' + esc(j.request.name) : ''}</a></dd>` : ''}
+          ${j.quote ? `<dt>${j.quote.kind === 'invoice' ? 'Invoice' : 'Quote'}</dt><dd><a href="#/quotes/${j.quote.id}">#${j.quote.id} · ${esc(j.quote.title)}</a></dd>` : ''}
+        </dl>
+      </section>
+      <section class="card stack">
+        <h2>Messages to the customer</h2>
+        ${j.messages.length ? `<ul class="small" style="margin:0;padding-left:20px">${j.messages.map((m) => `<li>${KIND[m.kind] || esc(m.kind)} ${CH[m.channel]}: ${mstate(m)}</li>`).join('')}</ul>` : '<p class="small muted">None. Add a phone number or email to send a confirmation and reminder.</p>'}
+      </section>
+      ${open ? `<div class="row">
+        <a class="btn" href="#/schedule/edit/${j.id}">Change time or details</a>
+        <button class="btn" type="button" data-js="done">Mark done</button>
+        <button class="linkbtn" type="button" data-js="canceled">Cancel appointment</button>
+      </div>` : ''}`;
+    const msg = document.getElementById('jv-msg');
+    const mins = document.getElementById('omw-min'), prev = document.getElementById('omw-preview');
+    const preview = () => { prev.textContent = `Sends: “${bizName()} is on the way, about ${Number(mins.value) || '?'} minutes.” with your phone number.`; };
+    if (mins) { mins.addEventListener('input', preview); preview(); }
+    const send = document.getElementById('omw-send');
+    if (send) send.addEventListener('click', async () => {
+      send.disabled = true;
+      try { await api(`/api/jobs/${id}/on-my-way`, { method: 'POST', body: { minutes: Number(mins.value) } }); await jobView(id); flash(document.getElementById('jv-msg'), 'Text sent.'); }
+      catch (err) { flash(msg, err.message, 'err'); send.disabled = false; }
+    });
+    view.querySelectorAll('[data-js]').forEach((b) => b.addEventListener('click', async () => {
+      if (b.dataset.js === 'canceled' && !confirm('Cancel this appointment? Its reminder won’t go out. We don’t tell the customer, so give them a call.')) return;
+      try { await api(`/api/jobs/${id}/status`, { method: 'POST', body: { status: b.dataset.js } }); jobView(id); } catch (err) { flash(msg, err.message, 'err'); }
+    }));
+  }
+
+  // Products moved off the phone menu: a card on the Business page links to them.
+  function productsCard() {
+    const first = view.querySelector('section.card');
+    if (first) first.insertAdjacentHTML('afterend', `<section class="card stack"><h2>Products and services</h2><p>Your prices for quotes, and the services on your website.</p><div><a class="btn" href="#/products">Edit products and services</a></div></section>`);
+  }
+
+  // ---------- owner features: subscriber emails ----------
+  async function campaignsView() {
+    setNav('quotes');
+    const st = await api('/api/campaigns');
+    const n = st.subscribers;
+    const blocked = !st.address.ok || !st.email_enabled || Boolean(st.next_allowed_label) || !n;
+    view.innerHTML = `
+      <a href="#/customers" class="small">← Customers</a>
+      <h1>Email your subscribers</h1>
+      <p class="muted">Send an update or an offer to customers who agreed to emails from you. ${n === 1 ? '1 person is' : n + ' people are'} signed up.</p>
+      ${!st.address.ok ? '<p class="alert err">Add your business mailing address first. The law requires it in every email like this. <a href="#/terms">Add your address</a></p>' : ''}
+      ${!st.email_enabled ? '<p class="alert err">Email isn’t set up on the platform yet. Contact support.</p>' : ''}
+      ${st.next_allowed_label ? `<p class="alert">You can send one email a day. Your next one can go out ${esc(st.next_allowed_label)}.</p>` : ''}
+      ${!n ? '<p class="alert">Nobody has signed up yet. Customers can sign up when they sign a proposal or pay an invoice.</p>' : ''}
+      <form class="card stack" id="cf">
+        <div><label for="cf-subj">Subject</label><input id="cf-subj" maxlength="150" placeholder="Book your spring check-up"></div>
+        <div><label for="cf-body">Message</label><textarea id="cf-body" rows="10" maxlength="10000" placeholder="Hi there,&#10;&#10;Spring is a good time to check your roof seals and batteries. Book this month and get 10% off.&#10;&#10;Mike"></textarea></div>
+        <p class="small muted">We add your business name, your mailing address${st.address.ok ? ` (${esc(st.address.line)})` : ''} and an unsubscribe link at the bottom. Replies go to your business email. Texts to subscribers aren’t available, because each state has its own rules for marketing texts.</p>
+        <p class="alert" id="cf-msg" hidden></p>
+        <div class="row"><button class="btn" type="button" id="cf-test" ${!st.address.ok || !st.email_enabled ? 'disabled' : ''}>Send me a test</button><button class="btn primary" type="submit" ${blocked ? 'disabled' : ''}>Send to ${n === 1 ? '1 subscriber' : n + ' subscribers'}</button></div>
+      </form>
+      <section class="card stack">
+        <h2>Emails you sent</h2>
+        ${st.campaigns.length ? `<div class="table-wrap" style="overflow-x:auto"><table class="items" style="min-width:520px"><thead><tr><th scope="col">Sent</th><th scope="col">Subject</th><th scope="col" class="num">People</th><th scope="col" class="num">Delivered</th><th scope="col" class="num">Not sent</th></tr></thead>
+          <tbody>${st.campaigns.map((c) => `<tr><td class="small">${esc(c.when_label)}${c.status === 'sending' ? '<div class="small muted">Still sending</div>' : ''}</td><td>${esc(c.subject)}</td><td class="num">${c.recipients}</td><td class="num">${c.sent}</td><td class="num">${c.skipped + c.failed}</td></tr>`).join('')}</tbody></table></div>
+          <p class="small muted">“Not sent” means the person unsubscribed before it went out, or their email didn’t go through.</p>` : '<p class="small muted">Nothing sent yet.</p>'}
+      </section>`;
+    const f = document.getElementById('cf'), msg = document.getElementById('cf-msg');
+    const body = () => ({ subject: document.getElementById('cf-subj').value, body: document.getElementById('cf-body').value });
+    document.getElementById('cf-test').addEventListener('click', async (e) => {
+      try { const r = await api('/api/campaigns/test', { method: 'POST', body: body() }); flash(msg, `Test sent to ${r.to}.`); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    });
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!confirm(`Send this email to ${n === 1 ? '1 person' : n + ' people'}? You can send one email a day.`)) return;
+      try { await api('/api/campaigns', { method: 'POST', body: body() }); await campaignsView(); flash(document.getElementById('cf-msg'), 'Sending now. It can take a few minutes to reach everyone.'); }
+      catch (err) { flash(msg, err.message, 'err'); }
+    });
+  }
+
+  // ---------- owner features: pay over time ----------
+  // Affirm and Klarna come from the business's own Stripe settings (Checkout shows what's turned on there).
+  function payLaterCard(st, cfg) {
+    const anchor = document.getElementById('st-msg');
+    if (!anchor || !cfg.stripe.platform_ready) return;
+    anchor.insertAdjacentHTML('beforebegin', `<div class="stack pot" id="pot">
+      <h3>Offer pay over time</h3>
+      <p class="small">Let customers split bigger jobs into payments with Affirm or Klarna. You get the full amount up front, and Affirm or Klarna collects from the customer.</p>
+      <ol class="small" style="margin:0;padding-left:22px"><li>Open your Stripe Dashboard.</li><li>Go to Settings, then Payment methods.</li><li>Turn on Affirm and Klarna.</li></ol>
+      <p class="small muted">Stripe charges a higher fee for these than for cards. Customers see them at checkout when the amount qualifies.</p>
+      <label class="check small"><input type="checkbox" id="pot-on" ${st.pay_over_time ? 'checked' : ''} ${isOwner() ? '' : 'disabled'}> <span>I turned these on. Show “Pay over time available at checkout” on proposals and invoices of $50 or more.</span></label>
+    </div>`);
+    document.getElementById('pot-on').addEventListener('change', async (e) => {
+      try { await api('/api/owner-settings', { method: 'PUT', body: { pay_over_time: e.target.checked } }); flash(document.getElementById('st-msg'), 'Saved.'); }
+      catch (err) { e.target.checked = !e.target.checked; flash(document.getElementById('st-msg'), err.message, 'err'); }
+    });
+  }
+
+  // ---------- owner features: accounting export ----------
+  function exportCard() {
+    const anchor = document.getElementById('rv') || document.getElementById('sf');
+    if (!anchor || !isOwner()) return;
+    const d = new Date(), pad = (n) => String(n).padStart(2, '0');
+    const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    anchor.insertAdjacentHTML('afterend', `<section class="card stack" id="qb">
+      <h2>Download for QuickBooks</h2>
+      <p class="small">A spreadsheet of the payments you received, ready to import into QuickBooks or send to your bookkeeper. It lists the date, customer, what it was for, the amount, how they paid, processing fees, what you kept, and the receipt number.</p>
+      <div class="grid2" style="max-width:520px">
+        <div><label for="qb-from">From</label><input id="qb-from" type="date" value="${today.slice(0, 8)}01"></div>
+        <div><label for="qb-to">To</label><input id="qb-to" type="date" value="${today}"></div>
+      </div>
+      <div><a class="btn" id="qb-go" href="#">Download for QuickBooks</a></div>
+      <p class="small muted">Dates follow your business time zone. Card payments that Stripe is still settling show their fees in the next download.</p>
+    </section>`);
+    const go = document.getElementById('qb-go');
+    const href = () => { go.href = `/api/exports/quickbooks.csv?from=${encodeURIComponent(document.getElementById('qb-from').value)}&to=${encodeURIComponent(document.getElementById('qb-to').value)}`; };
+    ['qb-from', 'qb-to'].forEach((id) => document.getElementById(id).addEventListener('change', href));
+    href();
+  }
+
+  // ---------- owner features: install on phone ----------
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/admin/sw.js', { scope: '/admin/' }).catch(() => {}));
+  let installPrompt = null; // Chrome on Android offers its own "Install" prompt; we show it from the tip
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; });
+  const tipKey = 'hp-install-tip';
+  function installTip() {
+    try { if (localStorage.getItem(tipKey) === 'hidden') return; } catch { /* storage blocked: show it */ }
+    const installed = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    if (installed || !window.matchMedia('(max-width: 720px)').matches) return;
+    const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+    const how = installPrompt ? '' : ios ? ' In Safari, tap the Share button, then “Add to Home Screen”.' : ' Open your browser menu, then tap “Add to Home screen” or “Install app”.';
+    const head = view.querySelector('.row.between');
+    if (!head || document.getElementById('install-tip')) return;
+    head.insertAdjacentHTML('afterend', `<section class="card install-tip" id="install-tip" aria-label="Tip">
+      <img src="/static/brand/icon-192.png" alt="" width="44" height="44">
+      <div class="grow stack" style="gap:6px"><strong>Add HitchPoint to your home screen</strong><p class="small">Open your jobs in one tap, like an app.${how}</p>
+        ${installPrompt ? '<div><button class="btn primary sm" type="button" id="it-add">Add to home screen</button></div>' : ''}</div>
+      <button class="linkbtn small" type="button" id="it-x" aria-label="Hide this tip">Not now</button>
+    </section>`);
+    const hide = () => { try { localStorage.setItem(tipKey, 'hidden'); } catch { /* fine */ } document.getElementById('install-tip')?.remove(); };
+    document.getElementById('it-x').addEventListener('click', hide);
+    document.getElementById('it-add')?.addEventListener('click', async () => {
+      installPrompt.prompt();
+      const choice = await installPrompt.userChoice.catch(() => null);
+      installPrompt = null;
+      if (choice && choice.outcome === 'accepted') hide();
+    });
+  }
+
   // ---------- router ----------
   async function loadMe() { me = await api('/api/me', { quiet: true }).catch(() => ({ authed: false })); if (!me.authed) me = null; return me; }
   async function route() {
@@ -1725,6 +2105,11 @@
       else if (a === 'quotes' && b === 'photo') photoQuoteView(c);
       else if (a === 'quotes' && b) await quoteView(b);
       else if (a === 'customers') await customersView();
+      else if (a === 'schedule' && b === 'new') await jobFormView(null, c, h.split('/')[3]);
+      else if (a === 'schedule' && b === 'job' && c) await jobView(c);
+      else if (a === 'schedule' && b === 'edit' && c) await jobFormView(c);
+      else if (a === 'schedule') await scheduleView(b, c);
+      else if (a === 'emails') await campaignsView();
       else if (a === 'quotes') await quotesView();
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();
