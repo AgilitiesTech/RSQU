@@ -164,3 +164,8 @@ fieldset.consent legend { padding: 0 6px; }
 .sched-item.done .item-title { text-decoration: line-through; color: var(--muted); }
 .sched-item.en_route { background: #FFF8E6; }
 .pot { border-top: 1px solid var(--line); padding-top: 12px; }
+
+/* owner features: install tip */
+.install-tip { display: flex; gap: 12px; align-items: flex-start; border-color: var(--ink); }
+.install-tip img { border-radius: 10px; flex: none; }
+.install-tip .linkbtn { flex: none; margin: -8px -4px 0 0; }

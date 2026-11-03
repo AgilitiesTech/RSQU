@@ -263,6 +263,7 @@
         </a>`).join('') : '<p class="empty">Nothing here. Requests from your website show up here automatically.</p>'}
       </div>`;
     view.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('click', () => { reqFilter = b.dataset.filter; requestsView(); }));
+    installTip();
   }
 
   function newRequestView() {
@@ -1743,6 +1744,35 @@
     const href = () => { go.href = `/api/exports/quickbooks.csv?from=${encodeURIComponent(document.getElementById('qb-from').value)}&to=${encodeURIComponent(document.getElementById('qb-to').value)}`; };
     ['qb-from', 'qb-to'].forEach((id) => document.getElementById(id).addEventListener('change', href));
     href();
+  }
+
+  // ---------- owner features: install on phone ----------
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/admin/sw.js', { scope: '/admin/' }).catch(() => {}));
+  let installPrompt = null; // Chrome on Android offers its own "Install" prompt; we show it from the tip
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; });
+  const tipKey = 'hp-install-tip';
+  function installTip() {
+    try { if (localStorage.getItem(tipKey) === 'hidden') return; } catch { /* storage blocked: show it */ }
+    const installed = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    if (installed || !window.matchMedia('(max-width: 720px)').matches) return;
+    const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+    const how = installPrompt ? '' : ios ? ' In Safari, tap the Share button, then “Add to Home Screen”.' : ' Open your browser menu, then tap “Add to Home screen” or “Install app”.';
+    const head = view.querySelector('.row.between');
+    if (!head || document.getElementById('install-tip')) return;
+    head.insertAdjacentHTML('afterend', `<section class="card install-tip" id="install-tip" aria-label="Tip">
+      <img src="/static/brand/icon-192.png" alt="" width="44" height="44">
+      <div class="grow stack" style="gap:6px"><strong>Add HitchPoint to your home screen</strong><p class="small">Open your jobs in one tap, like an app.${how}</p>
+        ${installPrompt ? '<div><button class="btn primary sm" type="button" id="it-add">Add to home screen</button></div>' : ''}</div>
+      <button class="linkbtn small" type="button" id="it-x" aria-label="Hide this tip">Not now</button>
+    </section>`);
+    const hide = () => { try { localStorage.setItem(tipKey, 'hidden'); } catch { /* fine */ } document.getElementById('install-tip')?.remove(); };
+    document.getElementById('it-x').addEventListener('click', hide);
+    document.getElementById('it-add')?.addEventListener('click', async () => {
+      installPrompt.prompt();
+      const choice = await installPrompt.userChoice.catch(() => null);
+      installPrompt = null;
+      if (choice && choice.outcome === 'accepted') hide();
+    });
   }
 
   // ---------- router ----------

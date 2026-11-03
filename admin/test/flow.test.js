@@ -1320,6 +1320,55 @@ test('QuickBooks download: paid payments for a date range, every cell quoted, fo
   assert.equal((await other('GET', url)).text.trim().split('\r\n').length, 1, 'only your own payments');
 });
 
+test('install on phone: manifest, service worker that never stores /api/, offline page', async () => {
+  const man = await anon('GET', '/manifest.webmanifest');
+  assert.equal(man.status, 200);
+  assert.match(man.headers.get('content-type'), /^application\/manifest\+json/);
+  assert.deepEqual([man.json.name, man.json.start_url, man.json.scope, man.json.display], ['HitchPoint', '/admin/#/requests', '/admin/', 'standalone']);
+  for (const size of ['192x192', '512x512']) assert.ok(man.json.icons.some((i) => i.sizes === size && i.type === 'image/png'), size);
+  assert.ok(man.json.icons.some((i) => i.purpose === 'maskable'));
+  for (const i of man.json.icons) assert.equal((await fetch(base + i.src)).status, 200, i.src);
+  const admin = await anon('GET', '/admin/');
+  assert.match(admin.text, /<link rel="manifest" href="\/manifest\.webmanifest">/);
+  assert.match(admin.text, /apple-touch-icon/);
+  assert.equal((await fetch(base + '/static/brand/apple-touch-icon.png')).status, 200);
+  const off = await anon('GET', '/admin/offline.html');
+  assert.equal(off.status, 200);
+  assert.match(off.text, /You’re offline/);
+  const swRes = await anon('GET', '/admin/sw.js');
+  assert.equal(swRes.status, 200);
+  assert.match(swRes.headers.get('content-type'), /^text\/javascript/);
+  assert.equal(swRes.headers.get('service-worker-allowed'), '/admin/');
+
+  // Run the service worker against fake caches and network.
+  const vm = await import('node:vm');
+  const on = {}, puts = [];
+  let online = true;
+  const sandbox = {
+    URL, console,
+    self: { location: { origin: 'https://app.test' }, addEventListener: (type, fn) => { on[type] = fn; }, skipWaiting: async () => {}, clients: { claim: async () => {} } },
+    caches: { open: async () => ({ addAll: async () => {}, put: async (req) => { puts.push(new URL(req.url).pathname); } }), match: async (k) => `cached ${typeof k === 'string' ? k : new URL(k.url).pathname}`, keys: async () => [] },
+    fetch: async () => { if (!online) throw new TypeError('offline'); return { ok: true, clone() { return this; }, body: 'live' }; },
+  };
+  vm.runInNewContext(swRes.text, sandbox);
+  const run = async (pathname, mode = 'no-cors', method = 'GET') => {
+    let p = null;
+    on.fetch({ request: { method, mode, url: 'https://app.test' + pathname }, respondWith: (x) => { p = x; } });
+    const out = p ? await p : 'not handled';
+    await new Promise((r) => setTimeout(r, 5));
+    return out;
+  };
+  assert.equal(await run('/api/requests?filter=new', 'cors'), 'not handled', 'API calls go straight to the network');
+  assert.equal(await run('/api/quotes', 'cors', 'POST'), 'not handled');
+  assert.equal((await run('/static/admin.js')).body, 'live', 'online: the live file');
+  assert.deepEqual(puts, ['/static/admin.js'], 'and a copy for offline');
+  online = false;
+  assert.equal(await run('/static/admin.js'), 'cached /static/admin.js');
+  assert.equal(await run('/admin/', 'navigate'), 'cached /admin/offline.html', 'offline pages show the friendly offline page');
+  assert.equal(await run('/api/me', 'cors'), 'not handled');
+  assert.ok(!puts.some((x) => x.startsWith('/api/')), 'nothing from /api/ is ever stored');
+});
+
 test('bold look: banner, service tiles, highlights, service pages', async () => {
   const st = (await mike('GET', '/api/website')).json;
   assert.deepEqual(st.icons.slice(0, 2), ['tools', 'shield']);

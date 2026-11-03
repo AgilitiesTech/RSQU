@@ -1459,6 +1459,15 @@ export function createApp(env = process.env) {
     res.end(lines.map((l) => l.map(owner.csvCell).join(',')).join('\r\n') + '\r\n');
   }, { auth: 'owner' });
 
+  // ---------- owner features: install on phone ----------
+  // The installable dashboard: web app manifest, service worker (scope /admin/) and offline page.
+  const APP_FILES = { '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/admin/sw.js': ['sw.js', 'text/javascript; charset=utf-8'], '/admin/offline.html': ['offline.html', 'text/html; charset=utf-8'] };
+  ownerPages.push([/^\/manifest\.webmanifest$|^\/admin\/(sw\.js|offline\.html)$/, (req, res, m) => {
+    const [file, type] = APP_FILES[m[0]];
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache', ...securityHeaders, ...(file === 'sw.js' ? { 'Service-Worker-Allowed': '/admin/' } : {}) });
+    res.end(fs.readFileSync(path.join(PUBLIC, file)));
+  }]);
+
   // Customers and who's subscribed
   route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
     send(res, 200, db.prepare('SELECT id, name, phone, email, email_opt_in, sms_opt_in, email_consent_at, sms_consent_at, email_unsubscribed_at, source, created_at FROM customers WHERE tenant_id = ? ORDER BY id DESC LIMIT 2000').all(t.id));
