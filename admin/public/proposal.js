@@ -45,6 +45,7 @@
         </dl>
       </section>
       ${q.notes ? `<section class="card"><h2>Notes</h2><p style="white-space:pre-wrap">${esc(q.notes)}</p></section>` : ''}
+      ${q.photos && q.photos.length ? `<section class="card stack"><h2>Photos</h2><div class="photos">${q.photos.map((ph, i) => `<a href="${esc(ph.url)}" target="_blank" rel="noopener"><img src="${esc(ph.url)}" alt="Job photo ${i + 1}" loading="lazy"></a>`).join('')}</div></section>` : ''}
       <section class="card stack">
         <table class="items">
           <thead><tr><th scope="col">Work and parts</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Amount</th></tr></thead>
@@ -72,10 +73,18 @@
         <h2>Accept and sign</h2>
         <form id="sf" class="stack">
           <div><label for="sn">Your full name</label><input id="sn" name="name" autocomplete="name" value="${esc(q.customer_name || '')}" required></div>
+          <div class="grid2">
+            <div><label for="sp">Mobile phone (for your receipt)</label><input id="sp" name="phone" type="tel" autocomplete="tel" value="${esc(q.customer_phone || '')}"></div>
+            <div><label for="se">Email (for your receipt)</label><input id="se" name="email" type="email" autocomplete="email" value="${esc(q.customer_email || '')}"></div>
+          </div>
           <div><p id="sig-label" style="font-family:var(--cond);font-weight:600;font-size:17px;margin-bottom:4px">Sign with your finger or mouse</p>
             <canvas class="sigpad" id="pad" role="img" aria-labelledby="sig-label"></canvas>
             <button class="linkbtn" type="button" id="clear">Clear signature</button></div>
           <label class="check"><input type="checkbox" name="agree" id="agree"> <span>I approve this work and the total above, and I agree to the terms above${q.customer_terms ? `, ${esc(q.business.name)}’s <a href="${esc(q.customer_terms.url)}" target="_blank" rel="noopener">Terms and Conditions</a> (version ${q.customer_terms.version})` : ''} and the <a href="/legal/customer-terms" target="_blank" rel="noopener">payment and e-signature notice</a>, including signing electronically.</span></label>
+          <fieldset class="stack consent"><legend class="small muted">Stay in touch (optional)</legend>
+            <label class="check small"><input type="checkbox" name="subscribe_email" checked> <span>${esc(q.consent.email)}</span></label>
+            <label class="check small"><input type="checkbox" name="subscribe_sms"> <span>${esc(q.consent.sms)}</span></label>
+          </fieldset>
           <p class="alert err" id="serr" hidden></p>
           <button class="btn primary block" type="submit">Accept and sign</button>
         </form>`;
@@ -83,7 +92,7 @@
     }
 
     const pay = document.getElementById('pay');
-    if (paid) pay.innerHTML = `<p class="alert ok">Paid in full. Thank you!</p>`;
+    if (paid) pay.innerHTML = `<p class="alert ok">Paid in full. Thank you!</p>${(q.receipts || []).map((r) => `<p><a href="${esc(r.url)}">View your receipt (${money(r.amount_cents)})</a></p>`).join('')}`;
     else if (!signed) pay.hidden = true;
     else if (t.balance <= 0) pay.innerHTML = `<p class="alert ok">Nothing is due right now.</p>`;
     else {
@@ -134,12 +143,16 @@
       if (!f.elements.name.value.trim()) { err.textContent = 'Type your full name.'; err.hidden = false; return; }
       if (!inked) { err.textContent = 'Please sign in the box.'; err.hidden = false; return; }
       if (!f.elements.agree.checked) { err.textContent = 'Check the box to approve the work.'; err.hidden = false; return; }
+      if (f.elements.subscribe_sms.checked && !f.elements.phone.value.trim()) { err.textContent = 'Add your mobile number to get texts, or uncheck that box.'; err.hidden = false; return; }
       // Export on a white background, scaled down to keep it small.
       const out = document.createElement('canvas'); out.width = 600; out.height = 600 * canvas.height / canvas.width;
       const o = out.getContext('2d'); o.fillStyle = '#fff'; o.fillRect(0, 0, out.width, out.height); o.drawImage(canvas, 0, 0, out.width, out.height);
       const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
       try {
-        await api(`/api/public/proposals/${encodeURIComponent(token)}/sign`, { name: f.elements.name.value, agree: true, signature: out.toDataURL('image/png'), terms_version: q.customer_terms ? q.customer_terms.version : undefined });
+        await api(`/api/public/proposals/${encodeURIComponent(token)}/sign`, {
+          name: f.elements.name.value, agree: true, signature: out.toDataURL('image/png'), terms_version: q.customer_terms ? q.customer_terms.version : undefined,
+          phone: f.elements.phone.value, email: f.elements.email.value, subscribe_email: f.elements.subscribe_email.checked, subscribe_sms: f.elements.subscribe_sms.checked,
+        });
         load();
       } catch (ex) { err.textContent = ex.message; err.hidden = false; btn.disabled = false; }
     });

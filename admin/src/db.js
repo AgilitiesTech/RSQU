@@ -243,4 +243,29 @@ function migrate(db) {
       UNIQUE (tenant_id, version)
     );
   `);
+
+  // Photos the technician took for a proposal ([{ file, show }]) and the AI draft notes for the
+  // technician (findings, safety notes, questions). Both JSON.
+  addColumn(db, 'quotes', 'photos', 'TEXT');
+  addColumn(db, 'quotes', 'ai_draft', 'TEXT');
+  // When the customer's receipt was sent (text and/or email), so it's sent once.
+  addColumn(db, 'payments', 'receipt_sent_at', 'TEXT');
+
+  // Each business's customers and what they agreed to receive. Consent is recorded with the exact
+  // wording shown, when, from where, and on which proposal.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS customers (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      name TEXT, phone TEXT, phone_key TEXT, email TEXT,
+      email_opt_in INTEGER NOT NULL DEFAULT 0, email_consent_at TEXT, email_consent_text TEXT, email_unsubscribed_at TEXT,
+      sms_opt_in INTEGER NOT NULL DEFAULT 0, sms_consent_at TEXT, sms_consent_text TEXT,
+      consent_ip TEXT, consent_ua TEXT, source TEXT,
+      unsub_token TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS customers_phone ON customers (tenant_id, phone_key);
+    CREATE INDEX IF NOT EXISTS customers_email ON customers (tenant_id, email);
+  `);
 }

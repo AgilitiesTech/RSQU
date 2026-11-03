@@ -86,6 +86,16 @@ A business can serve its hosted site from its own domain: it adds a CNAME pointi
   - City pages are offered to search engines (`index`, and listed in the sitemap) only once the owner writes at least 120 characters about that city, so they aren't near-duplicate doorway pages. Until then they're `noindex`.
   - Sitemaps: a business on its own domain gets `/sitemap.xml` and `/robots.txt` there; businesses hosted at `/s/<slug>` are listed in the platform sitemap.
   - Videos show a preview image and load YouTube's privacy-enhanced player only when a visitor presses play; the site's Content-Security-Policy allows just `i.ytimg.com` and `www.youtube-nocookie.com` for this.
+- **Quote from photos** (Quotes → From photos, or on a request): take up to 4 photos and add a note. With `ANTHROPIC_API_KEY` set, Claude drafts the proposal:
+  - The title, a plain-language summary for the customer, and lines from the business's own price list.
+  - Anything not on the price list comes in at $0, flagged "Set a price". Labor uses the hourly rate from Customer Terms details.
+  - Notes for the technician only: what the photos show, safety concerns, and what to confirm.
+  - The technician edits everything before sending and chooses which photos appear on the proposal. Without a key, the photos are kept and the technician fills in the lines.
+- **Receipts and subscribers:**
+  - When customers sign, they confirm their phone and email for the receipt. They can keep "email me updates and offers" on (one-click unsubscribe in every email) and opt in to texts. The texts box is unchecked, with STOP/HELP wording.
+  - The exact wording, time, IP and proposal are stored with each consent.
+  - After any payment (card, cash or check), the customer gets a receipt link (`/r/<token>`) by text and email, once.
+  - Quotes → Customers lists everyone and what they agreed to, with a CSV download. Email unsubscribe is at `/u/<token>`: GET asks, POST unsubscribes, including mail apps' one-click.
 - **Products:** prices for quotes; “Show on website” lists one on the site; “Customers can book it” makes a fixed-price package bookable from the form.
 - **Settings:** customer Terms & Conditions status, their own Stripe account (opens the Stripe Dashboard for refunds, disputes and payouts), recent online payments with the Processing Fee on each, the deposit name and amount, default tax and job notes, change password.
 - **Customer Terms & Conditions** (Settings → Review your terms): one-time business details, the generated draft, edits, and the owner’s final approval. Online payments turn on after approval.

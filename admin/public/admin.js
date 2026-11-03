@@ -337,7 +337,7 @@
             ${depPending.map((p) => payLinkBox(location.origin + '/pay/' + p.token, r.phone)).join('')}`}
           </section>` : ''}
           <section class="card stack">
-            <div class="row between"><h2>Quotes</h2><button class="btn primary" id="rq-quote" type="button">Build a quote</button></div>
+            <div class="row between"><h2>Quotes</h2><div class="row"><a class="btn" href="#/quotes/photo/${r.id}">Quote from photos</a><button class="btn primary" id="rq-quote" type="button">Build a quote</button></div></div>
             ${r.quotes.length ? `<div class="list">${r.quotes.map((q) => `<a class="item" href="#/quotes/${q.id}"><div class="grow"><div class="item-title">${esc(q.title)}</div><div class="small muted">#${q.id} · ${when(q.created_at)}</div></div><div class="stack" style="gap:4px;align-items:flex-end"><strong>${money(q.totals.total)}</strong><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div></a>`).join('')}</div>` : '<p class="muted small">No quotes yet.</p>'}
           </section>
         </div>
@@ -375,12 +375,12 @@
     setNav('quotes');
     const rows = await api('/api/quotes');
     view.innerHTML = `
-      <div class="row between"><h1>Quotes</h1><button class="btn primary sm" id="q-new" type="button">+ New quote</button></div>
+      <div class="row between"><h1>Quotes</h1><div class="row"><a class="btn ghost sm" href="#/customers">Customers</a><a class="btn sm" href="#/quotes/photo">+ From photos</a><button class="btn primary sm" id="q-new" type="button">+ New quote</button></div></div>
       <div class="list">${rows.length ? rows.map((q) => `
         <a class="item" href="#/quotes/${q.id}">
           <div class="grow"><div class="item-title">${esc(q.customer_name || 'No name')}</div><div class="small muted">${esc(q.title)} · #${q.id} · ${when(q.created_at)}</div></div>
           <div class="stack" style="gap:4px;align-items:flex-end"><strong>${money(q.totals.total)}</strong><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
-        </a>`).join('') : '<p class="empty">No quotes yet. Open a request and tap “Build a quote”.</p>'}</div>`;
+        </a>`).join('') : '<p class="empty">No quotes yet. Tap “From photos” to snap the problem and get a draft, or open a request and tap “Build a quote”.</p>'}</div>`;
     document.getElementById('q-new').addEventListener('click', async () => { const q = await api('/api/quotes', { method: 'POST', body: {} }); location.hash = '#/quotes/' + q.id; });
   }
 
@@ -396,6 +396,7 @@
       <div class="row between"><h1>Quote #${q.id}</h1><span class="tag ${q.status}">${QSTATUS[q.status]}</span></div>
       <p class="alert" id="q-msg" hidden></p>
       ${q.signed_at ? `<p class="alert ok">Signed by ${esc(q.signer_name)} on ${esc(new Date(q.signed_at.replace(' ', 'T') + 'Z').toLocaleString())}. Signed quotes can’t be edited.</p>` : ''}
+      ${aiCard(q, locked)}
       <form id="qf" class="stack">
         <fieldset ${locked ? 'disabled' : ''} style="border:0;padding:0;margin:0" class="stack">
         <section class="card stack">
@@ -469,7 +470,7 @@
         <div class="line" data-i="${i}">
           <div class="nm field"><label class="small" for="ln-n${i}">Item</label><input id="ln-n${i}" data-k="name" value="${esc(it.name)}"></div>
           <div class="field"><label class="small" for="ln-q${i}">Qty</label><input id="ln-q${i}" data-k="qty" inputmode="decimal" value="${esc(it.qty)}"></div>
-          <div class="field"><label class="small" for="ln-p${i}">Price each</label><input id="ln-p${i}" data-k="price" inputmode="decimal" value="${dollars(it.unit_cents)}"></div>
+          <div class="field"><label class="small" for="ln-p${i}">Price each${!it.unit_cents && !locked ? ' <span class="tag new">Set a price</span>' : ''}</label><input id="ln-p${i}" data-k="price" inputmode="decimal" value="${dollars(it.unit_cents)}" ${!it.unit_cents && !locked ? 'aria-invalid="true"' : ''}></div>
           <button class="btn ghost sm del" type="button" data-del="${i}" aria-label="Remove ${esc(it.name)}">Remove</button>
           <div class="desc field"><label class="small" for="ln-d${i}">Description (optional)</label><input id="ln-d${i}" data-k="description" value="${esc(it.description || '')}"></div>
           <label class="check small" style="grid-column:1/-1"><input type="checkbox" data-k="taxable" ${it.taxable ? 'checked' : ''}> Taxable</label>
@@ -503,11 +504,13 @@
       const body = Object.fromEntries(new FormData(f));
       body.tax_rate_bp = toCents(f.elements.tax.value);
       body.items = items.map((it) => ({ ...it, qty: Number(it.qty) || 0 })).filter((it) => it.name.trim());
+      body.photos = [...view.querySelectorAll('[data-photo]')].map((cb) => ({ file: cb.dataset.photo, show: cb.checked }));
       return api('/api/quotes/' + id, { method: 'PUT', body });
     }
     f.addEventListener('submit', async (e) => { e.preventDefault(); try { await save(); await quoteView(id); flash(document.getElementById('q-msg'), 'Saved.'); } catch (err) { flash(msg, err.message, 'err'); } });
     const show = document.getElementById('q-show');
     if (show) show.addEventListener('click', async () => {
+      if (items.some((it) => it.name.trim() && !it.unit_cents) && !confirm('Some lines are $0. Show the proposal anyway?')) return;
       const w = window.open('', '_blank');
       try { const saved = await save(); if (w) w.location = saved.proposal_url; else location.href = saved.proposal_url; quoteView(id); }
       catch (err) { if (w) w.close(); flash(msg, err.message, 'err'); }
@@ -532,6 +535,81 @@
       if (b.dataset.st === 'void' && !confirm('Void this quote? The customer link will stop working.')) return;
       try { await api(`/api/quotes/${id}/status`, { method: 'POST', body: { status: b.dataset.st } }); quoteView(id); } catch (err) { flash(msg, err.message, 'err'); }
     }));
+  }
+
+  // Photos and the AI draft notes on a quote (notes are for the technician; photos can show on the proposal).
+  function aiCard(q, locked) {
+    const ai = q.ai_draft;
+    if (!q.photos.length && !ai) return '';
+    const list = (title, xs, cls = '') => (xs && xs.length ? `<div class="${cls}"><h3>${title}</h3><ul class="small" style="margin:4px 0 0;padding-left:20px">${xs.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '');
+    const status = !ai ? '' : ai.error === 'not_configured' ? '<p class="small muted">Photos saved. Automatic drafting isn’t switched on yet, so add the lines yourself.</p>'
+      : ai.error ? `<p class="alert err">Couldn’t draft from the photos (${esc(ai.error)}). Your photos are saved; add the lines yourself.</p>`
+      : `<p class="small">Drafted from your photos. Check every line and price before you send it.${ai.needs_price && ai.needs_price.length ? ` <strong>${ai.needs_price.length} line${ai.needs_price.length === 1 ? '' : 's'} aren’t on your price list and need a price.</strong>` : ''}${ai.estimates && ai.estimates.length ? ' Labor hours are an estimate.' : ''}</p>`;
+    return `<section class="card stack">
+      <h2>Photos${ai && !ai.error ? ' and draft notes' : ''}</h2>
+      ${status}
+      ${ai && ai.safety && ai.safety.length ? `<div class="alert err"><strong>Safety:</strong> ${ai.safety.map(esc).join(' ')}</div>` : ''}
+      ${q.photos.length ? `<div class="row" style="gap:12px;align-items:flex-start">${q.photos.map((ph) => `<figure style="margin:0;width:140px"><a href="/api/uploads/${esc(ph.file)}" target="_blank" rel="noopener"><img src="/api/uploads/${esc(ph.file)}" alt="Job photo" style="width:140px;height:105px;object-fit:cover;border-radius:6px;display:block"></a><label class="check small" style="margin-top:4px"><input type="checkbox" data-photo="${esc(ph.file)}" form="qf" ${ph.show ? 'checked' : ''} ${locked ? 'disabled' : ''}> Show on proposal</label></figure>`).join('')}</div>` : ''}
+      ${ai && !ai.error ? `<div class="grid2">${list('What the photos show', ai.findings)}${list('Check before sending', ai.questions)}</div>` : ''}
+      ${ai && ai.note ? `<p class="small muted">Your note: ${esc(ai.note)}</p>` : ''}
+    </section>`;
+  }
+
+  // Snap the problem, get a draft proposal.
+  async function photoQuoteView(requestId) {
+    setNav('quotes');
+    const r = requestId ? await api('/api/requests/' + requestId).catch(() => null) : null;
+    const req = r && (r.request || r);
+    const photos = [];
+    view.innerHTML = `
+      <a href="${requestId ? '#/requests/' + esc(requestId) : '#/quotes'}" class="small">← ${requestId ? 'Request #' + esc(requestId) : 'Quotes'}</a>
+      <h1>Quote from photos</h1>
+      <section class="card stack">
+        <p>Take up to 4 photos of the problem: the damage up close, then the area around it, plus any model or serial plate. You’ll get a draft proposal using your price list, and you edit everything before the customer sees it.</p>
+        <div><button class="btn primary" type="button" id="pq-pick">Take or choose photos</button><input id="pq-files" type="file" accept="image/*" multiple hidden></div>
+        <div class="row" id="pq-thumbs" style="gap:10px"></div>
+        <div><label for="pq-rig">Year, make and model</label><input id="pq-rig" maxlength="200" value="${esc(req?.rig || '')}" placeholder="2019 Jayco Jay Flight 264BH"></div>
+        <div><label for="pq-note">What’s going on? (optional)</label><textarea id="pq-note" rows="3" maxlength="1000" placeholder="Customer says the awning won’t retract; the arm is bent at the elbow.">${esc(req?.issue || '')}</textarea></div>
+        <p class="alert" id="pq-msg" hidden></p>
+        <div><button class="btn primary" type="button" id="pq-go" disabled>Draft the proposal</button></div>
+      </section>`;
+    const thumbs = document.getElementById('pq-thumbs'), go = document.getElementById('pq-go'), msg = document.getElementById('pq-msg');
+    const draw = () => {
+      thumbs.innerHTML = photos.map((d, i) => `<figure style="margin:0;position:relative"><img src="${d}" alt="Photo ${i + 1}" style="width:110px;height:82px;object-fit:cover;border-radius:6px;display:block"><button type="button" class="btn ghost sm" data-rm="${i}" aria-label="Remove photo ${i + 1}" style="margin-top:4px">Remove</button></figure>`).join('');
+      go.disabled = !photos.length;
+    };
+    document.getElementById('pq-pick').addEventListener('click', () => document.getElementById('pq-files').click());
+    document.getElementById('pq-files').addEventListener('change', async (e) => {
+      for (const f of [...e.target.files]) {
+        if (photos.length >= 4) { flash(msg, 'Up to 4 photos. Remove one to add another.', 'err'); break; }
+        const d = await readImage(f, 1568);
+        if (d) photos.push(d); else flash(msg, 'That file isn’t a photo we can read. Use JPG or PNG.', 'err');
+      }
+      e.target.value = ''; draw();
+    });
+    thumbs.addEventListener('click', (e) => { const b = e.target.closest('[data-rm]'); if (b) { photos.splice(Number(b.dataset.rm), 1); draw(); } });
+    go.addEventListener('click', async () => {
+      go.disabled = true; go.textContent = 'Drafting… this takes about 20 seconds';
+      try {
+        const q = await api('/api/quotes/from-photos', { method: 'POST', body: { request_id: requestId ? Number(requestId) : null, photos, rig: document.getElementById('pq-rig').value, note: document.getElementById('pq-note').value } });
+        location.hash = '#/quotes/' + q.id;
+      } catch (err) { flash(msg, err.message, 'err'); go.disabled = false; go.textContent = 'Draft the proposal'; }
+    });
+  }
+
+  // Everyone who signed a proposal, and what they agreed to receive.
+  async function customersView() {
+    setNav('quotes');
+    const rows = await api('/api/customers');
+    const yes = (on, at) => (on ? `<span class="tag" style="background:#DDF3E6;color:#14532D">Yes</span>${at ? `<div class="small muted">${when(at)}</div>` : ''}` : '<span class="small muted">No</span>');
+    view.innerHTML = `
+      <a href="#/quotes" class="small">← Quotes</a>
+      <div class="row between"><h1>Customers</h1>${rows.length ? '<a class="btn sm" href="/api/customers.csv">Download CSV</a>' : ''}</div>
+      <p class="small muted">Customers are added when they sign a proposal. Email updates are on unless they uncheck the box; texts only if they check that box. Every email you send them must include an unsubscribe link, and texts must honor STOP.</p>
+      <div class="table-wrap" style="overflow-x:auto"><table class="items" style="min-width:640px">
+        <thead><tr><th scope="col">Name</th><th scope="col">Phone</th><th scope="col">Email</th><th scope="col">Email updates</th><th scope="col">Texts</th><th scope="col">From</th></tr></thead>
+        <tbody>${rows.map((c) => `<tr><td>${esc(c.name || '')}</td><td>${esc(c.phone || '')}</td><td>${esc(c.email || '')}</td><td>${yes(c.email_opt_in, c.email_consent_at)}</td><td>${yes(c.sms_opt_in, c.sms_consent_at)}</td><td class="small">${esc(c.source || '')}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No customers yet.</td></tr>'}</tbody>
+      </table></div>`;
   }
 
   function payoutLine(p) {
@@ -1266,7 +1344,7 @@
   async function loadMe() { me = await api('/api/me', { quiet: true }).catch(() => ({ authed: false })); if (!me.authed) me = null; return me; }
   async function route() {
     const h = location.hash.replace(/^#\/?/, '');
-    const [a, b] = h.split('/');
+    const [a, b, c] = h.split('/');
     if (a === 'reset' && b) return showAuth('reset', b);
     if (!me) await loadMe();
     if (!me) return showAuth(['signup', 'forgot'].includes(a) ? a : 'login');
@@ -1282,7 +1360,9 @@
         else await superView();
       } else if (a === 'requests' && b === 'new') newRequestView();
       else if (a === 'requests' && b) await requestView(b);
+      else if (a === 'quotes' && b === 'photo') photoQuoteView(c);
       else if (a === 'quotes' && b) await quoteView(b);
+      else if (a === 'customers') await customersView();
       else if (a === 'quotes') await quotesView();
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();

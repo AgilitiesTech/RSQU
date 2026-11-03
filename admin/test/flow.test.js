@@ -119,6 +119,28 @@ const stripeMock = http.createServer((req, res) => {
 let server, base, dataDir, appDb;
 const WHSEC = 'whsec_platform_test';
 
+// ---- fake Anthropic Messages API (photo-to-proposal drafts) ----
+const aiCalls = [];
+const aiMock = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => {
+    const b = JSON.parse(body || '{}');
+    aiCalls.push({ headers: req.headers, body: b });
+    const content = b.messages?.[0]?.content || [];
+    const text = content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+    if (/FAIL/.test(text)) { res.writeHead(529, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error' } })); }
+    const list = JSON.parse(/Price list \(JSON\): (\[.*\])/.exec(text)[1]);
+    const first = list[0];
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ model: b.model, content: [{ type: 'tool_use', id: 'tu_1', name: 'draft_proposal', input: {
+      title: 'Awning arm replacement', customer_summary: 'The front awning arm is bent at the elbow, so the awning can’t roll up.',
+      findings: ['Front awning arm bent at the elbow', 'Fabric looks intact'], safety_notes: [], questions_for_technician: ['Confirm the awning brand and arm length'],
+      line_items: [{ product_id: first.product_id, name: 'whatever the model said', quantity: 1 }, { product_id: 999999, name: 'Replacement awning arm', description: 'OEM-style arm', quantity: 1 }, { product_id: null, name: '', quantity: 1 }],
+    } }] }));
+  });
+});
+
 // Tiny cookie-jar client per user.
 function client() {
   let cookie = '';
@@ -148,21 +170,24 @@ function webhook(evt) {
 
 before(async () => {
   await new Promise((r) => stripeMock.listen(0, r));
+  await new Promise((r) => aiMock.listen(0, r));
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rsqu-test-'));
-  const { handler, db } = createApp({
+  const { handler, db, outbox: ob } = createApp({
     DATA_DIR: dataDir, SUPER_ADMIN_EMAIL: 'aaron@agilities.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw',
     STRIPE_SECRET_KEY: 'sk_test_platform', STRIPE_API_BASE: `http://localhost:${stripeMock.address().port}`, STRIPE_WEBHOOK_SECRET: WHSEC,
+    ANTHROPIC_API_KEY: 'sk-ant-test', ANTHROPIC_API_BASE: `http://localhost:${aiMock.address().port}`, NOTIFY_CAPTURE: '1',
   });
   appDb = db;
+  outbox = ob;
   server = http.createServer(handler);
   await new Promise((r) => server.listen(0, r));
   base = `http://localhost:${server.address().port}`;
 });
-after(() => { server.close(); stripeMock.close(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+after(() => { server.close(); stripeMock.close(); aiMock.close(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 const SIG = 'data:image/png;base64,' + 'A'.repeat(400);
-let mikeId, mikeSlug;
+let mikeId, mikeSlug, outbox;
 
 test('super admin creates a business; owner sets password and must accept agreements', async () => {
   assert.equal((await superA('GET', '/api/super/overview')).status, 401);
@@ -640,6 +665,99 @@ test('website sections, city pages, PDFs and local-search markup', async () => {
   assert.equal(del.status, 200);
   assert.equal(del.json.profile.resources.length, 0);
   assert.equal((await fetch(`${base}/s/${mikeSlug}/files/${doc.file}`)).status, 404);
+});
+
+test('photo quote: AI draft from the price list, photos on the proposal, consent, receipt by text and email, unsubscribe', async () => {
+  const JPG = PNG; // tiny valid image
+  assert.equal((await mike('POST', '/api/quotes/from-photos', { photos: [] })).status, 400);
+  assert.equal((await mike('POST', '/api/quotes/from-photos', { photos: ['data:text/plain;base64,aGk='] })).status, 400);
+
+  const d = await mike('POST', '/api/quotes/from-photos', { photos: [JPG, JPG], rig: '2019 Jayco Jay Flight', note: 'Awning will not retract' });
+  assert.equal(d.status, 201, JSON.stringify(d.json));
+  const call = aiCalls.at(-1);
+  assert.equal(call.headers['x-api-key'], 'sk-ant-test');
+  assert.equal(call.headers['anthropic-version'], '2023-06-01');
+  assert.equal(call.body.model, 'claude-sonnet-5-5');
+  assert.equal(call.body.messages[0].content.filter((c) => c.type === 'image').length, 2);
+  const q = d.json;
+  assert.equal(q.title, 'Awning arm replacement');
+  assert.match(q.notes, /awning arm is bent/);
+  assert.equal(q.photos.length, 2);
+  assert.deepEqual(q.ai_draft.findings, ['Front awning arm bent at the elbow', 'Fabric looks intact']);
+  // Price-list line keeps the business's own name and price; unknown product id becomes a $0 line to price
+  const products = (await mike('GET', '/api/products')).json.filter((p) => p.active);
+  const listed = products.sort((a, b) => a.name.localeCompare(b.name))[0];
+  assert.equal(q.items[0].name, listed.name);
+  assert.equal(q.items[0].unit_cents, listed.price_cents);
+  assert.equal(q.items[1].name, 'Replacement awning arm');
+  assert.equal(q.items[1].unit_cents, 0);
+  assert.equal(q.items.length, 2); // nameless line dropped
+  assert.deepEqual(q.ai_draft.needs_price, ['Replacement awning arm']);
+
+  // AI failure still keeps the photos
+  const failed = await mike('POST', '/api/quotes/from-photos', { photos: [JPG], note: 'FAIL please' });
+  assert.equal(failed.status, 201);
+  assert.match(failed.json.ai_draft.error, /529/);
+  assert.equal(failed.json.photos.length, 1);
+  assert.equal(failed.json.items.length, 0);
+  assert.equal((await other('GET', `/api/uploads/${failed.json.photos[0].file}`)).status, 404); // other businesses can't see it
+
+  // Owner prices the open line, hides one photo, adds the customer
+  const items = q.items.map((it) => ({ ...it, unit_cents: it.unit_cents || 18500 }));
+  const saved = await mike('PUT', `/api/quotes/${q.id}`, { title: q.title, customer_name: 'Pat Camper', customer_phone: '801-555-0142', customer_email: '', rig: q.rig, notes: q.notes, terms: '', tax_rate_bp: 0, items, photos: [{ file: q.photos[0].file, show: true }, { file: q.photos[1].file, show: false }] });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.json.photos.map((p) => p.show), [true, false]);
+
+  const pub = await anon('GET', `/api/public/proposals/${q.token}`);
+  assert.equal(pub.json.photos.length, 1);
+  assert.equal((await fetch(base + pub.json.photos[0].url)).status, 200);
+  assert.equal((await fetch(`${base}/api/public/proposals/${q.token}/photos/${q.photos[1].file}`)).status, 404);
+  assert.equal(pub.json.customer_phone, '801-555-0142');
+  assert.match(pub.json.consent.sms, /Reply STOP/);
+
+  // Sign: confirm contact, keep email updates on, opt in to texts
+  const tv = pub.json.customer_terms?.version;
+  assert.equal((await anon('POST', `/api/public/proposals/${q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: tv, email: 'not-an-email' })).status, 400);
+  const signed = await anon('POST', `/api/public/proposals/${q.token}/sign`, { name: 'Pat Camper', agree: true, signature: SIG, terms_version: tv, phone: '(801) 555-0142', email: 'Pat@Example.test', subscribe_email: true, subscribe_sms: true });
+  assert.equal(signed.status, 200, JSON.stringify(signed.json));
+  const custs = (await mike('GET', '/api/customers')).json;
+  const pat = custs.find((c) => c.email === 'pat@example.test');
+  assert.ok(pat && pat.email_opt_in === 1 && pat.sms_opt_in === 1);
+  assert.match(appDb.prepare('SELECT sms_consent_text FROM customers WHERE id = ?').get(pat.id).sms_consent_text, /Consent isn't required to buy/);
+  assert.equal((await other('GET', '/api/customers')).json.some((c) => c.email === 'pat@example.test'), false);
+  const csv = await mike('GET', '/api/customers.csv');
+  assert.match(csv.text, /pat@example\.test,yes/);
+
+  // Paid (cash): receipt by text and email, once
+  const before = outbox.length;
+  assert.equal((await mike('POST', `/api/quotes/${q.id}/payments`, { method: 'cash' })).status, 200);
+  await new Promise((r) => setTimeout(r, 50));
+  const sent = outbox.slice(before);
+  const sms = sent.find((m) => m.kind === 'sms' && m.to === '+18015550142');
+  assert.ok(sms, 'receipt text');
+  assert.match(sms.body, /Thanks, Pat! We received your payment of \$/);
+  const rpath = /(\/r\/[\w-]+)/.exec(sms.body)[1];
+  const mail = sent.find((m) => m.kind === 'email' && m.to === 'pat@example.test');
+  assert.ok(mail, 'receipt email');
+  assert.match(mail.text, new RegExp(rpath));
+  const unsub = /(\/u\/[\w-]+)/.exec(mail.text)[1];
+  assert.match(mail.headers['List-Unsubscribe'], new RegExp(unsub));
+  const receipt = await anon('GET', rpath);
+  assert.equal(receipt.status, 200);
+  assert.match(receipt.text, /Receipt/);
+  assert.match(receipt.text, /Replacement awning arm/);
+  assert.match(receipt.text, /Cash/);
+  const again = appDb.prepare('SELECT receipt_sent_at FROM payments WHERE token = ?').get(rpath.slice(3));
+  assert.ok(again.receipt_sent_at);
+  assert.match((await anon('GET', `/api/public/proposals/${q.token}`)).json.receipts[0].url, /^\/r\//);
+
+  // Unsubscribe: GET asks, POST does it
+  assert.match((await anon('GET', unsub)).text, /Unsubscribe from/);
+  assert.equal(appDb.prepare('SELECT email_opt_in FROM customers WHERE id = ?').get(pat.id).email_opt_in, 1);
+  assert.match((await anon('POST', unsub, 'List-Unsubscribe=One-Click', { 'Content-Type': 'application/x-www-form-urlencoded' })).text, /You’re unsubscribed/);
+  assert.equal(appDb.prepare('SELECT email_opt_in FROM customers WHERE id = ?').get(pat.id).email_opt_in, 0);
+  assert.equal((await anon('GET', '/u/nope')).status, 404);
+  assert.equal((await anon('GET', '/r/nope')).status, 404);
 });
 
 test('static pages, legal pages and seed script', async () => {

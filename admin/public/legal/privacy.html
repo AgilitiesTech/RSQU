@@ -33,7 +33,9 @@
 <li><strong>Request details:</strong> name, phone number, location (including GPS coordinates if you choose to share them), vehicle or equipment details, a description of the problem, and any photo you upload.</li>
 <li><strong>Proposal and signature records:</strong> the proposal you viewed, your typed name, your finger-drawn signature image, the date and time you signed, your IP address, and your device and browser information (user agent).</li>
 <li><strong>Payment information:</strong> payment amount, status, refunds, and dispute records. The service business, as merchant of record, and Stripe receive payment information from you. Card and bank account numbers are entered into and stored by Stripe, not by HitchPoint or the service business. We receive limited details such as card brand and last four digits.</li>
-<li><strong>Messages:</strong> text message alerts and related delivery records, if the business uses them.</li>
+<li><strong>Messages:</strong> text message alerts, receipts sent by text or email, and related delivery records.</li>
+<li><strong>Job photos:</strong> photos the business takes of your RV or equipment for a proposal. The business chooses which ones appear on your proposal.</li>
+<li><strong>Your contact choices:</strong> whether you asked to receive updates and offers from the business by email or text, the exact wording you agreed to, and when.</li>
 </ul>
 <h3>From business users</h3>
 <ul>
@@ -59,7 +61,9 @@
 <li>To deliver requests to the right business and let it respond, quote, and schedule work.</li>
 <li>To present proposals, record e-signatures, and keep a reliable record of what was agreed.</li>
 <li>To enable online payments to each business’s own Stripe account, show businesses their payment and Processing Fee records, and collect HitchPoint’s platform fee.</li>
-<li>To send text alerts about a request when a business enables them.</li>
+<li>To send text alerts about a request when a business enables them, and to send you a receipt by text and email after you pay.</li>
+<li>To help a business draft a proposal from the job photos it takes, using an AI service (see Subprocessors). The business reviews and edits every draft before you see it.</li>
+<li>To keep each business’s list of customers who asked to receive its updates and offers, so the business can contact them and honor unsubscribe and STOP requests.</li>
 <li>To respond to business inquiries submitted on the marketing website and contact those people about the Platform.</li>
 <li>To provide support, operate billing, secure the Platform, prevent fraud, and meet legal, tax, and compliance obligations, including issuing tax information forms where required.</li>
 <li>To improve the Platform and the marketing website using account and usage information. We do not use customer information to market to customers on our own behalf.</li>
@@ -86,7 +90,8 @@
 <tr><td>Stripe</td><td>Payment processing for each business’s own Stripe account, account onboarding (identity and bank verification), payouts to businesses, and HitchPoint’s platform fees</td></tr>
 <tr><td>Twilio</td><td>Optional text message alerts</td></tr>
 <tr><td>Render</td><td>Hosting, storage, and databases</td></tr>
-<tr><td>Resend</td><td>Account emails, such as password resets</td></tr>
+<tr><td>Resend</td><td>Emails, such as password resets and receipts</td></tr>
+<tr><td>Anthropic</td><td>Drafting proposals from job photos a business takes (photos and the business’s price list are sent to Anthropic’s API, which does not use them to train its models)</td></tr>
 <tr><td>Google Fonts</td><td>Web fonts on our pages. Your browser requests the fonts from Google, which receives your IP address.</td></tr>
 <tr><td>YouTube (Google)</td><td>Videos a business adds to its website. The video’s preview image loads from Google’s servers, which receive your IP address; the YouTube player (privacy-enhanced mode) loads only if you press play.</td></tr>
 </tbody>
@@ -96,12 +101,12 @@
 
 <section class="card">
 <h2>6. We do not sell personal data</h2>
-<p>HitchPoint does not sell personal information and does not share it for cross-context behavioral advertising. We do not use phone numbers from service requests for marketing. We use contact details from the business inquiry form only to contact people about the Platform, and you can ask us to stop at any time.</p>
+<p>HitchPoint does not sell personal information and does not share it for cross-context behavioral advertising. HitchPoint does not market to customers of service businesses on its own behalf. A business sends you updates or offers only if you agreed when signing a proposal: by email unless you unchecked that box, and by text only if you checked that box. Every update email has an unsubscribe link. We use contact details from the business inquiry form only to contact people about the Platform, and you can ask us to stop at any time.</p>
 </section>
 
 <section class="card">
 <h2>7. Text messages</h2>
-<p>When you submit a request, you agree that the service business may call or text you about that request. These are service messages, not marketing. Reply STOP to opt out of texts; message and data rates may apply. Text messages are sent through Twilio.</p>
+<p>When you submit a request, you agree that the service business may call or text you about that request, including a receipt after you pay. These are service messages, not marketing. A business texts you reminders or offers only if you checked the box to receive them; consent isn’t required to buy. Reply STOP to opt out of texts or HELP for help; message and data rates may apply. Text messages are sent through Twilio.</p>
 </section>
 
 <section class="card">

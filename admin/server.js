@@ -10,6 +10,8 @@ import * as customerTerms from './src/customer-terms.js';
 import { notifier } from './src/notify.js';
 import { renderSite, renderCityPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
 import * as siteProfile from './src/site-profile.js';
+import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
+import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
 import { renderLanding, robotsTxt, sitemapXml, llmsTxt, BRAND } from './src/landing.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -150,10 +152,70 @@ export function createApp(env = process.env) {
     if (!requestId) return;
     db.prepare(`UPDATE quotes SET deposit_credit_cents = ? WHERE request_id = ? AND status IN ('draft','sent','signed')`).run(paidDeposits(requestId), requestId);
   }
+  const jparse = (s, d) => { try { return s ? JSON.parse(s) : d; } catch { return d; } };
   function quoteFull(q) {
     const items = getItems(q.id);
     const payments = db.prepare('SELECT * FROM payments WHERE quote_id = ? ORDER BY id').all(q.id);
-    return { ...q, items, totals: quoteTotals(q, items), payments };
+    return { ...q, photos: jparse(q.photos, []), ai_draft: jparse(q.ai_draft, null), items, totals: quoteTotals(q, items), payments };
+  }
+
+  // ---------- customers, consent and receipts ----------
+  const publicBase = () => (env.BASE_URL || env.PLATFORM_URL || 'http://localhost:3000').replace(/\/$/, '');
+  const phoneKey = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 10 ? d.slice(-10) : ''; };
+  const toE164 = (p) => { const s = String(p || '').trim(); const d = s.replace(/\D/g, ''); if (s.startsWith('+') && d.length >= 10) return '+' + d; if (d.length === 10) return '+1' + d; if (d.length === 11 && d[0] === '1') return '+' + d; return ''; };
+  const normEmail = (e) => String(e || '').trim().toLowerCase();
+  function findCustomer(tid, phone, email) {
+    const k = phoneKey(phone), e = normEmail(email);
+    return (k && db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND phone_key = ? ORDER BY id LIMIT 1').get(tid, k))
+      || (e && db.prepare('SELECT * FROM customers WHERE tenant_id = ? AND email = ? ORDER BY id LIMIT 1').get(tid, e)) || null;
+  }
+  // Records a customer and what they agreed to. Email updates follow the checkbox each time; a text
+  // opt-in is only ever added here (customers stop texts by replying STOP).
+  function upsertCustomer(t, { name, phone, email, emailOptIn, smsOptIn, source, ip, ua }) {
+    const ts = now(), e = normEmail(email), k = phoneKey(phone);
+    if (!e && !k) return null;
+    let c = findCustomer(t.id, phone, email);
+    if (!c) {
+      const ins = db.prepare('INSERT INTO customers (tenant_id, name, phone, phone_key, email, unsub_token, source) VALUES (?,?,?,?,?,?,?)').run(t.id, name || '', phone || '', k, e || null, randomToken(), source);
+      c = db.prepare('SELECT * FROM customers WHERE id = ?').get(ins.lastInsertRowid);
+    } else {
+      db.prepare(`UPDATE customers SET name = COALESCE(NULLIF(?, ''), name), phone = COALESCE(NULLIF(?, ''), phone), phone_key = COALESCE(NULLIF(?, ''), phone_key), email = COALESCE(NULLIF(?, ''), email), updated_at = ? WHERE id = ?`).run(name || '', phone || '', k, e, ts, c.id);
+    }
+    if (e) {
+      if (emailOptIn) db.prepare('UPDATE customers SET email_opt_in = 1, email_consent_at = ?, email_consent_text = ?, email_unsubscribed_at = NULL, consent_ip = ?, consent_ua = ?, source = ? WHERE id = ?').run(ts, consentText.email(t.name), ip, ua, source, c.id);
+      else if (c.email_opt_in) db.prepare('UPDATE customers SET email_opt_in = 0, email_unsubscribed_at = ? WHERE id = ?').run(ts, c.id);
+    }
+    if (smsOptIn && k) db.prepare('UPDATE customers SET sms_opt_in = 1, sms_consent_at = ?, sms_consent_text = ?, consent_ip = ?, consent_ua = ?, source = ? WHERE id = ?').run(ts, consentText.sms(t.name), ip, ua, source, c.id);
+    return db.prepare('SELECT * FROM customers WHERE id = ?').get(c.id);
+  }
+
+  // Texts and emails the customer a link to their receipt, once per payment.
+  async function sendReceipt(paymentId) {
+    const claim = db.prepare(`UPDATE payments SET receipt_sent_at = ? WHERE id = ? AND status = 'paid' AND receipt_sent_at IS NULL`).run(now(), paymentId);
+    if (!claim.changes) return;
+    const pay = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+    const t = getTenant(pay.tenant_id);
+    const q = pay.quote_id ? db.prepare('SELECT * FROM quotes WHERE id = ?').get(pay.quote_id) : null;
+    const r = pay.request_id ? db.prepare('SELECT * FROM requests WHERE id = ?').get(pay.request_id) : null;
+    const name = String(q?.signer_name || q?.customer_name || r?.name || '').trim();
+    const first = name.split(/\s+/)[0] || '';
+    const phone = q?.customer_phone || r?.phone || '';
+    const email = normEmail(q?.customer_email || r?.email || '');
+    const url = `${publicBase()}/r/${pay.token}`;
+    const amount = receiptMoney(pay.amount_cents);
+    const sms = toE164(phone);
+    if (sms) await notify.sms(sms, `${t.name}: Thanks${first ? ', ' + first : ''}! We received your payment of ${amount}. Your receipt: ${url}`);
+    if (/^\S+@\S+\.\S+$/.test(email)) {
+      const c = findCustomer(t.id, phone, email);
+      const unsub = c && c.email_opt_in && normEmail(c.email) === email ? `${publicBase()}/u/${c.unsub_token}` : '';
+      const lines = [`Hi${first ? ' ' + first : ''},`, '', `Thanks for choosing ${t.name}. We received your payment of ${amount}${q ? ` for ${q.title}` : ''}.`, '', `Your receipt: ${url}`, '',
+        `Questions? ${t.phone ? `Call or text ${t.phone}` : 'Reply to this email'}${t.email ? ` or email ${t.email}` : ''}.`, '', t.name];
+      if (unsub) lines.push('', `You're subscribed to updates and offers from ${t.name}. Unsubscribe: ${unsub}`);
+      await notify.email(email, `Your receipt from ${t.name}: ${amount}`, lines.join('\n'), {
+        fromName: t.name, replyTo: t.email || undefined,
+        headers: unsub ? { 'List-Unsubscribe': `<${unsub}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : undefined,
+      });
+    }
   }
 
   function markPaid(payment, method, sessionId) {
@@ -171,6 +233,7 @@ export function createApp(env = process.env) {
       setRequestStatus(q?.request_id, 'paid');
       notify.sms(t?.notify_phone, `Payment received: ${money(payment.amount_cents)} for quote #${payment.quote_id} (${q?.customer_name || 'customer'}).`);
     }
+    sendReceipt(payment.id).catch((e) => console.error('Receipt failed', e));
   }
 
   function saveImage(dataUrl, prefix, maxBytes) {
@@ -498,7 +561,16 @@ export function createApp(env = process.env) {
       business: brand(t),
       // The business's customer Terms & Conditions: the version signed, or the current one to accept.
       customer_terms: publicTerms(t, full.customer_terms_version),
+      photos: full.photos.filter((ph) => ph.show).map((ph) => ({ url: `/api/public/proposals/${encodeURIComponent(q.token)}/photos/${encodeURIComponent(ph.file)}` })),
+      customer_phone: full.signed_at ? undefined : full.customer_phone, customer_email: full.signed_at ? undefined : full.customer_email,
+      consent: { email: consentText.email(t.name), sms: consentText.sms(t.name) },
+      receipts: full.payments.filter((pp) => pp.status === 'paid').map((pp) => ({ url: `/r/${pp.token}`, amount_cents: pp.amount_cents, paid_at: pp.paid_at })),
     });
+  });
+  route('GET', '/api/public/proposals/:token/photos/:file', async (req, res, p) => {
+    const q = getQuoteByToken(p.token);
+    if (!q || q.status === 'void' || !jparse(q.photos, []).some((ph) => ph.show && ph.file === p.file)) throw new HttpError(404, 'Not found');
+    sendUpload(res, p.file);
   });
 
   route('POST', '/api/public/proposals/:token/sign', async (req, res, p) => {
@@ -514,9 +586,16 @@ export function createApp(env = process.env) {
     if (terms && Number(b.terms_version) !== terms.version) throw new HttpError(409, 'The business updated its Terms & Conditions. Reload the page to review them, then sign.');
     if (!/^data:image\/png;base64,[A-Za-z0-9+/=]{200,}$/.test(b.signature || '')) throw new HttpError(400, 'Please sign in the box.');
     if (b.signature.length > 700_000) throw new HttpError(413, 'Signature is too large.');
+    // Where the receipt goes, and what the customer agreed to receive.
+    const phone = b.phone !== undefined ? clean(b.phone, 40) : q.customer_phone;
+    const email = b.email !== undefined ? clean(b.email, 200).toLowerCase() : normEmail(q.customer_email);
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) throw new HttpError(400, 'Check your email address.');
+    if (phone && !phoneKey(phone)) throw new HttpError(400, 'Check your phone number.');
+    if (b.subscribe_sms && !phoneKey(phone)) throw new HttpError(400, 'Add your mobile number to get texts, or uncheck that box.');
     const ts = now();
-    db.prepare(`UPDATE quotes SET status = 'signed', signer_name = ?, signature_png = ?, signer_ip = ?, signer_ua = ?, signed_at = ?, updated_at = ?, customer_terms_version = ?, customer_terms_sha256 = ? WHERE id = ?`)
-      .run(name, b.signature, clientIp(req), clean(req.headers['user-agent'], 400), ts, ts, terms?.version ?? null, terms?.sha256 ?? null, q.id);
+    db.prepare(`UPDATE quotes SET status = 'signed', signer_name = ?, signature_png = ?, signer_ip = ?, signer_ua = ?, signed_at = ?, updated_at = ?, customer_terms_version = ?, customer_terms_sha256 = ?, customer_phone = ?, customer_email = ? WHERE id = ?`)
+      .run(name, b.signature, clientIp(req), clean(req.headers['user-agent'], 400), ts, ts, terms?.version ?? null, terms?.sha256 ?? null, phone || '', email || '', q.id);
+    upsertCustomer(getTenant(q.tenant_id), { name, phone, email, emailOptIn: Boolean(b.subscribe_email), smsOptIn: Boolean(b.subscribe_sms), source: `Proposal #${q.id}`, ip: clientIp(req), ua: clean(req.headers['user-agent'], 400) });
     setRequestStatus(q.request_id, 'accepted');
     notify.sms(getTenant(q.tenant_id)?.notify_phone, `Proposal #${q.id} signed by ${name}.`);
     send(res, 200, { ok: true });
@@ -702,6 +781,47 @@ export function createApp(env = process.env) {
     send(res, 201, quoteFull(scoped('quotes', qid, t.id)));
   }, { auth: 'tenant' });
 
+  // A draft proposal from photos the technician takes. With ANTHROPIC_API_KEY set, Claude drafts the
+  // title, customer summary and lines from the business's price list; otherwise the photos are kept
+  // and the technician fills the quote in. Either way it's a draft the technician edits before sending.
+  route('POST', '/api/quotes/from-photos', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req, 14_000_000);
+    const list = (Array.isArray(b.photos) ? b.photos : []).slice(0, 4);
+    if (!list.length) throw new HttpError(400, 'Add at least one photo.');
+    const r = b.request_id ? scoped('requests', b.request_id, t.id) : null;
+    if (b.request_id && !r) throw new HttpError(404, 'Request not found.');
+    const files = [];
+    try {
+      for (const d of list) { const f = saveImage(d, `t${t.id}-qp`, 4_000_000); if (!f) throw new HttpError(400, 'Use JPG, PNG or WebP photos.'); files.push(f); }
+    } catch (e) { for (const f of files) try { fs.unlinkSync(path.join(uploads, f)); } catch { /* gone */ } throw e; }
+    const note = clean(b.note, 1000), rig = clean(b.rig, 200) || r?.rig || '';
+    const products = db.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY name').all(t.id);
+    const hourly = customerTerms.parseProfile(t.legal_profile).hourlyRateCents || 0;
+    let ai = null, error = '';
+    if (!env.ANTHROPIC_API_KEY) error = 'not_configured';
+    else {
+      try {
+        const MIME = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+        const images = files.map((f) => ({ mediaType: MIME[f.split('.').pop()], data: fs.readFileSync(path.join(uploads, f)).toString('base64') }));
+        const out = await draftProposal({
+          apiKey: env.ANTHROPIC_API_KEY, model: env.ANTHROPIC_MODEL || 'claude-sonnet-5-5', apiBase: env.ANTHROPIC_API_BASE || 'https://api.anthropic.com',
+          images, note, rig, products, hourlyRateCents: hourly,
+          business: { name: t.name, servicePhrase: siteProfile.servicePhrase(siteProfile.parseProfile(t.site_profile)) },
+        });
+        ai = { ...normalizeDraft(out.draft, products, hourly), model: out.model };
+      } catch (e) { error = e.message; console.error('AI draft failed', e.message); }
+    }
+    const ins = db.prepare(`INSERT INTO quotes (tenant_id, token, request_id, title, customer_name, customer_phone, customer_email, location, rig, notes, terms, tax_rate_bp, deposit_credit_cents, photos, ai_draft) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(t.id, randomToken(), r?.id ?? null, ai?.title || 'Repair proposal', r?.name || '', r?.phone || '', r?.email || '', r?.location || '', rig, ai?.summary || note, t.terms || '', t.tax_rate_bp, paidDeposits(r?.id),
+        JSON.stringify(files.map((file) => ({ file, show: true }))),
+        JSON.stringify({ note, error, model: ai?.model || null, findings: ai?.findings || [], safety: ai?.safety || [], questions: ai?.questions || [], needs_price: (ai?.items || []).filter((i) => i.needs_price).map((i) => i.name), estimates: (ai?.items || []).filter((i) => i.estimate).map((i) => i.name), at: now() }));
+    const qid = Number(ins.lastInsertRowid);
+    const li = db.prepare('INSERT INTO quote_items (quote_id, product_id, name, description, qty, unit_cents, taxable, sort) VALUES (?,?,?,?,?,?,?,?)');
+    (ai?.items || []).forEach((it, i) => li.run(qid, it.product_id, it.name, it.description || '', it.qty, it.unit_cents, it.taxable, i));
+    setRequestStatus(r?.id, 'quoted', ['new', 'contacted']);
+    send(res, 201, quoteFull(scoped('quotes', qid, t.id)));
+  }, { auth: 'tenant' });
+
   route('GET', '/api/quotes/:id', async (req, res, p, url, { tenant: t }) => {
     const q = scoped('quotes', p.id, t.id); if (!q) throw new HttpError(404, 'Not found');
     send(res, 200, { ...quoteFull(q), proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, quoteTotals(q, getItems(q.id)).balance) });
@@ -721,6 +841,10 @@ export function createApp(env = process.env) {
       const pid = it.product_id && scoped('products', it.product_id, t.id) ? it.product_id : null;
       ins.run(q.id, pid, clean(it.name, 200), clean(it.description, 1000), Math.max(0, Math.min(10000, Number(it.qty) || 0)), cents(it.unit_cents), it.taxable ? 1 : 0, i);
     });
+    if (Array.isArray(b.photos)) {
+      const show = new Map(b.photos.map((ph) => [ph && ph.file, Boolean(ph && ph.show)]));
+      db.prepare('UPDATE quotes SET photos = ? WHERE id = ?').run(JSON.stringify(jparse(q.photos, []).map((ph) => ({ file: ph.file, show: show.has(ph.file) ? show.get(ph.file) : ph.show }))), q.id);
+    }
     refreshCredits(q.request_id);
     const fresh = scoped('quotes', q.id, t.id);
     send(res, 200, { ...quoteFull(fresh), proposal_url: `${baseUrl(req)}/p/${q.token}`, online: onlineQuote(t, quoteTotals(fresh, getItems(q.id)).balance) });
@@ -781,6 +905,19 @@ export function createApp(env = process.env) {
     db.prepare(`UPDATE tenants SET ${b.kind} = ? WHERE id = ?`).run(name, t.id);
     send(res, 200, publicTenant(getTenant(t.id)));
   }, { auth: 'owner' });
+
+  // Customers and who's subscribed
+  route('GET', '/api/customers', async (req, res, p, url, { tenant: t }) => {
+    send(res, 200, db.prepare('SELECT id, name, phone, email, email_opt_in, sms_opt_in, email_consent_at, sms_consent_at, email_unsubscribed_at, source, created_at FROM customers WHERE tenant_id = ? ORDER BY id DESC LIMIT 2000').all(t.id));
+  }, { auth: 'tenant' });
+  route('GET', '/api/customers.csv', async (req, res, p, url, { tenant: t }) => {
+    const rows = db.prepare('SELECT name, phone, email, email_opt_in, email_consent_at, email_unsubscribed_at, sms_opt_in, sms_consent_at, source, created_at FROM customers WHERE tenant_id = ? ORDER BY id').all(t.id);
+    const cell = (v) => { const x = String(v ?? ''); return /[",\n]/.test(x) || /^[=+\-@]/.test(x) ? `"${(/^[=+\-@]/.test(x) ? "'" : '') + x.replace(/"/g, '""')}"` : x; };
+    const head = ['name', 'phone', 'email', 'email_updates', 'email_consent_at', 'email_unsubscribed_at', 'texts', 'text_consent_at', 'source', 'added'];
+    const body = rows.map((r) => [r.name, r.phone, r.email, r.email_opt_in ? 'yes' : 'no', r.email_consent_at, r.email_unsubscribed_at, r.sms_opt_in ? 'yes' : 'no', r.sms_consent_at, r.source, r.created_at].map(cell).join(','));
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="customers.csv"', 'Cache-Control': 'no-store' });
+    res.end([head.join(','), ...body].join('\n') + '\n');
+  }, { auth: 'tenant' });
 
   // Website content and local search (each business edits its own)
   function websiteState(req, t) {
@@ -1214,7 +1351,28 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
         }
         throw new HttpError(404, 'Not found');
       }
+      let um;
+      if ((um = /^\/u\/([\w-]+)$/.exec(pathname))) {
+        // Email unsubscribe. GET shows a button (link scanners don't unsubscribe anyone); POST, from the
+        // button or a mail app's one-click unsubscribe, takes effect.
+        const c = db.prepare('SELECT * FROM customers WHERE unsub_token = ?').get(um[1]);
+        const t = c ? getTenant(c.tenant_id) : { name: platformName };
+        let done = false;
+        if (c && req.method === 'POST') { db.prepare('UPDATE customers SET email_opt_in = 0, email_unsubscribed_at = COALESCE(email_unsubscribed_at, ?), updated_at = ? WHERE id = ?').run(now(), now(), c.id); done = true; }
+        else if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
+        res.writeHead(c ? 200 : 404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders });
+        return res.end(renderUnsubscribe({ t, customer: c ? db.prepare('SELECT * FROM customers WHERE id = ?').get(c.id) : null, done, actionPath: `/u/${um[1]}` }));
+      }
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
+      if ((um = /^\/r\/([\w-]+)$/.exec(pathname))) {
+        const pay = getPayment(um[1]);
+        if (!pay || pay.status !== 'paid') throw new HttpError(404, 'This receipt isn’t available.');
+        const t = getTenant(pay.tenant_id);
+        const q = pay.quote_id ? db.prepare('SELECT * FROM quotes WHERE id = ?').get(pay.quote_id) : null;
+        const items = q ? getItems(q.id) : [];
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders });
+        return res.end(renderReceipt({ t, pay, quote: q, items, totals: q ? quoteTotals(q, items) : null, proposalUrl: q ? `/p/${q.token}` : '' }));
+      }
 
       const host = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
       // Send www.<platform domain> to the bare domain so search engines see one site.
@@ -1273,7 +1431,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
     }
   }
 
-  return { handler, db };
+  return { handler, db, outbox: notify.outbox };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
