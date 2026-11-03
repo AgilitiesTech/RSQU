@@ -58,7 +58,7 @@ const lookup = (who, token, extra = {}) => who('POST', '/api/public/affiliate-in
 const accept = (who, token, body) => who('POST', '/api/public/affiliate-invites/accept', { token, ...body });
 const MAC = sealer(KEY).fingerprint;
 const w9 = (over = {}) => ({ legal_name: 'Pat Example', business_name: '', tax_class: 'individual', address: '100 Main St', city: 'Morgan', state: 'UT', zip: '84050', tin_type: 'ssn', tin: SSN, tin_confirm: SSN, signature: 'Pat Example', certify: true, ...over });
-const ach = (over = {}) => ({ method: 'ach', bank: { holder: 'Pat Example', routing: ROUTING, account: ACCOUNT, account_confirm: ACCOUNT, type: 'checking', ...over } });
+const ach = (over = {}) => ({ method: 'ach', authorize: true, bank: { holder: 'Pat Example', routing: ROUTING, account: ACCOUNT, account_confirm: ACCOUNT, type: 'checking', ...over } });
 
 test('sealed values: round trip, bound to what they are and to the key', () => {
   assert.equal(sealer(''), null);
@@ -202,6 +202,7 @@ test('invitation: a person joins with a W-9 and direct deposit, gets a tracked l
   assert.equal((await join({ w9: w9({ tin: '000-00-0000', tin_confirm: '000-00-0000' }) })).json.field, 'tin');
   assert.equal((await join({ payout: ach({ routing: '123456789' }) })).json.field, 'routing');
   assert.equal((await join({ payout: {} })).json.field, 'payout_method');
+  assert.equal((await join({ payout: { ...ach(), authorize: false } })).json.field, 'authorize', 'direct deposit needs the authorization');
   assert.equal((await join({ agree: false })).json.field, 'agree');
   assert.equal(a.db.prepare('SELECT COUNT(*) AS n FROM affiliates').get().n, 0, 'nothing saved on a mistake');
 
@@ -213,6 +214,10 @@ test('invitation: a person joins with a W-9 and direct deposit, gets a tracked l
   assert.ok(a.outbox.some((m) => m.to === 'pat@example.test' && /Your HitchPoint referral link/.test(m.subject)));
   assert.ok(a.outbox.some((m) => /New affiliate: Pat Example/.test(m.subject)));
 
+  // What Pat agreed to is on record: the terms, the privacy policy, and the direct deposit authorization.
+  const patId = a.db.prepare(`SELECT id FROM users WHERE email = 'pat@example.test'`).get().id;
+  assert.deepEqual(a.db.prepare('SELECT doc, version FROM agreements WHERE user_id = ? ORDER BY id').all(patId).map((x) => `${x.doc}@${x.version}`),
+    ['affiliate-terms@2026-11-03.2', 'privacy@2026-11-03.2', 'ach-authorization@2026-11-03:x6789']);
   // Pat is logged in as a referral partner, not a business.
   const me = (await pat('GET', '/api/me')).json;
   assert.deepEqual([me.user.role, me.tenant, me.needs_agreements], ['affiliate', null, false]);
@@ -304,6 +309,7 @@ test('the affiliate updates its W-9 and payout details (password needed); admin 
 
   // Payout details: the password is required, and the affiliate is emailed about the change.
   assert.deepEqual((await lee('POST', '/api/affiliate/payout', { password: 'wrong', payout: ach() })).json.field, 'password');
+  assert.deepEqual((await lee('POST', '/api/affiliate/payout', { password: 'lee-password-1', payout: { ...ach(), authorize: false } })).json.field, 'authorize');
   const before = a.outbox.length;
   const changed = await lee('POST', '/api/affiliate/payout', { password: 'lee-password-1', payout: ach({ holder: 'Lee Example' }) });
   assert.equal(changed.status, 200, JSON.stringify(changed.json));

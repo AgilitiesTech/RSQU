@@ -1043,7 +1043,7 @@
   const todayIso = () => new Date().toISOString().slice(0, 10);
   const smoney = (c) => (c < 0 ? '-' : '') + money(Math.abs(c || 0));
   const signedCents = (v) => { const n = Math.round(parseFloat(String(v).replace(/[^0-9.-]/g, '')) * 100); return Number.isFinite(n) ? n : 0; };
-  const shareLine = (a, lead = 'You earn') => `${lead} ${pct(a.share_bp)} of the fee ${PLATFORM} keeps on card payments from each business you refer, ${a.months ? `for ${a.months} month${a.months === 1 ? '' : 's'} after it signs up` : `for as long as it uses ${PLATFORM}`}.`;
+  const shareLine = (a, lead = 'You earn') => `${lead} ${pct(a.share_bp)} of the fee ${PLATFORM} keeps on online payments (card or bank) from each business you refer, ${a.months ? `for ${a.months} month${a.months === 1 ? '' : 's'} after it signs up` : `for as long as it uses ${PLATFORM}`}.`;
   const affStat = (label, value, sub = '') => `<section class="card"><p class="muted small">${label}</p><p class="big-num">${value}</p>${sub ? `<p class="small muted">${sub}</p>` : ''}</section>`;
   // A table that becomes stacked rows on phones. cols: [label, className?]; rows: arrays of cell HTML.
   const affTable = (cols, rows, empty) => rows.length
@@ -1088,7 +1088,7 @@
 
   function affTermsCard(A, first) {
     const body = isSuper() ? '<p class="small muted">Only the business owner can accept these terms.</p>' : `
-      <label class="check"><input type="checkbox" id="aff-agree"> <span>I have read and agree to the <a href="${esc(A.terms.url)}" target="_blank" rel="noopener">Affiliate Program Terms</a>${A.kind === 'business' ? ' for my business' : ''}.</span></label>
+      <label class="check"><input type="checkbox" id="aff-agree"> <span>${agreeText(A.kind === 'business', A.terms.url)}</span></label>
       <p class="alert err" id="aff-terms-err" hidden></p>
       <div><button class="btn primary" type="button" id="aff-accept">${first ? 'Accept and get my link' : 'Accept the new terms'}</button></div>`;
     return `<section class="card stack">
@@ -1124,18 +1124,23 @@
     if (typeof RadioNodeList !== 'undefined' && x instanceof RadioNodeList) return x.value;
     return x.type === 'checkbox' ? x.checked : x.value;
   };
+  const W9_DATA = new Set(['legal_name', 'business_name', 'tax_class', 'llc_class', 'other_class', 'foreign_owners', 'exempt_payee_code', 'fatca_code', 'address', 'city', 'state', 'zip', 'tin_type', 'tin', 'tin_confirm']);
+  // One box covers age, authority to sign for a group or business, the terms and the privacy policy.
+  const agreeText = (biz, termsUrl = '/legal/affiliate-terms') => biz
+    ? `I’m at least 18 and authorized to sign for my business. On its behalf, I agree to the <a href="${esc(termsUrl)}" target="_blank" rel="noopener">Affiliate Program Terms</a> and have read the <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a>.`
+    : `I’m at least 18. I agree to the <a href="${esc(termsUrl)}" target="_blank" rel="noopener">Affiliate Program Terms</a> and have read the <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a>. If I’m signing up a group or company, I’m authorized to sign for it.`;
   const W9_KEYS = ['legal_name', 'business_name', 'tax_class', 'llc_class', 'other_class', 'foreign_owners', 'exempt_payee_code', 'fatca_code', 'address', 'city', 'state', 'zip', 'tin_type', 'tin', 'tin_confirm', 'backup_withholding', 'signature', 'certify'];
   const readW9 = (f) => Object.fromEntries(W9_KEYS.map((k) => [k, fval(f, k)]));
   const readPayout = (f) => {
     const method = fval(f, 'payout_method');
-    return { method, bank: method === 'ach' ? { holder: fval(f, 'holder'), routing: fval(f, 'routing'), account: fval(f, 'account'), account_confirm: fval(f, 'account_confirm'), type: fval(f, 'acct_type') } : null };
+    return { method, authorize: method === 'ach' && Boolean(fval(f, 'authorize')), bank: method === 'ach' ? { holder: fval(f, 'holder'), routing: fval(f, 'routing'), account: fval(f, 'account'), account_confirm: fval(f, 'account_confirm'), type: fval(f, 'acct_type') } : null };
   };
   const todayLong = () => new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
   // IRS Form W-9, line by line, with the form's own certification wording.
   function w9Fields(F, pre = {}) {
     const opt = (v, l, cur) => `<option value="${esc(v)}"${String(cur ?? '') === String(v) ? ' selected' : ''}>${esc(l)}</option>`;
     return `
-      <p class="small muted">IRS Form W-9 (${esc(F.revision)}) for ${esc(F.requester)}. We use it to report what we pay you, as the law requires. Your tax ID number is encrypted; afterward only its last 4 digits are shown.</p>
+      <p class="small muted">IRS Form W-9 (${esc(F.revision)}) for ${esc(F.requester)}. We use it only to report what we pay you, as the law requires. Your tax ID number is encrypted; afterward only its last 4 digits are shown. See our <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a>.</p>
       <div><label for="w-name">1. Name of entity/individual, as shown on your income tax return</label><input id="w-name" name="legal_name" required maxlength="120" autocomplete="name" value="${esc(pre.legal_name || '')}"><p class="small muted">A sole proprietor, or a single-member LLC that’s a disregarded entity, enters the owner’s own name.</p></div>
       <div><label for="w-biz">2. Business name/disregarded entity name, if different (optional)</label><input id="w-biz" name="business_name" maxlength="120" autocomplete="organization" value="${esc(pre.business_name || '')}"></div>
       <fieldset class="plain stack" style="gap:6px"><legend>3a. Federal tax classification (choose one)</legend>
@@ -1150,7 +1155,7 @@
           <div><label for="w-fatca">Exemption from FATCA reporting code (if any)</label><select id="w-fatca" name="fatca_code"><option value="">None</option>${F.fatca_codes.map((c) => opt(c, c, '')).join('')}</select></div>
         </div>
       </details>
-      <div><label for="w-addr">5. Address (number, street, and apt. or suite no.)</label><input id="w-addr" name="address" required maxlength="160" autocomplete="street-address"></div>
+      <div><label for="w-addr">5. Address (number, street, and apt. or suite no.)</label><input id="w-addr" name="address" required maxlength="160" autocomplete="street-address"><p class="small muted">We mail any Form 1099 to this address.</p></div>
       <div class="grid3">
         <div><label for="w-city">6. City</label><input id="w-city" name="city" required maxlength="80" autocomplete="address-level2"></div>
         <div><label for="w-state">State</label><select id="w-state" name="state" required autocomplete="address-level1"><option value="">State</option>${F.states.map((c) => opt(c, c, '')).join('')}</select></div>
@@ -1163,8 +1168,14 @@
           <div><label for="w-tin2">Type it again</label><input id="w-tin2" name="tin_confirm" required inputmode="numeric" maxlength="11" autocomplete="off" spellcheck="false"></div>
         </div>
         <p class="small muted">A sole proprietor can give an SSN or an EIN. Corporations, partnerships and LLCs taxed as one give an EIN.</p>
-      </fieldset>
-      <fieldset class="w9-cert stack"><legend>Part II. Certification</legend>
+      </fieldset>`;
+  }
+  // Part II of the W-9. The IRS requires the electronic signature to be the last thing entered, so
+  // this block always comes after every other W-9 line, and changing any line afterward clears it.
+  function w9SignFields(F) {
+    return `
+      <fieldset class="w9-cert stack"><legend>Part II. Certification: sign your W-9</legend>
+        <p class="small alert err w9-resign" hidden>You changed your W-9 after signing, so please sign it again.</p>
         <p><strong>${esc(F.certification.lead)}</strong></p>
         <ol>${F.certification.items.map((t) => `<li>${esc(t)}</li>`).join('')}</ol>
         <details><summary class="small" style="cursor:pointer">What “U.S. person” means</summary><p class="small">${esc(F.certification.usPerson)} If you aren’t a U.S. person, don’t use this form; email support@gethitchpoint.com.</p></details>
@@ -1188,6 +1199,7 @@
           <div><label for="b-acct2">Account number again</label><input id="b-acct2" name="account_confirm" inputmode="numeric" maxlength="17" autocomplete="off"></div>
         </div>
         <p class="small muted">Both numbers are at the bottom of a check or in your bank’s app. They’re encrypted; afterward only the last 4 digits of the account are shown.</p>
+        <label class="check"><input type="checkbox" name="authorize"> <span>I authorize Agilities Tech, LLC (HitchPoint) to deposit my referral payouts into this account by ACH. This stays in effect until I change my payout details or leave the program.</span></label>
       </div>`;
   }
   // Show the parts of the form that apply (LLC class, "Other", line 3b, bank fields). Hidden parts are
@@ -1206,10 +1218,21 @@
       const item2 = f.querySelectorAll('.w9-cert ol li')[1]; if (item2) item2.classList.toggle('struck', Boolean(fval(f, 'backup_withholding')));
       const ach = fval(f, 'payout_method') === 'ach';
       toggle('ach', ach);
-      ['holder', 'routing', 'account', 'account_confirm'].forEach((n) => { const x = f.elements.namedItem(n); if (x) x.required = ach; });
+      ['holder', 'routing', 'account', 'account_confirm', 'authorize'].forEach((n) => { const x = f.elements.namedItem(n); if (x) x.required = ach; });
     };
     f.addEventListener('change', sync);
     sync();
+    // A signature covers exactly what was on the form when it was signed: any later change clears it.
+    const unsign = (e) => {
+      if (!W9_DATA.has(e.target.name)) return;
+      const sig = f.elements.namedItem('signature'), cert = f.elements.namedItem('certify');
+      if (!(sig && sig.value) && !(cert && cert.checked)) return;
+      if (sig) sig.value = '';
+      if (cert) cert.checked = false;
+      const note = f.querySelector('.w9-resign'); if (note) note.hidden = false;
+    };
+    f.addEventListener('input', unsign);
+    f.addEventListener('change', unsign);
   }
   // Checks the browser can do before sending: required fields, and the typed-twice numbers match.
   function checkFields(scope, f) {
@@ -1241,13 +1264,13 @@
     try { [d, F] = await Promise.all([api('/api/public/affiliate-invites/lookup', { method: 'POST', body: { token }, quiet: true }), w9Form()]); }
     catch (e) { view.innerHTML = `<section class="card login stack">${brandHead}<h1>This invitation can’t be used</h1><p>${esc(e.message)}</p><p class="small">Already joined? <a href="#/login">Log in</a></p></section>`; return; }
     const span = d.months ? `for ${d.months} month${d.months === 1 ? '' : 's'} after each one signs up` : `for as long as each one uses ${PLATFORM}`;
-    const head = `${brandHead}<h1>Join the ${PLATFORM} referral program</h1><p>Earn <strong>${esc(pct(d.share_bp))}</strong> of the fee ${PLATFORM} keeps on card payments from each mobile RV repair business you refer, ${esc(span)}.</p>`;
+    const head = `${brandHead}<h1>Join the ${PLATFORM} referral program</h1><p>Earn <strong>${esc(pct(d.share_bp))}</strong> of the fee ${PLATFORM} keeps on online payments (card or bank) from each mobile RV repair business you refer, ${esc(span)}.</p>`;
     if (!d.tax_ready || d.account === 'blocked') {
       view.innerHTML = `<section class="card login stack" style="max-width:640px">${head}<p class="alert err">${d.account === 'blocked' ? `This email already has a ${PLATFORM} login that can’t be used for the referral program. Email support@gethitchpoint.com for help.` : 'We can’t take tax forms just yet. Please try this link again in a day or two.'}</p></section>`;
       return;
     }
     const biz = d.account === 'business';
-    const STEPS = ['About you', 'Tax form', 'Payouts', 'Agree'];
+    const STEPS = ['About you', 'Tax form', 'Payouts', 'Sign'];
     const other = me && me.user && me.user.email.toLowerCase() !== d.email.toLowerCase();
     view.innerHTML = `
       <section class="card stack join">
@@ -1257,6 +1280,7 @@
           <li>We pay monthly once you have ${money(d.min_payout_cents)} or more, by direct deposit or check.</li>
           <li>When you share your link, you tell people you earn a share.</li>
         </ul>
+        <p class="small muted">We use what you enter here only to run the referral program, pay you, and file tax forms. See our <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a> and the <a href="${esc(d.terms_url)}" target="_blank" rel="noopener">Affiliate Program Terms</a>.</p>
         <p class="small muted">Invitation for <strong>${esc(d.email)}</strong>. It works until ${esc(affDate(d.expires_at))}. Have your Social Security number or EIN ready, and your bank’s routing and account numbers for direct deposit.${other ? ` You’re logged in as ${esc(me.user.email)}; finishing logs you in as ${esc(d.email)}.` : ''}</p>
         <ol class="join-steps" aria-label="Steps">${STEPS.map((x, i) => `<li>${i + 1}. ${x}</li>`).join('')}</ol>
         <form class="stack" id="jf" novalidate>
@@ -1264,7 +1288,7 @@
             <h2>About you</h2>
             ${biz ? `<p>This email already has a ${PLATFORM} login for <strong>${esc(d.business_name)}</strong>, so your business will be the affiliate.</p>` : `
             <div><label for="j-name">Your name, or your group’s or company’s name</label><input id="j-name" name="name" required maxlength="120" autocomplete="name"><p class="small muted">Businesses you refer see this name.</p></div>
-            <div><label for="j-phone">Phone (optional, for payout questions)</label><input id="j-phone" name="phone" type="tel" maxlength="40" autocomplete="tel"></div>`}
+            <div><label for="j-phone">Phone (optional)</label><input id="j-phone" name="phone" type="tel" maxlength="40" autocomplete="tel"><p class="small muted">We’ll only call or text you about your account and payouts. Never marketing.</p></div>`}
             <div><label for="j-aud">Where will you share your link? (optional)</label><textarea id="j-aud" name="audience" rows="2" maxlength="500" placeholder="For example: my RV owners group, our campground newsletter, techs I know"></textarea></div>
             <div><label for="j-code">Your link</label><div class="aff-link"><span class="small muted" style="align-self:center;overflow-wrap:anywhere">${esc(d.link_base)}</span><input id="j-code" name="code" required maxlength="40" autocapitalize="none" spellcheck="false" value="${esc(d.suggested_code)}" style="flex:1 1 140px"></div><p class="small muted" id="j-code-note">Lowercase letters, numbers and dashes. Businesses can also type it as a referral code when they sign up.</p></div>
             <div><label for="j-pw">${biz ? `Your ${PLATFORM} password` : 'Choose a password (10 or more characters)'}</label><input id="j-pw" name="password" type="password" required ${biz ? '' : 'minlength="10"'} autocomplete="${biz ? 'current-password' : 'new-password'}"><p class="small muted">${biz ? 'The one you use to log in to your business dashboard.' : `You’ll log in with ${esc(d.email)} and this password to see your clicks and earnings.`}</p></div>
@@ -1272,9 +1296,10 @@
           <section class="stack" data-step="1" hidden><h2>Tax form (W-9)</h2>${w9Fields(F)}</section>
           <section class="stack" data-step="2" hidden><h2>How we pay you</h2>${payoutFields()}</section>
           <section class="stack" data-step="3" hidden>
-            <h2>Check and agree</h2>
+            <h2>Check, agree and sign</h2>
             <dl class="kv" id="j-review"></dl>
-            <label class="check"><input type="checkbox" name="agree" required> <span>I have read and agree to the <a href="${esc(d.terms_url)}" target="_blank" rel="noopener">Affiliate Program Terms</a>${biz ? ' for my business' : ''}.</span></label>
+            <label class="check"><input type="checkbox" name="agree" required> <span>${agreeText(biz, d.terms_url)}</span></label>
+            ${w9SignFields(F)}
           </section>
           <p class="alert err" id="j-err" hidden></p>
           <div class="row between"><button class="btn ghost" type="button" id="j-back" hidden>Back</button><span></span><button class="btn primary" type="submit" id="j-next">Next</button></div>
@@ -1300,7 +1325,7 @@
       sections.forEach((x, i) => { x.hidden = i !== n; });
       dots.forEach((li, i) => { li.classList.toggle('done', i < n); if (i === n) li.setAttribute('aria-current', 'step'); else li.removeAttribute('aria-current'); });
       document.getElementById('j-back').hidden = n === 0;
-      document.getElementById('j-next').textContent = n === sections.length - 1 ? 'Join and get my link' : 'Next';
+      document.getElementById('j-next').textContent = n === sections.length - 1 ? 'Sign and join' : 'Next';
       if (n === sections.length - 1) review();
       err.hidden = true;
       f.closest('.join').scrollIntoView({ block: 'start' });
@@ -1323,6 +1348,7 @@
       btn.disabled = true; btn.textContent = 'Joining…';
       try {
         const body = { name: fval(f, 'name'), phone: fval(f, 'phone'), audience: fval(f, 'audience'), code: fval(f, 'code'), password: fval(f, 'password'), agree: fval(f, 'agree'), w9: readW9(f), payout: readPayout(f) };
+        if (!body.w9.signature || !body.w9.certify) { show(sections.length - 1); flash(err, 'Sign your W-9 at the bottom of this step.', 'err'); btn.disabled = false; btn.textContent = 'Sign and join'; return; }
         const r = await api('/api/public/affiliate-invites/accept', { method: 'POST', body: { token, ...body }, quiet: true });
         me = null;
         const line = shareText(biz ? 'business' : 'person');
@@ -1343,7 +1369,7 @@
         document.getElementById('j-copy-line').addEventListener('click', (ev) => copy(`${line} ${r.link}`, ev.currentTarget));
         document.getElementById('j-open').addEventListener('click', async (ev) => { ev.preventDefault(); await loadMe(); location.hash = '#/affiliate'; route(); });
       } catch (ex) {
-        btn.disabled = false; btn.textContent = 'Join and get my link';
+        btn.disabled = false; btn.textContent = 'Sign and join';
         const node = markField(f, ex, err);
         const sec = node && node.closest('[data-step]');
         if (sec) { show(sections.indexOf(sec)); flash(err, ex.message, 'err'); node.focus(); }
@@ -1373,7 +1399,7 @@
           : T.w9_on_paper ? '<p>We have a paper W-9 from you. If your name, address or tax ID changed, fill out a new one here.</p>' : '<p>We need a W-9 before we can pay you. It takes about 5 minutes.</p>'}
         ${W && W.backup_withholding ? '<p class="alert err">You told us the IRS has you on backup withholding, so we may have to hold back part of each payout for the IRS.</p>' : ''}
         ${T.ready && !isSuper() ? `<div><button class="btn ${W ? 'ghost' : 'primary'}" type="button" data-open="w9f">${W || T.w9_on_paper ? 'Fill out a new W-9' : 'Fill out the W-9'}</button></div>
-        <form class="stack" id="w9f" hidden novalidate>${w9Fields(F, W ? { legal_name: W.legal_name, business_name: W.business_name } : {})}${pwField('w9-pw')}
+        <form class="stack" id="w9f" hidden novalidate>${w9Fields(F, W ? { legal_name: W.legal_name, business_name: W.business_name } : {})}${pwField('w9-pw')}${w9SignFields(F)}
           <p class="alert err" id="w9-err" hidden></p>
           <div class="row" style="gap:8px"><button class="btn primary" type="submit">Sign and send W-9</button><button class="btn ghost" type="button" data-close="w9f">Cancel</button></div>
         </form>` : ''}
@@ -1572,7 +1598,7 @@
     view.innerHTML = `
       <div class="row between"><h1>Affiliates</h1>
         <div class="row" style="gap:8px"><select id="aff-year" aria-label="Year for the 1099 export" style="width:auto">${d.years.map((y) => `<option>${esc(y)}</option>`).join('')}</select><a class="btn ghost sm" id="aff-1099" href="/api/super/affiliate-payouts.csv?year=${esc(d.years[0])}">Download payouts for 1099s</a></div></div>
-      <p class="muted">Affiliates earn a share of ${PLATFORM}’s fee on card payments from businesses they refer. New earnings are pending for 30 days, then available. Pay them by ACH or check, then record the payout on their page.</p>
+      <p class="muted">Affiliates earn a share of ${PLATFORM}’s fee on online payments (card or bank) from businesses they refer. New earnings are pending for 30 days, then available. Pay them by ACH or check, then record the payout on their page.</p>
       ${d.tax_ready ? '' : `<section class="card stack" id="key-setup">
         <h2>First, turn on secure storage for tax forms</h2>
         <p>Affiliates give you their Social Security number or EIN and their bank details. ${PLATFORM} encrypts them with a secret key that’s kept in Render, not in the database. Invitations stay off until the key is set.</p>
