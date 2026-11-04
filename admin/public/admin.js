@@ -85,6 +85,11 @@
     if (!res.ok) { const e = new Error(data.error || 'Something went wrong.'); e.data = data; throw e; }
     return data;
   }
+  // An error next to the button that caused it, scrolled into view (on a phone it could be off screen).
+  function showError(el, msg) {
+    flash(el, msg, 'err');
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
   function flash(el, msg, kind = 'ok') {
     if (!el) return;
     el.className = 'alert ' + kind; el.textContent = msg; el.hidden = false;
@@ -282,8 +287,8 @@
         <p class="small"><strong>Have ready:</strong> your legal or business name, EIN or SSN, business address, bank routing and account numbers, and a photo ID.</p>
         <p class="small muted">Processing Fee on each online payment: Stripe’s fee (billed to you by Stripe) plus ${PLATFORM}’s 3%. Cash and check payments have no fee. See the <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>.</p>
         ${sub === 'return' ? '<p class="alert err">Stripe still needs a few details. Pick up where you left off.</p>' : ''}
-        <p class="alert err" id="ob-err" hidden></p>
         <button class="btn primary block" type="button" id="ob-go">Connect with Stripe</button>
+        <p class="alert err" id="ob-err" role="alert" hidden></p>
         <a class="btn ghost block" href="#/requests">Not now, open my dashboard</a>
         <p class="small muted">Until you connect, customers pay you by cash or check, and everything else works as usual.</p>
         <button class="linkbtn" type="button" id="ob-out">Log out</button>
@@ -292,7 +297,7 @@
     go.addEventListener('click', async () => {
       go.disabled = true; go.textContent = 'Opening Stripe…';
       try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); if (!openOutside(url, { stripe: true })) location.href = url; }
-      catch (err) { flash(document.getElementById('ob-err'), err.message, 'err'); go.disabled = false; go.textContent = 'Connect with Stripe'; }
+      catch (err) { showError(document.getElementById('ob-err'), err.message); go.disabled = false; go.textContent = 'Try again'; }
     });
     document.getElementById('ob-out').addEventListener('click', logout);
   }
@@ -1934,7 +1939,7 @@
     if (c) c.addEventListener('click', async () => {
       c.disabled = true; c.textContent = 'Opening Stripe…';
       try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); if (!openOutside(url, { stripe: true })) location.href = url; }
-      catch (err) { flash(document.getElementById('st-msg'), err.message, 'err'); c.disabled = false; c.textContent = 'Connect with Stripe'; }
+      catch (err) { showError(document.getElementById('st-msg'), err.message); c.disabled = false; c.textContent = 'Try again'; }
     });
     const bank = document.getElementById('bank');
     if (bank) bank.addEventListener('click', async () => {
