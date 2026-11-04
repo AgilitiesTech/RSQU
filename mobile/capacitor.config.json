@@ -1,0 +1,23 @@
+{
+  "appId": "com.gethitchpoint.app",
+  "appName": "HitchPoint",
+  "webDir": "www",
+  "appendUserAgent": "HitchPointApp/1.0",
+  "backgroundColor": "#16302A",
+  "server": {
+    "url": "https://gethitchpoint.com/admin/",
+    "allowNavigation": ["gethitchpoint.com"],
+    "errorPath": "offline.html"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 1200,
+      "launchAutoHide": true,
+      "backgroundColor": "#16302A",
+      "showSpinner": false
+    }
+  },
+  "ios": {
+    "scheme": "HitchPoint"
+  }
+}

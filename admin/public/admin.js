@@ -29,6 +29,41 @@
   const PLATFORM = 'HitchPoint';
   // The HitchPoint mark: a folk pine of chevrons inside a map pin, with an orange sun (colors for the dark header).
   const HP_MARK = '<svg class="hp-mark" viewBox="12 7 40 53" aria-hidden="true"><path d="M32 59C29.6 55.4 13 41.2 13 27a19 19 0 0 1 38 0c0 14.2-16.6 28.4-19 32z" fill="#FBF7F0"/><circle cx="43" cy="17" r="3.2" fill="#FF7A1A"/><path d="M32 10L38.5 19.5L35.62 19.5L32 13.68L28.38 19.5L25.5 19.5ZM32 16L41.5 26.5L38.44 26.5L32 19.91L25.56 26.5L22.5 26.5ZM32 22.5L44.5 34L41.26 34L32 26.64L22.74 34L19.5 34Z" fill="#16302A"/><path d="M30.3 31h3.4v10a1.7 1.7 0 0 1-3.4 0z" fill="#FF7A1A"/></svg>';
+
+  // ---------- inside the HitchPoint phone app (iPhone and Android) ----------
+  // None of this runs in a browser. In the app, other websites (Stripe, maps, Google) and public pages
+  // meant for a new tab (legal pages, the business's website, proposals) open in the in-app browser,
+  // so the dashboard stays put underneath. Pages that need the login (photos, W-9s) open in place;
+  // swipe back on iPhone, or use the back button on Android.
+  const NATIVE = Boolean(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function' && window.Capacitor.isNativePlatform());
+  const NATIVE_BROWSER = NATIVE && window.Capacitor.Plugins ? window.Capacitor.Plugins.Browser : null;
+  let stripeOpened = false;
+  function openOutside(url, opts = {}) {
+    if (!NATIVE_BROWSER) return false;
+    if (opts.stripe) stripeOpened = true;
+    NATIVE_BROWSER.open({ url: new URL(url, location.href).href }).catch(() => { location.href = url; });
+    return true;
+  }
+  if (NATIVE) {
+    document.documentElement.classList.add('in-app');
+    document.addEventListener('click', (e) => {
+      const a = e.target.closest ? e.target.closest('a[href]') : null;
+      if (!a || e.defaultPrevented || a.hasAttribute('download')) return;
+      let u; try { u = new URL(a.getAttribute('href'), location.href); } catch { return; }
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return; // tel:, sms: and mailto: go to the phone's own apps
+      const sameSite = u.origin === location.origin;
+      if (sameSite && a.target !== '_blank') return; // ordinary dashboard links
+      e.preventDefault();
+      if (sameSite && u.pathname.startsWith('/api/')) location.assign(u.href); // needs the login, so open in place
+      else openOutside(u.href);
+    }, true);
+    // Back from Stripe's pages (or any in-app browser page): refresh, so Stripe status is current.
+    if (NATIVE_BROWSER && NATIVE_BROWSER.addListener) NATIVE_BROWSER.addListener('browserFinished', () => {
+      const check = stripeOpened ? api('/api/stripe/refresh', { method: 'POST', quiet: true }).catch(() => {}) : Promise.resolve();
+      stripeOpened = false;
+      check.then(() => loadMe()).then(() => route()).catch(() => {});
+    });
+  }
   const FEE_TEXT = (bp) => `Stripe’s fee + ${pct(bp)}`;
   const LEGAL = '<a href="/legal/terms" target="_blank" rel="noopener">Terms of Service</a>, <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a> and <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>';
   const isSuper = () => me && me.user.role === 'super';
@@ -256,7 +291,7 @@
     const go = document.getElementById('ob-go');
     go.addEventListener('click', async () => {
       go.disabled = true; go.textContent = 'Opening Stripe…';
-      try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); location.href = url; }
+      try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); if (!openOutside(url, { stripe: true })) location.href = url; }
       catch (err) { flash(document.getElementById('ob-err'), err.message, 'err'); go.disabled = false; go.textContent = 'Connect with Stripe'; }
     });
     document.getElementById('ob-out').addEventListener('click', logout);
@@ -542,8 +577,8 @@
     const show = document.getElementById('q-show');
     if (show) show.addEventListener('click', async () => {
       if (items.some((it) => it.name.trim() && !it.unit_cents) && !confirm(`Some lines are $0. Show the ${noun} anyway?`)) return;
-      const w = window.open('', '_blank');
-      try { const saved = await save(); if (w) w.location = saved.proposal_url; else location.href = saved.proposal_url; quoteView(id); }
+      const w = NATIVE ? null : window.open('', '_blank');
+      try { const saved = await save(); if (w) w.location = saved.proposal_url; else if (!openOutside(saved.proposal_url)) location.href = saved.proposal_url; quoteView(id); }
       catch (err) { if (w) w.close(); flash(msg, err.message, 'err'); }
     });
     view.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.copy, b)));
@@ -1898,12 +1933,12 @@
     const c = document.getElementById('connect');
     if (c) c.addEventListener('click', async () => {
       c.disabled = true; c.textContent = 'Opening Stripe…';
-      try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); location.href = url; }
+      try { const { url } = await api('/api/stripe/connect', { method: 'POST' }); if (!openOutside(url, { stripe: true })) location.href = url; }
       catch (err) { flash(document.getElementById('st-msg'), err.message, 'err'); c.disabled = false; c.textContent = 'Connect with Stripe'; }
     });
     const bank = document.getElementById('bank');
     if (bank) bank.addEventListener('click', async () => {
-      try { const { url } = await api('/api/stripe/dashboard', { method: 'POST' }); window.open(url, '_blank', 'noopener'); }
+      try { const { url } = await api('/api/stripe/dashboard', { method: 'POST' }); if (!openOutside(url, { stripe: true })) window.open(url, '_blank', 'noopener'); }
       catch (err) { flash(document.getElementById('st-msg'), err.message, 'err'); }
     });
     api('/api/payments').then((rows) => {
@@ -2597,7 +2632,7 @@
   const tipKey = 'hp-install-tip';
   function installTip() {
     try { if (localStorage.getItem(tipKey) === 'hidden') return; } catch { /* storage blocked: show it */ }
-    const installed = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    const installed = NATIVE || window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
     if (installed || !window.matchMedia('(max-width: 720px)').matches) return;
     const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
     const how = installPrompt ? '' : ios ? ' In Safari, tap the Share button, then “Add to Home Screen”.' : ' Open your browser menu, then tap “Add to Home screen” or “Install app”.';

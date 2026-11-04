@@ -1,0 +1,25 @@
+{
+  "name": "hitchpoint-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HitchPoint for iPhone and Android: the HitchPoint dashboard in a native app shell (Capacitor).",
+  "scripts": {
+    "sync": "cap sync",
+    "icons": "capacitor-assets generate --ios --android --iconBackgroundColor '#1F3D35' --iconBackgroundColorDark '#16302A' --splashBackgroundColor '#16302A' --splashBackgroundColorDark '#16302A'",
+    "open:ios": "cap open ios",
+    "open:android": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.3",
+    "@capacitor/app": "8.1.2",
+    "@capacitor/browser": "8.0.5",
+    "@capacitor/core": "8.5.3",
+    "@capacitor/ios": "8.5.3",
+    "@capacitor/splash-screen": "8.0.2",
+    "@capacitor/status-bar": "8.0.4"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "3.0.5",
+    "@capacitor/cli": "8.5.3"
+  }
+}

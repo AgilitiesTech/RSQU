@@ -1603,8 +1603,8 @@ export function createApp(env = process.env) {
 
   // ---------- owner features: install on phone ----------
   // The installable dashboard: web app manifest, service worker (scope /admin/) and offline page.
-  const APP_FILES = { '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/admin/sw.js': ['sw.js', 'text/javascript; charset=utf-8'], '/admin/offline.html': ['offline.html', 'text/html; charset=utf-8'] };
-  ownerPages.push([/^\/manifest\.webmanifest$|^\/admin\/(sw\.js|offline\.html)$/, (req, res, m) => {
+  const APP_FILES = { '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'], '/admin/sw.js': ['sw.js', 'text/javascript; charset=utf-8'], '/admin/app-done.html': ['app-done.html', 'text/html; charset=utf-8'], '/admin/offline.html': ['offline.html', 'text/html; charset=utf-8'] };
+  ownerPages.push([/^\/manifest\.webmanifest$|^\/admin\/(sw\.js|offline\.html|app-done\.html)$/, (req, res, m) => {
     const [file, type] = APP_FILES[m[0]];
     res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache', ...securityHeaders, ...(file === 'sw.js' ? { 'Service-Worker-Allowed': '/admin/' } : {}) });
     res.end(fs.readFileSync(path.join(PUBLIC, file)));
@@ -2478,7 +2478,12 @@ export function createApp(env = process.env) {
       }
       acct = await creatingAccount.get(t.id);
     }
-    const link = await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
+    // In the phone app, Stripe opens in the in-app browser (which isn't logged in), so Stripe sends the
+    // owner to a short "tap Done" page; closing it takes them back to the app, which refreshes their status.
+    const inApp = /HitchPointApp\//.test(String(req.headers['user-agent'] || ''));
+    const link = inApp
+      ? await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/app-done.html?expired=1`, returnUrl: `${baseUrl(req)}/admin/app-done.html` })
+      : await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
     send(res, 200, { url: link.url });
   }, { auth: 'owner', onboarding: true });
   route('POST', '/api/stripe/refresh', async (req, res, p, url, { tenant: t }) => {
