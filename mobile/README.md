@@ -28,6 +28,14 @@ The dashboard (`admin/public/admin.js`) notices it's running in the app and:
 
 The app adds `HitchPointApp/1.0` to its browser identity, which is how the server tells the app apart.
 
+## Google Play builds and the upload key
+
+GitHub builds the Google Play app bundle (`app-release.aab`) on main and whenever someone clicks **Run workflow** on the Phone apps workflow. It's saved under **Artifacts** on the run's page for 90 days. Each build's version code is the run number, so every upload is higher than the last.
+
+The bundle is signed with HitchPoint's **upload key**, `android/upload-keystore.p12`. The key file is locked with the `ANDROID_UPLOAD_PASSWORD` repository secret, and that password lives only in that secret and Aaron's password manager. The first run on main after the secret is added creates the key and commits it with `[skip render]`. Google Play App Signing holds the real app signing key; if the upload key or its password is ever lost, the account owner can ask Google for an upload key reset in Play Console → Test and release → App integrity.
+
+On pull requests, the workflow checks that a release build signs using a throwaway key that it deletes afterwards.
+
 ## Build it yourself
 
 ```bash
@@ -47,7 +55,7 @@ Both stores reject apps that are only a website in a frame, and both require a w
 3. **Links that open the app**: password reset, invitations and Stripe returns open in the app instead of the browser (Apple universal links and Android App Links). Needs the Apple Team ID and the Android signing certificate fingerprint.
 4. **A reviewer login** with example requests, quotes and a schedule, plus review notes.
 5. **Store listings**: screenshots, descriptions, privacy answers (Apple's App Privacy labels, Google's Data safety form) and the privacy policy link (https://gethitchpoint.com/legal/privacy).
-6. **Signing and upload**: an App Store Connect API key and Android upload key stored as GitHub secrets, so builds go to TestFlight and Google Play's internal test track from GitHub (no Mac needed).
+6. **Signing and upload**: Android signing is set up (above); the first bundle is uploaded by hand in Play Console. Still to do: an App Store Connect API key for TestFlight, and a Google Play service account so later Android builds upload from GitHub.
 
 ## Accounts Agilities needs first
 

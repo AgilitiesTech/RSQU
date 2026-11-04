@@ -12,4 +12,6 @@ ios/DerivedData/
 *.jks
 *.p8
 *.p12
+# ...except HitchPoint's upload key, which is locked with the ANDROID_UPLOAD_PASSWORD GitHub secret
+!android/upload-keystore.p12
 *.mobileprovision
