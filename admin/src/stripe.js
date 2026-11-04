@@ -174,8 +174,21 @@ export function stripeClient(env) {
     // so the business is the merchant of record and Checkout shows its branding. The platform's
     // share is collected as an application fee. No payment_method_types: Checkout offers whatever
     // the business turned on in its Stripe Dashboard (cards, ACH, Affirm, Klarna, ...).
-    createCheckout({ account, name, amountCents, applicationFeeCents, successUrl, cancelUrl, ref, email, statementName, metadata = {} }) {
+    // Page settings below come from Stripe Checkout Studio (Nov 4, 2026). `hosted_page` needs API
+    // version 2026-03-25.dahlia or later (the platform account's default is 2026-10-28.endive).
+    // origin_context 'mobile_app' opts into Stripe's app-to-web checkout, so it's only sent when the
+    // HitchPoint app itself started the payment; customers paying from a browser get 'web'.
+    // No payment_method_collection: Stripe only allows it in subscription mode.
+    createCheckout({ account, name, amountCents, applicationFeeCents, successUrl, cancelUrl, ref, email, statementName, metadata = {}, fromApp = false }) {
       return call('POST', '/v1/checkout/sessions', {
+        ui_mode: 'hosted_page',
+        billing_address_collection: 'auto',
+        phone_number_collection: { enabled: false },
+        automatic_tax: { enabled: false },
+        allow_promotion_codes: false,
+        submit_type: 'auto',
+        integration_identifier: 'hosted_mobile_app_0001',
+        origin_context: fromApp ? 'mobile_app' : 'web',
         mode: 'payment',
         success_url: successUrl,
         cancel_url: cancelUrl,
