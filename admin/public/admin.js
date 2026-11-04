@@ -284,7 +284,8 @@
         <h1>${legacy ? 'Move payments to your own Stripe account' : 'Connect your Stripe account'}</h1>
         ${legacy ? '<p class="alert ok">Customers now pay your business directly, so your business is the seller of record for its own sales. Connect your own Stripe account to keep taking online payments. Payments you already received still pay out to your old account.</p>' : ''}
         <p>Your customers pay <strong>your business</strong> directly through your own Stripe account, and Stripe pays out to your bank. Your business name appears on their card statement, and you handle your own refunds, disputes and sales tax from your Stripe Dashboard. It takes about 10 minutes.</p>
-        <p class="small"><strong>Have ready:</strong> your legal or business name, EIN or SSN, business address, bank routing and account numbers, and a photo ID.</p>
+        <div class="alert ok" style="font-weight:400"><strong>Already have a Stripe account?</strong> When Stripe opens, sign in with it (the same email and password you use at stripe.com). Stripe then offers to copy your business details and bank account from that account, so there’s little to retype. Stripe keeps your ${PLATFORM} payments in their own account under the same login; you switch between them in your Stripe Dashboard.</div>
+        <p class="small"><strong>New to Stripe? Have ready:</strong> your legal or business name, EIN or SSN, business address, bank routing and account numbers, and a photo ID.</p>
         <p class="small muted">Processing Fee on each online payment: Stripe’s fee (billed to you by Stripe) plus ${PLATFORM}’s 3%. Cash and check payments have no fee. See the <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>.</p>
         ${sub === 'return' ? '<p class="alert err">Stripe still needs a few details. Pick up where you left off.</p>' : ''}
         <button class="btn primary block" type="button" id="ob-go">Connect with Stripe</button>
@@ -1909,7 +1910,7 @@
         ${!st.platform_ready ? '<p>Online payments aren’t switched on yet. You’ll be notified when they are.</p>' :
           st.payouts_enabled ? `<p class="alert ok">Card payments are on. Customers pay your business directly and Stripe pays out to your bank${st.test_mode ? ' (test mode: no real money moves)' : ''}.</p>` :
           st.details_submitted ? '<p class="alert ok">Details submitted. Stripe is verifying them; card payments turn on as soon as that’s done.</p>' :
-          '<p>Connect your Stripe account so customers can pay you online.</p>'}
+          '<p>Connect your Stripe account so customers can pay you online. Already have one? Sign in with it when Stripe opens, and Stripe offers to copy your business details and bank account.</p>'}
         ${isOwner() && st.platform_ready ? `<div class="row">${st.account && st.details_submitted ? '<button class="btn" type="button" id="bank">Open your Stripe Dashboard</button>' : ''}${!st.details_submitted ? '<button class="btn primary" type="button" id="connect">Connect with Stripe</button>' : ''}</div>` : ''}
         <p class="small muted">Your business is the seller of record: refunds, disputes and payouts are managed in your Stripe Dashboard. Processing Fee on online payments: Stripe’s fee (billed by Stripe) plus ${FEE_TEXT(pf.bp).replace(/^Stripe’s fee \+ /, '')}. Cash and check payments have no fee. <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment terms</a></p>
         <p class="alert" id="st-msg" hidden></p>
