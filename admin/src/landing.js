@@ -41,7 +41,7 @@ export function renderLanding({ origin, name = BRAND.name, email }) {
   const title = `${name}: Software for Mobile RV & Trailer Repair Techs`;
   const description = 'Branded website, job inbox, onsite quotes with e-signature, deposits, and direct-deposit payouts for mobile RV and trailer repair technicians. No monthly fee.';
   const ld = [
-    { '@context': 'https://schema.org', '@type': 'Organization', '@id': url + '#org', name, url, logo: origin + '/favicon.svg', email, description: BRAND.tagline, parentOrganization: { '@type': 'Organization', name: 'Agilities', url: 'https://agilitiestech.com' } },
+    { '@context': 'https://schema.org', '@type': 'Organization', '@id': url + '#org', name, url, logo: { '@type': 'ImageObject', url: origin + '/static/brand/logo-512.png', width: 512, height: 512 }, email, description: BRAND.tagline, parentOrganization: { '@type': 'Organization', name: 'Agilities', url: 'https://agilitiestech.com' } },
     { '@context': 'https://schema.org', '@type': 'WebSite', '@id': url + '#site', name, url, publisher: { '@id': url + '#org' } },
     {
       '@context': 'https://schema.org', '@type': 'SoftwareApplication', name, url, applicationCategory: 'BusinessApplication', operatingSystem: 'Web browser on phone, tablet or computer',
@@ -92,6 +92,7 @@ export function renderLanding({ origin, name = BRAND.name, email }) {
 <link rel="canonical" href="${esc(url)}">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <meta name="theme-color" content="#0E2236">
+<link rel="icon" href="/favicon.ico" sizes="48x48">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="${esc(name)}">

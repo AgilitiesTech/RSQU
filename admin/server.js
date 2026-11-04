@@ -2723,7 +2723,7 @@ export function createApp(env = process.env) {
   }, { auth: 'super' });
 
   // ---------- static pages ----------
-  const types = { '.txt': 'text/plain; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg' };
+  const types = { '.txt': 'text/plain; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
   const securityHeaders = {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'same-origin',
@@ -2902,7 +2902,8 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
         return send(res, 200, sitemapXml(siteOrigin(req), hosted), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
       }
       if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req), platformEmail), { 'Cache-Control': 'public, max-age=3600' });
-      if (pathname === '/favicon.ico' || pathname === '/favicon.svg') return serveFile(res, 'brand/favicon.svg');
+      if (pathname === '/favicon.svg') return serveFile(res, 'brand/favicon.svg');
+      if (pathname === '/favicon.ico') return serveFile(res, 'brand/favicon.ico');
       if (pathname === '/healthz') return send(res, 200, 'ok');
       if (pathname === '/admin' || pathname === '/admin/') return serveFile(res, 'admin.html');
       if (pathname === '/signup') { res.writeHead(302, { Location: '/admin/#/signup' }); return res.end(); }
