@@ -1722,6 +1722,9 @@ test('static pages, legal pages and seed script', async () => {
   assert.match((await anon('GET', '/robots.txt')).text, /Sitemap: .*\/sitemap\.xml/);
   assert.match((await anon('GET', '/sitemap.xml')).text, /<urlset/);
   assert.match((await anon('GET', '/llms.txt')).text, /# HitchPoint/);
+  // The platform owner's email never appears on public pages.
+  assert.doesNotMatch(home.text, /mailto:|aaron@/i, 'no contact email on the home page');
+  assert.doesNotMatch((await anon('GET', '/llms.txt')).text, /aaron@|Contact:/i, 'no contact email in llms.txt');
   for (const p of ['/admin/', '/favicon.svg', '/static/brand/og.png', '/static/landing.js', '/p/abc', '/pay/abc', '/static/app.css', '/static/admin.js', '/static/site.js', '/legal/terms', '/legal/privacy', '/legal/payment-terms', '/legal/customer-terms']) {
     assert.equal((await fetch(base + p)).status, 200, p);
   }

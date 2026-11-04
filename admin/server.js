@@ -2887,7 +2887,8 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if (pathname === '/') {
         if (domainTenant) return serveSite(req, res, domainTenant, true);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300', ...securityHeaders });
-        return res.end(renderLanding({ origin: siteOrigin(req), name: platformName, email: platformEmail }));
+        // No contact email on public pages: the owner's address stays private. Visitors use sign-up or the call-back form.
+        return res.end(renderLanding({ origin: siteOrigin(req), name: platformName }));
       }
       if (domainTenant && pathname === '/robots.txt') return send(res, 200, tenantRobots(`https://${domainTenant.custom_domain}`), { 'Cache-Control': 'public, max-age=3600' });
       if (domainTenant && pathname === '/sitemap.xml') {
@@ -2901,7 +2902,7 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
           .flatMap((t) => sitePages(t, siteProfile.parseProfile(t.site_profile), baseUrl(req), activeProducts(t)));
         return send(res, 200, sitemapXml(siteOrigin(req), hosted), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
       }
-      if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req), platformEmail), { 'Cache-Control': 'public, max-age=3600' });
+      if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req)), { 'Cache-Control': 'public, max-age=3600' });
       if (pathname === '/favicon.svg') return serveFile(res, 'brand/favicon.svg');
       if (pathname === '/favicon.ico') return serveFile(res, 'brand/favicon.ico');
       if (pathname === '/healthz') return send(res, 200, 'ok');
