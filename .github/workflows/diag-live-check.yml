@@ -8,16 +8,14 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Check Mike's domain and that no Agilities address is on public pages
+      - name: Check the blog and Q&A update is live (counts only)
         run: |
-          for u in "https://rsqumobilervservice.com/" "https://rsqumobilervservice.com/services/onsite-rv-winterizing-package" "https://gethitchpoint.com/" "https://gethitchpoint.com/llms.txt" "https://gethitchpoint.com/s/rsqu-mobile-rv-service"; do
-            echo "=== $u"
-            code=$(curl -sS -o body.html -w '%{http_code} %{url_effective}' -L "$u" || true)
-            echo "status: $code"
-            echo "title: $(grep -o '<title>[^<]*' body.html | head -1 | sed 's/<title>//')"
-            echo "canonical: $(grep -o '<link rel="canonical" href="[^"]*"' body.html | head -1)"
-            echo "agilitiestech.com email: $(grep -oi '@agilitiestech\.com' body.html | wc -l)"
-            echo "padlock (https): yes"
+          echo "healthz: $(curl -sS https://gethitchpoint.com/healthz || true)"
+          curl -sS -o site.js https://gethitchpoint.com/static/site.js || true
+          echo "site.js ask-form mentions: $(grep -c 'ask-form' site.js)"
+          curl -sS -o admin.js https://gethitchpoint.com/admin/admin.js || curl -sS -o admin.js https://gethitchpoint.com/static/admin.js || true
+          echo "admin.js questionsView mentions: $(grep -c 'questionsView' admin.js)"
+          for u in "https://rsqumobilervservice.com/" "https://gethitchpoint.com/s/rsqu-mobile-rv-service" "https://rsqumobilervservice.com/questions" "https://rsqumobilervservice.com/blog"; do
+            code=$(curl -sS -o body.html -w '%{http_code}' "$u" || true)
+            echo "=== $u -> $code; title: $(grep -o '<title>[^<]*' body.html | head -1 | sed 's/<title>//'); Q&A link: $(grep -c '/questions"' body.html); Blog link: $(grep -c '/blog"' body.html)"
           done
-          echo "=== www redirect"
-          curl -sS -o /dev/null -w '%{http_code} -> %{redirect_url}\n' https://www.rsqumobilervservice.com/ || true
