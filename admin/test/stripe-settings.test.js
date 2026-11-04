@@ -40,7 +40,7 @@ test('stripeSettingProblem names the mistake without repeating the value', () =>
 });
 
 test('the admin check: a padded key still works, and each setting gets a line', async () => {
-  let v2Refused = false;
+  let v2Refused = false, platformActivated = true;
   const stripeMock = http.createServer((req, res) => {
     const ok = req.headers.authorization === `Bearer ${KEY}`;
     if (ok && req.url.startsWith('/v2/core/accounts')) {
@@ -48,7 +48,7 @@ test('the admin check: a padded key still works, and each setting gets a line', 
       return res.end(JSON.stringify(v2Refused ? { error: { message: 'Accounts v2 is not enabled for this platform.' } } : { data: [] }));
     }
     res.writeHead(ok ? 200 : 401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(ok ? { id: 'acct_platform', business_profile: { name: 'HitchPoint' }, charges_enabled: true, details_submitted: true } : { error: { message: 'Invalid API Key provided.' } }));
+    res.end(JSON.stringify(ok ? { id: 'acct_platform', business_profile: { name: 'HitchPoint' }, charges_enabled: platformActivated, details_submitted: platformActivated } : { error: { message: 'Invalid API Key provided.' } }));
   });
   await new Promise((r) => stripeMock.listen(0, r));
   const dirs = [];
@@ -67,10 +67,17 @@ test('the admin check: a padded key still works, and each setting gets a line', 
     const good = await run({ STRIPE_SECRET_KEY: ` ${KEY}\n`, STRIPE_CONNECT_WEBHOOK_SECRET: `"${WHSEC}"`, STRIPE_WEBHOOK_SECRET: WHSEC });
     assert.equal(good.ok, true, JSON.stringify(good));
     assert.equal(good.test_mode, false);
-    // Webhook secrets, then whether businesses' Stripe accounts can be made (Accounts v2), then the ACH setting.
-    assert.deepEqual(good.checks.map((c) => c.ok), [true, true, true, true]);
-    assert.match(good.checks[2].name, /Accounts v2/);
-    assert.match(good.checks[3].message, /STRIPE_ACH_PAYMENTS/);
+    // Webhook secrets, then HitchPoint's own account activated, businesses' accounts (Accounts v2), the ACH setting.
+    assert.deepEqual(good.checks.map((c) => c.ok), [true, true, true, true, true]);
+    assert.match(good.checks[2].name, /Stripe account activated/);
+    assert.match(good.checks[3].name, /Accounts v2/);
+    assert.match(good.checks[4].message, /STRIPE_ACH_PAYMENTS/);
+    platformActivated = false;
+    const notActive = await run({ STRIPE_SECRET_KEY: KEY, STRIPE_CONNECT_WEBHOOK_SECRET: WHSEC });
+    const act = notActive.checks.find((c) => /Stripe account activated/.test(c.name));
+    assert.equal(act.ok, false);
+    assert.match(act.message, /dashboard\.stripe\.com\/account\/onboarding/);
+    platformActivated = true;
     v2Refused = true;
     const noV2 = await run({ STRIPE_SECRET_KEY: KEY, STRIPE_CONNECT_WEBHOOK_SECRET: WHSEC });
     assert.equal(noV2.checks.find((c) => /Accounts v2/.test(c.name)).ok, false);
