@@ -1,0 +1,15 @@
+node_modules/
+# Native build output (the native projects themselves are committed)
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/app/release/
+ios/App/build/
+ios/App/Pods/
+ios/DerivedData/
+*.keystore
+*.jks
+*.p8
+*.p12
+*.mobileprovision

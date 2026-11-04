@@ -2,8 +2,8 @@
 // HitchPoint dashboard service worker (scope /admin/). Keeps a copy of the app shell so the dashboard
 // opens fast and can show a friendly page offline. It never stores /api/ responses: requests,
 // customers and payments always come fresh from the server.
-const CACHE = 'hitchpoint-shell-v1';
-const SHELL = ['/admin/', '/admin/offline.html', '/static/admin.js', '/static/app.css', '/favicon.svg', '/static/brand/icon-192.png'];
+const CACHE = 'hitchpoint-shell-v2';
+const SHELL = ['/admin/', '/admin/offline.html', '/static/admin.js', '/static/app.css', '/static/hp.css', '/favicon.svg', '/static/brand/icon-192.png', '/static/brand/logo.svg', '/static/brand/logo-on-dark.svg', '/static/brand/topo.svg'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

@@ -6,8 +6,8 @@
   "start_url": "/admin/#/requests",
   "scope": "/admin/",
   "display": "standalone",
-  "background_color": "#F6F3EE",
-  "theme_color": "#1F1C17",
+  "background_color": "#FBF7F0",
+  "theme_color": "#16302A",
   "icons": [
     { "src": "/static/brand/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "/static/brand/icon-512.png", "sizes": "512x512", "type": "image/png" },
