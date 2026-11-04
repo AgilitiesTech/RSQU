@@ -1501,6 +1501,173 @@ test('bold look: banner, service tiles, highlights, service pages', async () => 
   await mike('PUT', '/api/website', { ...ok.json.profile, theme: 'classic' });
 });
 
+test('blog and questions: off until turned on, drafts private, town pages and sitemap; questions wait for the owner and never show who asked', async () => {
+  const ldOf = (html) => [...html.matchAll(/<script type="application\/ld\+json">(.*?)<\/script>/gs)].map((m) => JSON.parse(m[1]));
+  // Off by default: no pages, no asking
+  assert.equal((await anon('GET', `/s/${mikeSlug}/blog`)).status, 404);
+  assert.equal((await anon('GET', `/s/${mikeSlug}/questions`)).status, 404);
+  assert.equal((await anon('POST', `/api/public/t/${mikeSlug}/questions`, { question: 'Do you fix slide-out motors?' })).status, 404);
+  const st0 = (await mike('GET', '/api/community')).json;
+  assert.deepEqual([st0.blog_on, st0.qa_on], [false, false]);
+  assert.ok(st0.cities.some((c) => c.slug === 'ogden-ut'));
+  // Team members can read but not change anything
+  assert.equal((await tia('GET', '/api/posts')).status, 200);
+  assert.equal((await tia('PUT', '/api/community', { blog_on: true })).status, 403);
+  assert.equal((await tia('POST', '/api/posts', { title: 'x' })).status, 403);
+
+  // ---- blog ----
+  const body = '## What we found\nThe front cap seal had cracked.\n\n- Old sealant removed\n- New **self-leveling** lap sealant\n\nSee our [roof checklist](https://example.com/roof). <script>alert(1)</script>';
+  const draft = await mike('POST', '/api/posts', { title: 'Roof seal repair in Ogden', summary: 'A cracked front cap seal, fixed in an afternoon.', body, city: 'ogden-ut' });
+  assert.equal(draft.status, 201, JSON.stringify(draft.json));
+  assert.deepEqual([draft.json.slug, draft.json.status, draft.json.url], ['roof-seal-repair-in-ogden', 'draft', null]);
+  assert.equal((await mike('POST', '/api/posts', { title: 'Somewhere else', city: 'provo-ut' })).status, 400, 'only towns it serves');
+  assert.equal((await mike('POST', '/api/posts', { title: 'Too short', body: 'Hi.', status: 'published' })).status, 400, 'a post needs some words before it goes up');
+  assert.equal((await mike('GET', '/api/posts')).json.rows.length, 1);
+  assert.equal((await mike('PUT', '/api/community', { blog_on: true })).json.blog_on, true);
+  // On, but nothing published: the page isn't indexed and the menu doesn't link it; drafts stay private
+  const empty = await anon('GET', `/s/${mikeSlug}/blog`);
+  assert.equal(empty.status, 200);
+  assert.match(empty.text, /<meta name="robots" content="noindex,follow">/);
+  assert.doesNotMatch((await anon('GET', `/s/${mikeSlug}`)).text, new RegExp(`href="/s/${mikeSlug}/blog"`));
+  assert.equal((await anon('GET', `/s/${mikeSlug}/blog/roof-seal-repair-in-ogden`)).status, 302, 'drafts aren’t public');
+
+  const pic = await mike('POST', `/api/posts/${draft.json.id}/image`, { image: PNG });
+  assert.equal(pic.status, 200);
+  assert.match(pic.json.image, /^t\d+-post-/);
+  assert.equal((await other('POST', `/api/posts/${draft.json.id}/image`, { image: PNG })).status, 404);
+  assert.equal((await other('GET', `/api/posts/${draft.json.id}`)).status, 404);
+  assert.equal((await other('PUT', `/api/posts/${draft.json.id}`, { status: 'published' })).status, 404);
+
+  const pub = await mike('PUT', `/api/posts/${draft.json.id}`, { status: 'published' });
+  assert.equal(pub.status, 200, JSON.stringify(pub.json));
+  assert.equal(pub.json.url, 'https://www.mikesrv.test/blog/roof-seal-repair-in-ogden');
+  const page = await anon('GET', `/s/${mikeSlug}/blog/roof-seal-repair-in-ogden`);
+  assert.equal(page.status, 200);
+  assert.match(page.text, /<h2>What we found<\/h2>/);
+  assert.match(page.text, /<strong>self-leveling<\/strong>/);
+  assert.match(page.text, /<a href="https:\/\/example\.com\/roof" rel="noopener">roof checklist<\/a>/);
+  assert.doesNotMatch(page.text, /<script>alert/);
+  assert.match(page.text, /&lt;script&gt;alert/);
+  assert.match(page.text, /<link rel="canonical" href="https:\/\/www\.mikesrv\.test\/blog\/roof-seal-repair-in-ogden">/);
+  const art = ldOf(page.text).find((x) => x['@type'] === 'BlogPosting');
+  assert.equal(art.headline, 'Roof seal repair in Ogden');
+  assert.match(art.datePublished, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  assert.match(art.image, new RegExp(pic.json.image));
+  assert.equal(art.contentLocation.name, 'Ogden, UT');
+  assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 200);
+  // Home shows the latest posts and links the blog; the Ogden page shows posts from Ogden only
+  const home = (await anon('GET', `/s/${mikeSlug}`)).text;
+  assert.match(home, /From the blog/);
+  assert.match(home, new RegExp(`href="/s/${mikeSlug}/blog"`));
+  assert.match((await anon('GET', `/s/${mikeSlug}/areas/ogden-ut`)).text, /Recent work in Ogden/);
+  assert.doesNotMatch((await anon('GET', `/s/${mikeSlug}/areas/layton-ut`)).text, /Recent work in/);
+  assert.match((await anon('GET', `/s/${mikeSlug}/blog`)).text, /<meta name="robots" content="index,follow">/);
+  // His own domain and sitemap
+  assert.equal((await viaHost('www.mikesrv.test', '/blog')).status, 200);
+  assert.equal((await viaHost('www.mikesrv.test', '/blog/roof-seal-repair-in-ogden')).status, 200);
+  let sm = (await viaHost('www.mikesrv.test', '/sitemap.xml')).text;
+  assert.match(sm, /<loc>https:\/\/www\.mikesrv\.test\/blog<\/loc>/);
+  assert.match(sm, /<loc>https:\/\/www\.mikesrv\.test\/blog\/roof-seal-repair-in-ogden<\/loc>/);
+  // Once published, the address stays put when the title changes; a missing post goes to the blog
+  assert.equal((await mike('PUT', `/api/posts/${draft.json.id}`, { title: 'Fixing a cracked roof seal' })).json.slug, 'roof-seal-repair-in-ogden');
+  const gone = await anon('GET', `/s/${mikeSlug}/blog/not-a-post`);
+  assert.deepEqual([gone.status, gone.headers.get('location')], [302, `/s/${mikeSlug}/blog`]);
+
+  // ---- questions ----
+  await mike('PUT', '/api/community', { qa_on: true });
+  const qpage = await anon('GET', `/s/${mikeSlug}/questions`);
+  assert.equal(qpage.status, 200);
+  assert.match(qpage.text, /id="ask-form"/);
+  assert.match(qpage.text, /id="ask-email"/);
+  assert.match(qpage.text, /<meta name="robots" content="noindex,follow">/, 'nothing answered yet');
+  assert.match((await anon('GET', `/s/${mikeSlug}`)).text, /Ask a question/);
+  let ip = 10;
+  const ask = (b, from) => anon('POST', `/api/public/t/${mikeSlug}/questions`, b, { 'X-Forwarded-For': from || `203.0.113.${ip++}` });
+  assert.equal((await ask({ question: 'Hi' })).status, 400);
+  assert.equal((await ask({ question: 'Cheap parts at www.spam-shop.xyz today only' })).status, 400, 'no links');
+  assert.equal((await ask({ question: '$$$$ 1234567 !!!! @@@@ #### %%%%' })).status, 400);
+  assert.equal((await ask({ question: 'Do you fix slide-out motors?', email: 'not-an-email' })).status, 400);
+  const mark = outbox.length;
+  const text = 'Do you fix slide-out motors on fifth wheels? Ours stopped halfway. Call me at 801-555-0199.';
+  const asked = await ask({ question: text, name: 'Pat Quill', email: 'Pat@Example.test' });
+  assert.equal(asked.status, 201);
+  assert.equal(asked.json.email, true);
+  assert.equal((await ask({ question: text, name: 'Pat Quill' })).status, 201, 'a double tap');
+  assert.equal((await ask({ question: 'whatever', website: 'http://spam.test' })).status, 201, 'the honeypot looks fine to bots');
+  const alertPhone = appDb.prepare('SELECT notify_phone FROM tenants WHERE id = ?').get(mikeId).notify_phone;
+  if (alertPhone) assert.equal(outbox.slice(mark).filter((m) => m.kind === 'sms' && m.to === alertPhone && /New question on your website from Pat Quill/.test(m.body)).length, 1);
+  const list = (await mike('GET', '/api/questions')).json;
+  assert.equal(list.questions.new, 1, 'stored once');
+  const q = list.rows[0];
+  assert.deepEqual([q.name, q.email, q.question], ['Pat Quill', 'pat@example.test', text]);
+  assert.equal((await tia('GET', '/api/questions')).json.rows.length, 1, 'the team sees questions');
+  assert.doesNotMatch((await anon('GET', `/s/${mikeSlug}/questions`)).text, /slide-out/, 'nothing public until answered');
+  assert.equal((await other('GET', '/api/questions')).json.rows.length, 0);
+  assert.equal((await other('PUT', `/api/questions/${q.id}`, { status: 'published', answer: 'x'.repeat(40) })).status, 404);
+  assert.equal((await tia('PUT', `/api/questions/${q.id}`, { status: 'published', answer: 'x'.repeat(40) })).status, 403);
+  assert.equal((await mike('PUT', `/api/questions/${q.id}`, { status: 'published' })).status, 400, 'needs an answer');
+
+  // The owner shortens the question (dropping the phone number) and answers it
+  const answer = 'Yes. When a slide-out stops halfway it is usually a worn gear or a loose ground wire. We carry common motors on the truck, so it is often a one-visit fix.\n\n- Don’t force it\n- Call us before you try the manual crank';
+  const pubQ = await mike('PUT', `/api/questions/${q.id}`, { title: 'Do you fix slide-out motors on fifth wheels?', answer, status: 'published' });
+  assert.equal(pubQ.status, 200, JSON.stringify(pubQ.json));
+  assert.equal(pubQ.json.slug, 'do-you-fix-slide-out-motors-on-fifth-wheels');
+  const qp = await anon('GET', `/s/${mikeSlug}/questions/do-you-fix-slide-out-motors-on-fifth-wheels`);
+  assert.equal(qp.status, 200);
+  assert.match(qp.text, /worn gear/);
+  assert.match(qp.text, /<li>Don’t force it<\/li>/);
+  assert.match(qp.text, /<meta name="robots" content="index,follow">/);
+  const faq = ldOf(qp.text).find((x) => x['@type'] === 'FAQPage');
+  assert.equal(faq.mainEntity[0].name, 'Do you fix slide-out motors on fifth wheels?');
+  const idx = (await anon('GET', `/s/${mikeSlug}/questions`)).text;
+  assert.match(idx, /<meta name="robots" content="index,follow">/);
+  assert.match(idx, /Do you fix slide-out motors on fifth wheels\?/);
+  for (const html of [qp.text, idx, (await anon('GET', `/s/${mikeSlug}`)).text]) {
+    for (const secret of ['Pat Quill', 'pat@example.test', '801-555-0199', 'stopped halfway']) assert.ok(!html.includes(secret), `public page shows ${secret}`);
+  }
+  // The person who asked gets one email with the link, not one per edit
+  await new Promise((r) => setTimeout(r, 30));
+  let mails = outbox.slice(mark).filter((m) => m.kind === 'email' && m.to === 'pat@example.test');
+  assert.equal(mails.length, 1);
+  assert.match(mails[0].text, /https:\/\/www\.mikesrv\.test\/questions\/do-you-fix-slide-out-motors-on-fifth-wheels/);
+  await mike('PUT', `/api/questions/${q.id}`, { answer: answer + '\n\nCall any time.' });
+  await new Promise((r) => setTimeout(r, 30));
+  mails = outbox.slice(mark).filter((m) => m.kind === 'email' && m.to === 'pat@example.test');
+  assert.equal(mails.length, 1);
+  assert.match((await anon('GET', `/s/${mikeSlug}`)).text, /Questions and answers/);
+  sm = (await viaHost('www.mikesrv.test', '/sitemap.xml')).text;
+  assert.match(sm, /<loc>https:\/\/www\.mikesrv\.test\/questions\/do-you-fix-slide-out-motors-on-fifth-wheels<\/loc>/);
+  // A short answer is published but kept out of Google
+  const q2 = await ask({ question: 'Do you work on Sundays at all?' });
+  assert.equal(q2.status, 201);
+  const q2id = (await mike('GET', '/api/questions')).json.rows[0].id;
+  const short = await mike('PUT', `/api/questions/${q2id}`, { answer: 'Only for emergencies. Call us.', status: 'published' });
+  assert.equal(short.status, 200);
+  assert.match((await anon('GET', `/s/${mikeSlug}/questions/${short.json.slug}`)).text, /<meta name="robots" content="noindex,follow">/);
+  assert.doesNotMatch((await viaHost('www.mikesrv.test', '/sitemap.xml')).text, new RegExp(short.json.slug));
+
+  // Hiding takes it off the site; its old link goes to the questions page
+  await mike('PUT', `/api/questions/${q.id}`, { status: 'hidden' });
+  const hq = await anon('GET', `/s/${mikeSlug}/questions/do-you-fix-slide-out-motors-on-fifth-wheels`);
+  assert.deepEqual([hq.status, hq.headers.get('location')], [302, `/s/${mikeSlug}/questions`]);
+  assert.equal((await mike('GET', '/api/questions?status=hidden')).json.rows.length, 1);
+  // Five questions an hour from one address
+  let last;
+  for (let i = 0; i < 6; i++) last = await ask({ question: `Question number ${i} about my water heater?` }, '198.51.100.9');
+  assert.equal(last.status, 429);
+
+  // Turning both off takes the pages and links down; deleting a post removes its photo
+  await mike('PUT', '/api/community', { blog_on: false, qa_on: false });
+  assert.equal((await anon('GET', `/s/${mikeSlug}/blog`)).status, 404);
+  assert.equal((await anon('GET', `/s/${mikeSlug}/questions`)).status, 404);
+  const off = (await anon('GET', `/s/${mikeSlug}`)).text;
+  assert.doesNotMatch(off, /From the blog|Ask a question/);
+  assert.doesNotMatch((await viaHost('www.mikesrv.test', '/sitemap.xml')).text, /\/blog|\/questions/);
+  assert.equal((await mike('DELETE', `/api/posts/${draft.json.id}`)).status, 200);
+  assert.equal((await fetch(`${base}/media/${mikeSlug}/${pic.json.image}`)).status, 404);
+  assert.equal((await mike('DELETE', `/api/questions/${q2id}`)).status, 200);
+});
+
 test('affiliate program: links, sign-up credit, earnings, payouts and privacy', async () => {
   const IP = { 'X-Forwarded-For': '198.51.100.7' }; // its own rate-limit buckets
   const loc = (r) => r.headers.get('location');

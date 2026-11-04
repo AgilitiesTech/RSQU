@@ -770,7 +770,7 @@
   // ---------- business, brand and website ----------
   async function businessView() {
     setNav('business');
-    const [b, team] = await Promise.all([api('/api/business'), api('/api/team')]);
+    const [b, team, cm] = await Promise.all([api('/api/business'), api('/api/team'), api('/api/community')]);
     const ro = isOwner() ? '' : 'disabled';
     const embed = `<meta name="rsqu-api" content="${location.origin}">\n<meta name="rsqu-business" content="${b.slug}">`;
     view.innerHTML = `
@@ -779,6 +779,12 @@
         <h2>Get found on Google</h2>
         <p>Add the cities you serve, your hours, certifications, FAQs, videos and customer checklists. Each city gets its own page, and your site tells Google exactly where you work.</p>
         <div><a class="btn primary" href="#/website">Edit website sections</a></div>
+      </section>
+      <section class="card stack" id="community-card">
+        <h2>Blog and questions</h2>
+        <p>Post tips and stories from your jobs, and answer customers’ questions on your website. Both give Google more reasons to show your business.</p>
+        <div class="row"><a class="btn" href="#/blog">Blog${cm.posts.published ? ` (${cm.posts.published})` : ''}</a><a class="btn" href="#/questions">Questions ${cm.questions.new ? `<span class="badge">${cm.questions.new}</span>` : ''}</a></div>
+        <p class="small muted">${cm.blog_on ? 'Blog is on.' : 'Blog is off.'} ${cm.qa_on ? 'Questions are on.' : 'Questions are off.'}</p>
       </section>
       <section class="card stack">
         <h2>Your website</h2>
@@ -2591,6 +2597,157 @@
     });
   }
 
+  // ---------- blog and questions ----------
+  // A blog and a questions-and-answers board on the business's website. Both start off; the owner
+  // turns them on. Visitors' questions stay private until the owner answers and publishes them.
+  async function communityToggle(key, on, msg) {
+    try { await api('/api/community', { method: 'PUT', body: { [key]: on } }); flash(msg, on ? 'Turned on.' : 'Turned off.'); return true; }
+    catch (err) { flash(msg, err.message, 'err'); return false; }
+  }
+  async function blogView() {
+    setNav('business');
+    const d = await api('/api/posts');
+    const own = isOwner();
+    const city = (slug) => (d.cities.find((c) => c.slug === slug) || {}).name || '';
+    view.innerHTML = `
+      <a href="#/business" class="small">← Business</a>
+      <div class="row between"><h1>Blog</h1>${own ? '<a class="btn sm primary" href="#/blog/new">+ New post</a>' : ''}</div>
+      <section class="card stack">
+        <label class="check"><input type="checkbox" id="bl-on" ${d.blog_on ? 'checked' : ''} ${own ? '' : 'disabled'}> <span><strong>Show the blog on my website.</strong> Your Blog page and its menu link appear once you publish a post.</span></label>
+        ${d.blog_on && d.posts.published ? `<p class="small">Your blog: <a href="${esc(d.blog_url)}" target="_blank" rel="noopener">${esc(d.blog_url)}</a></p>` : ''}
+        <p class="alert" id="bl-msg" hidden></p>
+      </section>
+      <p class="small muted">Post ideas: a recent repair with a photo, a seasonal tip (winterizing, a spring check-up), or something customers ask you a lot. Pick a town and the post also shows on that town’s page.</p>
+      <div class="list">${d.rows.length ? d.rows.map((p) => `
+        <a class="item" href="#/blog/${p.id}">
+          <div class="grow stack" style="gap:4px">
+            <div class="row" style="gap:8px"><span class="item-title">${esc(p.title || 'Untitled')}</span>
+              <span class="tag ${p.status === 'published' ? 'paid' : ''}">${p.status === 'published' ? 'Published' : 'Draft'}</span>${p.city && city(p.city) ? `<span class="tag">${esc(city(p.city))}</span>` : ''}</div>
+            ${p.summary ? `<div class="small muted">${esc(p.summary.slice(0, 140))}</div>` : ''}
+          </div>
+          <div class="small muted" style="white-space:nowrap">${esc(p.date_label || when(p.updated_at))}</div>
+        </a>`).join('') : '<p class="empty">No posts yet. Tap “New post” to write your first one.</p>'}
+      </div>`;
+    document.getElementById('bl-on').addEventListener('change', async (e) => { if (!(await communityToggle('blog_on', e.target.checked, document.getElementById('bl-msg')))) e.target.checked = !e.target.checked; });
+  }
+
+  async function postView(id) {
+    setNav('business');
+    const isNew = id === 'new';
+    const d = isNew ? { ...(await api('/api/community')), title: '', summary: '', body: '', city: null, status: 'draft' } : await api('/api/posts/' + encodeURIComponent(id));
+    const own = isOwner(), published = d.status === 'published';
+    view.innerHTML = `
+      <a href="#/blog" class="small">← Blog</a>
+      <h1>${isNew ? 'New post' : esc(d.title || 'Untitled')}</h1>
+      ${published ? `<p class="alert ok">Published ${esc(d.date_label)}. <a href="${esc(d.url)}" target="_blank" rel="noopener">See it on your site</a></p>` : `<p class="small muted">${isNew ? 'New post.' : 'Draft.'} Nobody else sees it until you publish.</p>`}
+      ${!d.blog_on ? '<p class="alert">Your blog is off, so posts won’t show on your website yet. <a href="#/blog">Turn it on</a></p>' : ''}
+      <form class="card stack" id="pf"><fieldset ${own ? '' : 'disabled'} class="stack" style="border:0;padding:0;margin:0">
+        <div><label for="pf-title">Title</label><input id="pf-title" name="title" maxlength="${d.limits.title}" value="${esc(d.title)}" placeholder="How we fixed a leaking roof seal in Ogden"></div>
+        <div><label for="pf-sum">Short summary</label><p class="small muted" id="pf-sum-h">One or two sentences. Google and link previews show it under the title.</p><textarea id="pf-sum" name="summary" rows="2" maxlength="${d.limits.summary}" aria-describedby="pf-sum-h">${esc(d.summary)}</textarea></div>
+        <div><label for="pf-body">Post</label><p class="small muted" id="pf-body-h">Leave a blank line between paragraphs. Start a line with <code>## </code> for a heading or <code>- </code> for a bullet. <code>**words**</code> makes them bold; <code>[words](https://…)</code> makes a link.</p><textarea id="pf-body" name="body" rows="16" maxlength="${d.limits.body}" aria-describedby="pf-body-h">${esc(d.body)}</textarea></div>
+        <div><label for="pf-city">Town</label><select id="pf-city" name="city"><option value="">None</option>${d.cities.map((c) => `<option value="${esc(c.slug)}" ${c.slug === d.city ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>
+          <p class="small muted">${d.cities.length ? 'The post also shows on that town’s page.' : 'Add the towns you serve under Business → Edit website sections to tag posts with a town.'}</p></div>
+        ${isNew ? '<p class="small muted">Save the post first, then you can add a photo.</p>' : `<div class="stack" style="gap:6px"><label for="pf-img">Cover photo</label>${d.image_url ? `<img src="${esc(d.image_url)}" alt="Current cover photo" style="width:100%;max-width:360px;border-radius:8px">` : ''}<input id="pf-img" type="file" accept="image/*">${d.image_url ? '<div><button type="button" class="linkbtn small" id="pf-img-x">Remove photo</button></div>' : ''}</div>`}
+      </fieldset>
+        <p class="alert" id="pf-msg" hidden></p>
+        ${own ? `<div class="row">
+          <button class="btn" type="submit">${published ? 'Save changes' : 'Save draft'}</button>
+          ${published ? '<button class="btn" type="button" id="pf-unpub">Unpublish</button>' : '<button class="btn primary" type="button" id="pf-pub">Publish</button>'}
+          ${isNew ? '' : '<button class="btn ghost" type="button" id="pf-del">Delete</button>'}
+        </div>` : ''}
+      </form>`;
+    if (!own) return;
+    const f = document.getElementById('pf'), msg = document.getElementById('pf-msg');
+    const fields = () => ({ title: f.elements.title.value, summary: f.elements.summary.value, body: f.elements.body.value, city: f.elements.city.value });
+    async function save(status) {
+      if (isNew) {
+        const created = await api('/api/posts', { method: 'POST', body: { ...fields(), ...(status ? { status } : {}) } });
+        location.hash = '#/blog/' + created.id;
+        return created;
+      }
+      return api('/api/posts/' + d.id, { method: 'PUT', body: { ...fields(), ...(status ? { status } : {}) } });
+    }
+    const run = (status, done) => async (e) => {
+      if (e) e.preventDefault();
+      try { await save(status); if (!isNew) { await postView(d.id); flash(document.getElementById('pf-msg'), done); } }
+      catch (err) { showError(msg, err.message); }
+    };
+    f.addEventListener('submit', run(null, 'Saved.'));
+    document.getElementById('pf-pub')?.addEventListener('click', run('published', 'Published. It’s on your website now.'));
+    document.getElementById('pf-unpub')?.addEventListener('click', (e) => { if (confirm('Take this post off your website? It stays here as a draft.')) run('draft', 'Unpublished. It’s a draft again.')(e); });
+    document.getElementById('pf-del')?.addEventListener('click', async () => {
+      if (!confirm('Delete this post for good?')) return;
+      try { await api('/api/posts/' + d.id, { method: 'DELETE' }); location.hash = '#/blog'; } catch (err) { showError(msg, err.message); }
+    });
+    const photo = async (image) => {
+      try { await save(null); await api(`/api/posts/${d.id}/image`, { method: 'POST', body: { image } }); await postView(d.id); flash(document.getElementById('pf-msg'), image ? 'Photo added.' : 'Photo removed.'); }
+      catch (err) { showError(msg, err.message); }
+    };
+    document.getElementById('pf-img')?.addEventListener('change', async (e) => { const image = await readImage(e.target.files[0], 1600, false); if (image) photo(image); else showError(msg, 'Use a JPG, PNG or WebP photo.'); });
+    document.getElementById('pf-img-x')?.addEventListener('click', () => photo(null));
+  }
+
+  let qaFilter = 'new';
+  async function questionsView(sub) {
+    setNav('business');
+    if (['new', 'published', 'hidden'].includes(sub)) qaFilter = sub;
+    const d = await api('/api/questions?status=' + qaFilter);
+    const own = isOwner();
+    const tab = (k, label, n) => `<button type="button" data-qf="${k}" aria-pressed="${qaFilter === k}">${label} (${n})</button>`;
+    const empty = { new: 'No new questions. When a visitor asks one, it shows up here.', published: 'Nothing published yet. Answer a new question and publish it.', hidden: 'No hidden questions.' }[qaFilter];
+    view.innerHTML = `
+      <a href="#/business" class="small">← Business</a>
+      <h1>Questions</h1>
+      <section class="card stack">
+        <label class="check"><input type="checkbox" id="qa-on" ${d.qa_on ? 'checked' : ''} ${own ? '' : 'disabled'}> <span><strong>Show Questions on my website.</strong> Visitors can ask you a question. Nothing they write appears on your site until you answer it and publish it.</span></label>
+        ${d.qa_on ? `<p class="small">Your Questions page: <a href="${esc(d.questions_url)}" target="_blank" rel="noopener">${esc(d.questions_url)}</a></p>` : ''}
+        ${d.qa_on ? `<p class="small muted">${d.sms_alerts ? 'We text you when a new question comes in.' : 'New questions show up here. Check back now and then.'}</p>` : ''}
+        <p class="alert" id="qa-msg" hidden></p>
+      </section>
+      <div class="tabs" role="group" aria-label="Show">${tab('new', 'New', d.questions.new)}${tab('published', 'Published', d.questions.published)}${tab('hidden', 'Hidden', d.questions.hidden)}</div>
+      <div class="stack">${d.rows.length ? d.rows.map((q) => `
+        <form class="card stack" data-q="${q.id}">
+          <div class="row between"><span class="small muted">Asked ${esc(q.received_label)}</span>${q.url ? `<a class="small" href="${esc(q.url)}" target="_blank" rel="noopener">See it on your site</a>` : ''}</div>
+          <div class="stack" style="gap:6px">
+            <p class="small muted" style="margin:0">From ${esc(q.name || 'someone who left no name')}${q.email ? ` · <a href="mailto:${esc(q.email)}">${esc(q.email)}</a>` : ''} · only you see this</p>
+            <p style="margin:0;padding:10px 14px;border-left:4px solid var(--line);background:#FBF8F3;white-space:pre-wrap;overflow-wrap:anywhere">${esc(q.question)}</p>
+          </div>
+          <fieldset ${own ? '' : 'disabled'} class="stack" style="border:0;padding:0;margin:0">
+            <div><label for="qt-${q.id}">Question as shown on your site</label><p class="small muted" id="qt-h-${q.id}">Fix typos and take out names, phone numbers or addresses.</p><textarea id="qt-${q.id}" name="title" rows="2" maxlength="${d.limits.questionShown}" aria-describedby="qt-h-${q.id}">${esc(q.shown_title)}</textarea></div>
+            <div><label for="qa-${q.id}">Your answer</label><p class="small muted" id="qa-h-${q.id}">Blank line between paragraphs. <code>- </code> for bullets, <code>[words](https://…)</code> for a link.</p><textarea id="qa-${q.id}" name="answer" rows="6" maxlength="${d.limits.answer}" aria-describedby="qa-h-${q.id}">${esc(q.answer || '')}</textarea></div>
+          </fieldset>
+          <p class="alert" data-msg hidden></p>
+          ${own ? `<div class="row">
+            <button class="btn primary" type="submit">${q.status === 'published' ? 'Save' : 'Publish answer'}</button>
+            ${q.status === 'hidden' ? '' : `<button class="btn" type="button" data-act="hide">${q.status === 'published' ? 'Unpublish' : 'Hide'}</button>`}
+            <button class="btn ghost" type="button" data-act="delete">Delete</button>
+          </div>` : ''}
+        </form>`).join('') : `<p class="empty">${empty}</p>`}
+      </div>`;
+    view.querySelectorAll('[data-qf]').forEach((b) => b.addEventListener('click', () => questionsView(b.dataset.qf)));
+    document.getElementById('qa-on').addEventListener('change', async (e) => { if (await communityToggle('qa_on', e.target.checked, document.getElementById('qa-msg'))) questionsView().then(() => flash(document.getElementById('qa-msg'), e.target.checked ? 'Questions are on. Your Questions page is live.' : 'Questions are off.')); else e.target.checked = !e.target.checked; });
+    if (!own) return;
+    view.querySelectorAll('form[data-q]').forEach((f) => {
+      const id = f.dataset.q, msg = f.querySelector('[data-msg]');
+      const body = (status) => ({ title: f.elements.title.value, answer: f.elements.answer.value, ...(status ? { status } : {}) });
+      const done = async (text) => { await questionsView(); flash(document.getElementById('qa-msg'), text); };
+      f.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        try { await api('/api/questions/' + id, { method: 'PUT', body: body('published') }); await done(qaFilter === 'published' ? 'Saved.' : 'Published. It’s on your Questions page now.'); }
+        catch (err) { showError(msg, err.message); }
+      });
+      f.querySelector('[data-act="hide"]')?.addEventListener('click', async () => {
+        try { await api('/api/questions/' + id, { method: 'PUT', body: body('hidden') }); await done(qaFilter === 'published' ? 'Unpublished. It’s under Hidden now.' : 'Hidden. It’s under Hidden if you change your mind.'); }
+        catch (err) { showError(msg, err.message); }
+      });
+      f.querySelector('[data-act="delete"]').addEventListener('click', async () => {
+        if (!confirm('Delete this question for good?')) return;
+        try { await api('/api/questions/' + id, { method: 'DELETE' }); await done('Deleted.'); }
+        catch (err) { showError(msg, err.message); }
+      });
+    });
+  }
+
   // ---------- owner features: pay over time ----------
   // Affirm and Klarna come from the business's own Stripe settings (Checkout shows what's turned on there).
   function payLaterCard(st, cfg) {
@@ -2697,6 +2854,9 @@
       else if (a === 'products') await productsView();
       else if (a === 'business') await businessView();
       else if (a === 'website') await websiteView();
+      else if (a === 'blog' && b) await postView(b);
+      else if (a === 'blog') await blogView();
+      else if (a === 'questions') await questionsView(b);
       else if (a === 'settings') await settingsView(b);
       else if (a === 'terms') await termsView();
       else if (a === 'affiliate' && b === 'details') await affiliateDetailsView();

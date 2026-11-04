@@ -2,6 +2,7 @@
 // city it serves, and the files it shares with customers. Local-search markup (schema.org JSON-LD,
 // canonical URLs, sitemaps) is generated from the business's own data.
 import { DAYS, citySlug, cityIndexable, servicePhrase, slugify } from './site-profile.js';
+import { richText, plainText, answerIndexable } from './community.js';
 
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hex = (c, d) => (/^#[0-9a-fA-F]{6}$/.test(c || '') ? c : d);
@@ -171,6 +172,17 @@ footer h2{color:#fff;font-size:20px;margin-bottom:6px}footer dl{display:grid;gri
 .big{font-family:var(--cond);font-weight:700;font-size:34px;color:var(--a);text-decoration:none}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .links{display:flex;flex-wrap:wrap;gap:8px 16px;padding:0;margin:8px 0 0;list-style:none}
+.prose{max-width:46em}.prose h2{font-size:clamp(24px,2.6vw,32px);margin:28px 0 10px}.prose p{margin:0 0 16px}.prose ul{margin:0 0 16px}
+.posts{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr));gap:28px;padding:0;margin:0;list-style:none}
+.post-card{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+.post-card>a{display:block;line-height:0}.post-card img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block}
+.post-card div{padding:16px 18px 20px}.post-card h3{font-size:23px;margin:4px 0 8px}.post-card h3 a{color:var(--ink);text-decoration:none}.post-card h3 a:hover{color:var(--p)}
+.post-card p{margin:0;font-size:17px;color:#4A433C}.meta{font-size:15px;color:var(--muted);margin:0}.post-card .meta{color:var(--muted)}
+.cover{display:block;width:100%;max-width:880px;height:auto;border-radius:10px;margin:0 0 28px}
+.qa-list{max-width:52em;padding:0;margin:0;list-style:none}.qa{border-bottom:1px solid var(--line);padding:18px 0}.qa:first-child{padding-top:0}
+.qa h3{font-size:22px;margin:0 0 6px}.qa h3 a{color:var(--ink);text-decoration:none}.qa h3 a:hover{color:var(--p)}.qa p{margin:0;color:#4A433C;font-size:17px}
+.answer{border-left:4px solid var(--p);padding:2px 0 2px 18px;margin:8px 0 0}.answer .by{font-family:var(--cond);font-weight:600;color:var(--ink);margin:0 0 8px}
+.more-link{display:inline-block;margin-top:22px;font-weight:600}
 `;
 }
 
@@ -208,7 +220,7 @@ function hoursList(profile) {
   return Object.keys(profile.hours.days).length ? `<dl>${days.join('')}</dl>` : '';
 }
 
-function footer(t, profile, u) {
+function footer(t, profile, u, cm = NO_COMMUNITY) {
   const tel = telDigits(t.phone);
   const year = new Date().getFullYear();
   const hours = hoursList(profile);
@@ -220,9 +232,11 @@ function footer(t, profile, u) {
     L.facebook && `<li><a href="${esc(L.facebook)}" rel="noopener" target="_blank">Facebook</a></li>`,
     L.instagram && `<li><a href="${esc(L.instagram)}" rel="noopener" target="_blank">Instagram</a></li>`,
   ].filter(Boolean);
+  const own = [cm.blog && `<li><a href="${u.rel('/blog')}">Blog</a></li>`, cm.qa && `<li><a href="${u.rel('/questions')}">Questions and answers</a></li>`].filter(Boolean);
   const where = profile.base_city ? `Based in ${esc(profile.base_city)}, ${esc(profile.base_state)}${profile.radius_miles ? ` · serving about ${profile.radius_miles} miles around` : ''}` : (t.service_area ? `Serving ${esc(t.service_area)}` : '');
   return `<footer><div class="wrap">
   <div><h2><a href="${u.rel('/')}" style="text-decoration:none">${esc(t.name)}</a></h2>${where ? `<div>${where}</div>` : ''}
+    ${own.length ? `<ul class="links">${own.join('')}</ul>` : ''}
     ${links.length ? `<ul class="links">${links.join('')}</ul>` : ''}
     <p style="font-size:14px;margin:14px 0 0">© ${year} ${esc(t.name)} · <a href="/legal/privacy">Privacy</a> · <a href="/legal/customer-terms">Customer terms</a></p></div>
   ${hours || profile.hours.note ? `<div><h2>Hours</h2>${hours}${profile.hours.note ? `<p style="margin:6px 0 0">${esc(profile.hours.note)}</p>` : ''}</div>` : ''}
@@ -275,7 +289,8 @@ body.bold h1,body.bold section.s h2{text-transform:uppercase;letter-spacing:.01e
 function boldHeader(t, profile, u, { current = 'home', sections = {} } = {}) {
   const tel = telDigits(t.phone);
   const items = [['/', 'Home', 'home'], [sections.services && '/#services', 'Services', 'services'], [sections.about && '/#about', 'About', 'about'],
-    [sections.areas && '/#areas', 'Service area', 'areas'], [sections.resources && '/#resources', 'Resources', 'resources'], ['/#request', 'Contact', 'contact']].filter(([h]) => h);
+    [sections.areas && '/#areas', 'Service area', 'areas'], [sections.resources && '/#resources', 'Resources', 'resources'], [sections.blog && '/blog', 'Blog', 'blog'],
+    [sections.qa && '/questions', 'Q&A', 'questions'], ['/#request', 'Contact', 'contact']].filter(([h]) => h);
   // Every page gets the same one-row header as the home page; only the marked menu item changes.
   return `<body class="bold">
 <header class="bhead"><div class="wrap">
@@ -314,14 +329,15 @@ const resourcesSection = (profile, u) => (profile.resources.length ? `<section c
 
 const faqSchema = (profile) => (profile.faqs.length ? [{ '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: profile.faqs.map((f) => ({ '@type': 'Question', name: f.q, acceptedAnswer: { '@type': 'Answer', text: f.a } })) }] : []);
 
-const sectionsOf = (t, profile, services) => ({ services: services.length > 0, about: Boolean(t.about || t.owner_photo), areas: Boolean(profile.cities.length || profile.base_city), resources: profile.resources.length > 0 });
+const NO_COMMUNITY = { blog: false, qa: false, email: false, posts: [], qas: [], cityPosts: [] };
+const sectionsOf = (t, profile, services, cm = NO_COMMUNITY) => ({ services: services.length > 0, about: Boolean(t.about || t.owner_photo), areas: Boolean(profile.cities.length || profile.base_city), resources: profile.resources.length > 0, blog: cm.blog, qa: cm.qa });
 
 // Bold theme: menu, banner picture, service tiles, highlights, then the request form on dark.
-function boldTop(t, profile, u, img, services, bookable, tel) {
+function boldTop(t, profile, u, img, services, bookable, tel, cm) {
   const B = profile.banner;
   const tiles = services.filter((p) => p.image);
   const phrase = servicePhrase(profile);
-  return `${boldHeader(t, profile, u, { current: 'home', sections: sectionsOf(t, profile, services) })}
+  return `${boldHeader(t, profile, u, { current: 'home', sections: sectionsOf(t, profile, services, cm) })}
 ${B.desktop ? `<section class="banner" aria-label="${esc(t.name)}"><picture>${B.mobile ? `<source media="(max-width: 700px)" srcset="${img(B.mobile)}">` : ''}<img src="${img(B.desktop)}" alt="${esc(B.alt || t.name)}" fetchpriority="high"></picture></section>` : ''}
 ${tiles.length ? `<section class="tiles" aria-labelledby="tiles-h"><div class="wrap"><h2 id="tiles-h" class="sr-only">What we work on</h2><ul class="tile-grid">${tiles.map((p) => `<li><a href="${hasPage(p) ? u.rel('/services/' + serviceSlug(p, services)) : '#svc-' + p.id}"><img src="${img(p.image)}" alt="${esc(p.name)}" loading="lazy" width="204" height="204"></a></li>`).join('')}</ul></div></section>` : ''}
 ${profile.highlights.length ? `<section class="hl" aria-label="Why choose ${esc(t.name)}"><ul class="wrap">${profile.highlights.map((h) => `<li>${icon(h.icon)}<span><strong>${esc(h.title)}</strong>${esc(h.text)}</span></li>`).join('')}</ul></section>` : ''}
@@ -338,7 +354,7 @@ ${profile.highlights.length ? `<section class="hl" aria-label="Why choose ${esc(
 }
 
 // A page for one service, from the owner's write-up.
-export function renderServicePage(t, products, profile, product, { platformBase, onDomain = false }) {
+export function renderServicePage(t, products, profile, product, { platformBase, onDomain = false, community: cm = NO_COMMUNITY }) {
   const u = siteUrls(t, platformBase, onDomain);
   const img = (f) => `/media/${encodeURIComponent(t.slug)}/${encodeURIComponent(f)}`;
   const mediaAbs = (f) => `${platformBase}${img(f)}`;
@@ -356,7 +372,7 @@ export function renderServicePage(t, products, profile, product, { platformBase,
   const crumbs = { '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [{ '@type': 'ListItem', position: 1, name: t.name, item: u.abs('/') }, { '@type': 'ListItem', position: 2, name: product.name, item: canonical }] };
   const others = services.filter((p) => p.id !== product.id && hasPage(p));
   return `${head(t, profile, { title, description, canonical, robots: 'index,follow', image: product.image ? mediaAbs(product.image) : (t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : ''), schemas: [business, service, crumbs] })}
-${topBar(t, u, img, profile, { current: 'services', sections: sectionsOf(t, profile, services) })}
+${topBar(t, u, img, profile, { current: 'services', sections: sectionsOf(t, profile, services, cm) })}
 <section class="${profile.theme === 'bold' ? 'svc-hero' : 'hero'}"><div class="wrap">
   ${product.image && profile.theme === 'bold' ? `<img src="${img(product.image)}" alt="" width="204" height="204">` : ''}
   <div class="hero-l">
@@ -370,10 +386,10 @@ ${topBar(t, u, img, profile, { current: 'services', sections: sectionsOf(t, prof
 <section class="s"><div class="wrap prose">${details(product.details)}</div></section>
 <section class="s alt" id="request-wrap"><div class="wrap" style="display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start"><div style="flex:1 1 320px;min-width:0"><h2>${product.bookable ? `Book ${esc(product.name.toLowerCase())}` : 'Request service'}</h2><p>Send your location and a few details and we’ll call or text you back.</p></div>${requestCard(t, bookable)}</div></section>
 ${others.length ? `<section class="s"><div class="wrap"><h2>Other services</h2><ul class="areas">${others.map((p) => `<li><a href="${u.rel('/services/' + serviceSlug(p, products))}">${esc(p.name)}</a></li>`).join('')}</ul></div></section>` : ''}
-${footer(t, profile, u)}`;
+${footer(t, profile, u, cm)}`;
 }
 
-export function renderSite(t, products, profile, { platformBase, onDomain = false }) {
+export function renderSite(t, products, profile, { platformBase, onDomain = false, community: cm = NO_COMMUNITY }) {
   const u = siteUrls(t, platformBase, onDomain);
   const img = (f) => `/media/${encodeURIComponent(t.slug)}/${encodeURIComponent(f)}`;
   const mediaAbs = (f) => `${platformBase}${img(f)}`;
@@ -390,7 +406,7 @@ export function renderSite(t, products, profile, { platformBase, onDomain = fals
   const bold = profile.theme === 'bold';
 
   return `${head(t, profile, { title, description, canonical: u.abs('/'), robots: 'index,follow', image: t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : '', schemas: [businessSchema(t, profile, products, u, mediaAbs), ...faqSchema(profile)] })}
-${bold ? boldTop(t, profile, u, img, services, bookable, tel) : `${topBar(t, u, img)}
+${bold ? boldTop(t, profile, u, img, services, bookable, tel, cm) : `${topBar(t, u, img)}
 
 <section class="hero"><div class="wrap">
   <div class="hero-l">
@@ -409,12 +425,14 @@ ${credentialsSection(profile)}
 ${videosSection(profile)}
 ${t.about || t.owner_photo ? `<section class="s" id="about"><div class="wrap about">${t.owner_photo ? `<img src="${img(t.owner_photo)}" alt="${esc(t.name)}">` : ''}<div><h2>About us</h2>${para(t.about)}</div></div></section>` : ''}
 ${areasSection(t, profile, u, null)}
+${blogSection(cm.blog ? cm.posts : [], profile, u, img, 'From the blog', true)}
 ${faqSection(profile)}
+${qaSection(cm, u)}
 ${resourcesSection(profile, u)}
-${footer(t, profile, u)}`;
+${footer(t, profile, u, cm)}`;
 }
 
-export function renderCityPage(t, products, profile, city, { platformBase, onDomain = false }) {
+export function renderCityPage(t, products, profile, city, { platformBase, onDomain = false, community: cm = NO_COMMUNITY }) {
   const u = siteUrls(t, platformBase, onDomain);
   const img = (f) => `/media/${encodeURIComponent(t.slug)}/${encodeURIComponent(f)}`;
   const mediaAbs = (f) => `${platformBase}${img(f)}`;
@@ -432,7 +450,7 @@ export function renderCityPage(t, products, profile, city, { platformBase, onDom
   const crumbs = { '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: [{ '@type': 'ListItem', position: 1, name: t.name, item: u.abs('/') }, { '@type': 'ListItem', position: 2, name: place, item: canonical }] };
 
   return `${head(t, profile, { title, description, canonical, robots: cityIndexable(city) ? 'index,follow' : 'noindex,follow', image: t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : '', schemas: [business, service, crumbs] })}
-${topBar(t, u, img, profile, { current: 'areas', sections: sectionsOf(t, profile, services) })}
+${topBar(t, u, img, profile, { current: 'areas', sections: sectionsOf(t, profile, services, cm) })}
 
 <section class="hero"><div class="wrap">
   <div class="hero-l">
@@ -446,10 +464,124 @@ ${topBar(t, u, img, profile, { current: 'areas', sections: sectionsOf(t, profile
 </div></section>
 
 ${city.intro ? `<section class="s"><div class="wrap intro"><h2>Serving ${esc(city.name)}</h2>${para(city.intro)}</div></section>` : ''}
+${blogSection(cm.blog ? cm.cityPosts : [], profile, u, img, `Recent work in ${city.name}`, false)}
 ${servicesSection(services, u)}
 ${credentialsSection(profile)}
 ${areasSection(t, profile, u, slug)}
-${footer(t, profile, u)}`;
+${footer(t, profile, u, cm)}`;
+}
+
+// ---------- blog and questions ----------
+// Posts and answered questions come from server.js already formatted for display: each has a
+// date_label (in the business's time zone) and iso dates for search engines.
+const townOf = (profile, slug) => { const c = slug && profile.cities.find((x) => citySlug(x) === slug); return c ? `${c.name}, ${c.state}` : ''; };
+const postSummary = (p) => p.summary || clip(plainText(p.body), 200);
+function postCards(posts, profile, u, img) {
+  return `<ul class="posts">${posts.map((p) => {
+    const href = u.rel('/blog/' + p.slug), town = townOf(profile, p.city);
+    return `<li class="post-card">${p.image ? `<a href="${href}" tabindex="-1" aria-hidden="true"><img src="${img(p.image)}" alt="" loading="lazy" width="640" height="360"></a>` : ''}<div>
+      <p class="meta">${esc(p.date_label)}${town ? ` · ${esc(town)}` : ''}</p><h3><a href="${href}">${esc(p.title)}</a></h3><p>${esc(postSummary(p))}</p></div></li>`;
+  }).join('')}</ul>`;
+}
+function blogSection(posts, profile, u, img, heading, linkAll) {
+  if (!posts.length) return '';
+  return `<section class="s" id="blog"><div class="wrap"><h2>${esc(heading)}</h2>${postCards(posts, profile, u, img)}${linkAll ? `<a class="more-link" href="${u.rel('/blog')}">See all posts</a>` : ''}</div></section>`;
+}
+const qaItems = (qas, u, full) => `<ul class="qa-list">${qas.map((q) => `<li class="qa"><h3><a href="${u.rel('/questions/' + q.slug)}">${esc(q.title)}</a></h3><p>${esc(clip(plainText(q.answer), full ? 320 : 200))}</p></li>`).join('')}</ul>`;
+function qaSection(cm, u) {
+  if (!cm.qa) return '';
+  return `<section class="s alt" id="questions"><div class="wrap"><h2>Questions and answers</h2>
+    ${cm.qas.length ? qaItems(cm.qas, u, false) : '<p style="max-width:46em">Have a question about your rig? Ask us. We answer the useful ones here so other customers can see them too.</p>'}
+    <p style="margin-top:22px"><a class="btn btn-l" href="${u.rel('/questions')}#ask">Ask a question</a>${cm.qas.length ? ` <a class="more-link" style="margin-left:16px" href="${u.rel('/questions')}">See all answers</a>` : ''}</p></div></section>`;
+}
+function askCard(t, cm) {
+  const tel = telDigits(t.phone);
+  return `<div class="card" id="ask">
+    <form id="ask-form" novalidate data-slug="${esc(t.slug)}">
+      <div style="position:absolute;left:-9999px" aria-hidden="true"><label for="ask-website">Leave empty</label><input id="ask-website" name="website" tabindex="-1" autocomplete="off"></div>
+      <h2>Ask a question</h2>
+      <p class="hint">We answer useful questions on this page so other customers can see them too.</p>
+      <label for="ask-q">Your question <span style="color:var(--p)">(required)</span></label><textarea id="ask-q" name="question" rows="4" maxlength="1000"></textarea>
+      <label for="ask-name">First name</label><input id="ask-name" name="name" autocomplete="given-name" maxlength="80">
+      ${cm.email ? '<label for="ask-email">Email</label><p class="hint" id="ask-email-hint">Optional. We’ll email you when it’s answered.</p><input id="ask-email" name="email" type="email" autocomplete="email" maxlength="200" aria-describedby="ask-email-hint">' : ''}
+      <p class="err" id="ask-err" role="alert" hidden></p>
+      <p class="hint" style="margin-top:14px">We may post your question with our answer on this site. We never show your name${cm.email ? ' or email' : ''}. <a href="/legal/privacy">Privacy</a></p>
+      <button class="btn btn-p" type="submit" style="margin-top:8px">Send question</button>
+    </form>
+    <div id="ask-sent" role="status" hidden><h2>Thanks! We got your question</h2><p>We’ll post an answer here soon<span id="ask-sent-email" hidden> and email you when it’s up</span>.${tel ? ` Need help right now? Call <a href="tel:${tel}">${esc(t.phone)}</a>.` : ''}</p></div>
+  </div>`;
+}
+// The top of a blog or questions page, in the business's look.
+function pageHero(t, profile, u, crumbs, h1, lead, side = '') {
+  const bold = profile.theme === 'bold';
+  return `<section class="${bold ? 'svc-hero' : 'hero'}"><div class="wrap" style="align-items:flex-start">
+  <div class="hero-l">
+    <p class="crumbs"><a href="${u.rel('/')}">${esc(t.name)}</a>${crumbs.map(([href, label]) => ` › ${href ? `<a href="${href}">${esc(label)}</a>` : esc(label)}`).join('')}</p>
+    <h1>${esc(h1)}</h1>
+    ${lead}
+  </div>${side}
+</div></section>`;
+}
+function pageParts(t, products, profile, platformBase, onDomain) {
+  const u = siteUrls(t, platformBase, onDomain);
+  const img = (f) => `/media/${encodeURIComponent(t.slug)}/${encodeURIComponent(f)}`;
+  const mediaAbs = (f) => `${platformBase}${img(f)}`;
+  const services = products.filter((p) => p.on_site);
+  return { u, img, mediaAbs, services, bookable: products.filter((p) => p.bookable), business: businessSchema(t, profile, products, u, mediaAbs), fallbackImage: t.owner_photo || t.logo ? mediaAbs(t.owner_photo || t.logo) : '' };
+}
+const crumbList = (items) => ({ '@context': 'https://schema.org', '@type': 'BreadcrumbList', itemListElement: items.map(([name, item], i) => ({ '@type': 'ListItem', position: i + 1, name, item })) });
+
+export function renderBlogIndex(t, products, profile, posts, { platformBase, onDomain = false, community: cm = NO_COMMUNITY }) {
+  const { u, img, services, business, fallbackImage } = pageParts(t, products, profile, platformBase, onDomain);
+  const canonical = u.abs('/blog');
+  const place = profile.base_city ? `${profile.base_city}, ${profile.base_state}` : '';
+  const blog = { '@context': 'https://schema.org', '@type': 'Blog', name: `${t.name} blog`, url: canonical, publisher: { '@id': business['@id'] },
+    blogPost: posts.slice(0, 30).map((p) => ({ '@type': 'BlogPosting', headline: p.title, url: u.abs('/blog/' + p.slug), datePublished: p.iso })) };
+  return `${head(t, profile, { title: `Blog | ${t.name}`, description: clip(`Tips, recent jobs and news from ${t.name}${place ? ` in ${place}` : ''}.`, 160), canonical, robots: posts.length ? 'index,follow' : 'noindex,follow', image: fallbackImage, schemas: [business, blog, crumbList([[t.name, u.abs('/')], ['Blog', canonical]])] })}
+${topBar(t, u, img, profile, { current: 'blog', sections: sectionsOf(t, profile, services, cm) })}
+${pageHero(t, profile, u, [[null, 'Blog']], `${t.name} blog`, '<p class="lead">Tips, recent jobs and news.</p>')}
+<section class="s"><div class="wrap">${posts.length ? postCards(posts, profile, u, img) : '<p>No posts yet. Check back soon.</p>'}</div></section>
+${footer(t, profile, u, cm)}`;
+}
+
+export function renderPost(t, products, profile, post, { platformBase, onDomain = false, community: cm = NO_COMMUNITY, more = [] }) {
+  const { u, img, mediaAbs, services, bookable, business, fallbackImage } = pageParts(t, products, profile, platformBase, onDomain);
+  const canonical = u.abs('/blog/' + post.slug);
+  const description = clip(postSummary(post), 160);
+  const town = townOf(profile, post.city);
+  const article = { '@context': 'https://schema.org', '@type': 'BlogPosting', headline: post.title, description, url: canonical, mainEntityOfPage: canonical,
+    datePublished: post.iso, dateModified: post.modified_iso || post.iso, author: { '@type': 'Organization', name: t.name, url: u.abs('/') }, publisher: { '@id': business['@id'] },
+    ...(post.image ? { image: mediaAbs(post.image) } : {}), ...(town ? { contentLocation: { '@type': 'Place', name: town } } : {}) };
+  return `${head(t, profile, { title: `${post.title} | ${t.name}`, description, canonical, robots: 'index,follow', image: post.image ? mediaAbs(post.image) : fallbackImage, schemas: [business, article, crumbList([[t.name, u.abs('/')], ['Blog', u.abs('/blog')], [post.title, canonical]])] })}
+${topBar(t, u, img, profile, { current: 'blog', sections: sectionsOf(t, profile, services, cm) })}
+${pageHero(t, profile, u, [[u.rel('/blog'), 'Blog']], post.title, `<p class="lead" style="font-size:18px">${esc(post.date_label)}${town ? ` · <a href="${u.rel('/areas/' + post.city)}" style="color:inherit">${esc(town)}</a>` : ''}</p>`)}
+<section class="s"><div class="wrap"><article class="prose">${post.image ? `<img class="cover" src="${img(post.image)}" alt="" width="880" height="495">` : ''}${richText(post.body)}</article></div></section>
+<section class="s alt" id="request-wrap"><div class="wrap" style="display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start"><div style="flex:1 1 320px;min-width:0"><h2>Need a hand?</h2><p>Send your location and a few details and we’ll call or text you back.</p>${cm.qa ? `<p>Just have a question? <a href="${u.rel('/questions')}#ask">Ask it here</a>.</p>` : ''}</div>${requestCard(t, bookable)}</div></section>
+${more.length ? `<section class="s"><div class="wrap"><h2>More from the blog</h2>${postCards(more, profile, u, img)}</div></section>` : ''}
+${footer(t, profile, u, cm)}`;
+}
+
+const faqLd = (qas, u) => ({ '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: qas.map((q) => ({ '@type': 'Question', name: q.title, url: u.abs('/questions/' + q.slug), acceptedAnswer: { '@type': 'Answer', text: plainText(q.answer) } })) });
+
+export function renderQuestions(t, products, profile, qas, { platformBase, onDomain = false, community: cm = NO_COMMUNITY }) {
+  const { u, img, services, business, fallbackImage } = pageParts(t, products, profile, platformBase, onDomain);
+  const canonical = u.abs('/questions');
+  return `${head(t, profile, { title: `Questions and answers | ${t.name}`, description: clip(`Answers to customer questions from ${t.name}. Have one of your own? Ask it here.`, 160), canonical, robots: qas.length ? 'index,follow' : 'noindex,follow', image: fallbackImage, schemas: [business, ...(qas.length ? [faqLd(qas.slice(0, 50), u)] : []), crumbList([[t.name, u.abs('/')], ['Questions and answers', canonical]])] })}
+${topBar(t, u, img, profile, { current: 'questions', sections: sectionsOf(t, profile, services, cm) })}
+${pageHero(t, profile, u, [[null, 'Questions and answers']], 'Questions and answers', `<p class="lead">Ask ${esc(t.name)} a question. We answer the useful ones here so other customers can learn too.</p>`, askCard(t, cm))}
+<section class="s"><div class="wrap">${qas.length ? `<h2>Answered questions</h2>${qaItems(qas, u, true)}` : '<p>No answered questions yet. Be the first to ask.</p>'}</div></section>
+${footer(t, profile, u, cm)}`;
+}
+
+export function renderQuestion(t, products, profile, q, { platformBase, onDomain = false, community: cm = NO_COMMUNITY, more = [] }) {
+  const { u, img, services, business, fallbackImage } = pageParts(t, products, profile, platformBase, onDomain);
+  const canonical = u.abs('/questions/' + q.slug);
+  return `${head(t, profile, { title: `${clip(q.title, 70)} | ${t.name}`, description: clip(plainText(q.answer), 160), canonical, robots: answerIndexable(q) ? 'index,follow' : 'noindex,follow', image: fallbackImage, schemas: [business, faqLd([q], u), crumbList([[t.name, u.abs('/')], ['Questions and answers', u.abs('/questions')], [clip(q.title, 70), canonical]])] })}
+${topBar(t, u, img, profile, { current: 'questions', sections: sectionsOf(t, profile, services, cm) })}
+${pageHero(t, profile, u, [[u.rel('/questions'), 'Questions and answers']], q.title, `<p class="lead" style="font-size:18px">Asked by a customer · answered ${esc(q.date_label)}</p>`)}
+<section class="s"><div class="wrap"><div class="prose answer"><p class="by">${esc(t.name)} answered:</p>${richText(q.answer)}</div></div></section>
+<section class="s alt"><div class="wrap" style="display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start"><div style="flex:1 1 320px;min-width:0"><h2>Have a question of your own?</h2><p>Ask us. We read every one.</p>${more.length ? `<h3 style="font-size:22px;margin:24px 0 8px">More answers</h3>${qaItems(more, u, false)}` : ''}<a class="more-link" href="${u.rel('/questions')}">All questions and answers</a></div>${askCard(t, cm)}</div></section>
+${footer(t, profile, u, cm)}`;
 }
 
 // Pages search engines should index for one business, as absolute URLs.
