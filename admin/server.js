@@ -2463,6 +2463,14 @@ export function createApp(env = process.env) {
   // Businesses on a legacy Express payout account get a new account here; the old one is kept so
   // payments taken before the switch can still pay out.
   const creatingAccount = new Map(); // tenant id -> in-flight account creation (double-click safety)
+  // A Stripe failure while an owner connects: log the details for the Render logs, and show the owner Stripe's
+  // own reason (instead of "Something went wrong") so they can send it to HitchPoint.
+  function stripeSetupError(e, t, step) {
+    if (!e || !e.stripe) return e;
+    console.error(`[stripe] connect failed for business ${t.id} (${t.slug}) while ${step}: ${e.message}${e.code ? ` [${e.code}]` : ''}`);
+    const said = String(e.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    return new HttpError(502, `Stripe couldn’t start your setup. Stripe said: “${said}” Send a screenshot of this to HitchPoint and we’ll fix it.`);
+  }
   route('POST', '/api/stripe/connect', async (req, res, p, url, { tenant: t, user }) => {
     if (!stripe.enabled) throw new HttpError(503, 'Payments aren’t switched on for the platform yet. Contact support.');
     let acct = isMerchant(t) ? t.stripe_account_id : null;
@@ -2471,7 +2479,7 @@ export function createApp(env = process.env) {
         creatingAccount.set(t.id, (async () => {
           const fresh = getTenant(t.id);
           if (isMerchant(fresh)) return fresh.stripe_account_id;
-          const id = (await stripe.createMerchantAccount({ email: fresh.email || user.email, businessName: fresh.name, tenantId: fresh.id })).id;
+          const id = (await stripe.createMerchantAccount({ email: fresh.email || user.email, businessName: fresh.name, tenantId: fresh.id }).catch((e) => { throw stripeSetupError(e, fresh, 'creating the Stripe account'); })).id;
           db.prepare(`UPDATE tenants SET legacy_stripe_account_id = COALESCE(legacy_stripe_account_id, stripe_account_id), stripe_account_id = ?, stripe_account_type = 'v2_merchant', stripe_payouts_enabled = 0, stripe_details_submitted = 0 WHERE id = ? AND COALESCE(stripe_account_type, '') != 'v2_merchant'`).run(id, fresh.id);
           return getTenant(fresh.id).stripe_account_id;
         })().finally(() => creatingAccount.delete(t.id)));
@@ -2481,9 +2489,10 @@ export function createApp(env = process.env) {
     // In the phone app, Stripe opens in the in-app browser (which isn't logged in), so Stripe sends the
     // owner to a short "tap Done" page; closing it takes them back to the app, which refreshes their status.
     const inApp = /HitchPointApp\//.test(String(req.headers['user-agent'] || ''));
-    const link = inApp
-      ? await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/app-done.html?expired=1`, returnUrl: `${baseUrl(req)}/admin/app-done.html` })
-      : await stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` });
+    const link = await (inApp
+      ? stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/app-done.html?expired=1`, returnUrl: `${baseUrl(req)}/admin/app-done.html` })
+      : stripe.merchantAccountLink({ account: acct, refreshUrl: `${baseUrl(req)}/admin/#/onboarding/refresh`, returnUrl: `${baseUrl(req)}/admin/#/onboarding/return` })
+    ).catch((e) => { throw stripeSetupError(e, t, 'opening Stripe’s setup pages'); });
     send(res, 200, { url: link.url });
   }, { auth: 'owner', onboarding: true });
   route('POST', '/api/stripe/refresh', async (req, res, p, url, { tenant: t }) => {
@@ -2609,6 +2618,13 @@ export function createApp(env = process.env) {
     const modeNote = onLiveSite && mode === 'test' ? ' Warning: this is a TEST key on the live site, so real customers can’t pay. Use your sk_live_ key here.' : '';
     try {
       const a = await stripe.platformAccount();
+      // Businesses connect through Accounts v2; if the key can't use it, Connect Stripe fails for every owner.
+      await stripe.listMerchantAccounts().then(
+        () => checks.push({ name: 'Business Stripe accounts (Accounts v2)', ok: true, message: 'HitchPoint can create and look up businesses’ Stripe accounts.' }),
+        (e) => checks.push({ name: 'Business Stripe accounts (Accounts v2)', ok: false, message: `Stripe won’t let this key manage businesses’ accounts, so Connect Stripe fails: ${e.message}` }));
+      checks.push({ name: 'Bank (ACH) payments', ok: true, message: stripe.requestsAch
+        ? 'Requested for each business. Stripe must allow ACH Direct Debit for connected accounts (Settings → Connect → Payment methods); if it doesn’t, add STRIPE_ACH_PAYMENTS = off in Render.'
+        : 'Off (STRIPE_ACH_PAYMENTS = off). Businesses take cards only.' });
       send(res, 200, { ok: true, test_mode: stripe.testMode, mode_note: modeNote, account_id: a.id, name: a.settings?.dashboard?.display_name || a.business_profile?.name || '', charges_enabled: Boolean(a.charges_enabled), details_submitted: Boolean(a.details_submitted), checks });
     } catch (e) {
       send(res, 200, { ok: false, error: `The key looks right, but Stripe turned it down: ${e.message} If you rolled (replaced) the key in Stripe, paste the new one into Render.`, checks });

@@ -40,8 +40,13 @@ test('stripeSettingProblem names the mistake without repeating the value', () =>
 });
 
 test('the admin check: a padded key still works, and each setting gets a line', async () => {
+  let v2Refused = false;
   const stripeMock = http.createServer((req, res) => {
     const ok = req.headers.authorization === `Bearer ${KEY}`;
+    if (ok && req.url.startsWith('/v2/core/accounts')) {
+      res.writeHead(v2Refused ? 400 : 200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(v2Refused ? { error: { message: 'Accounts v2 is not enabled for this platform.' } } : { data: [] }));
+    }
     res.writeHead(ok ? 200 : 401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(ok ? { id: 'acct_platform', business_profile: { name: 'HitchPoint' }, charges_enabled: true, details_submitted: true } : { error: { message: 'Invalid API Key provided.' } }));
   });
@@ -62,7 +67,15 @@ test('the admin check: a padded key still works, and each setting gets a line', 
     const good = await run({ STRIPE_SECRET_KEY: ` ${KEY}\n`, STRIPE_CONNECT_WEBHOOK_SECRET: `"${WHSEC}"`, STRIPE_WEBHOOK_SECRET: WHSEC });
     assert.equal(good.ok, true, JSON.stringify(good));
     assert.equal(good.test_mode, false);
-    assert.deepEqual(good.checks.map((c) => c.ok), [true, true]);
+    // Webhook secrets, then whether businesses' Stripe accounts can be made (Accounts v2), then the ACH setting.
+    assert.deepEqual(good.checks.map((c) => c.ok), [true, true, true, true]);
+    assert.match(good.checks[2].name, /Accounts v2/);
+    assert.match(good.checks[3].message, /STRIPE_ACH_PAYMENTS/);
+    v2Refused = true;
+    const noV2 = await run({ STRIPE_SECRET_KEY: KEY, STRIPE_CONNECT_WEBHOOK_SECRET: WHSEC });
+    assert.equal(noV2.checks.find((c) => /Accounts v2/.test(c.name)).ok, false);
+    assert.match(noV2.checks.find((c) => /Accounts v2/.test(c.name)).message, /Connect Stripe fails: Accounts v2 is not enabled/);
+    v2Refused = false;
     const pk = await run({ STRIPE_SECRET_KEY: 'pk_live_' + 'x'.repeat(90) });
     assert.equal(pk.ok, false);
     assert.match(pk.error, /publishable key/);

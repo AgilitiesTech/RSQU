@@ -20,6 +20,7 @@ const sessions = new Map();
 const accounts = new Map(); // v1 Express (legacy)
 const merchants = new Map(); // v2 merchant accounts
 const transfers = [];
+let stripeRefusesNextAccount = false;
 const v2Requests = [];
 const appFees = new Map(); // application fees (platform account) for refund tests
 const appFeeRefunds = [];
@@ -44,6 +45,7 @@ const stripeMock = http.createServer((req, res) => {
       v2Requests.push({ method: req.method, url: req.url, body: j });
       if (req.method === 'POST' && req.url === '/v2/core/accounts') {
         if ('type' in j) return bad('v2 accounts take no top-level type');
+        if (stripeRefusesNextAccount) { stripeRefusesNextAccount = false; return bad('The ach_debit_payments capability is not available for this platform.'); }
         const id = 'acct_' + crypto.randomBytes(5).toString('hex');
         merchants.set(id, { id, body: j, card: 'inactive', due: 'currently_due', submitted: false });
         return ok({ id, object: 'v2.core.account' });
@@ -227,6 +229,11 @@ test('super admin creates a business; owner sets password and must accept agreem
   // account. The rest of the dashboard works meanwhile (requests, quotes, cash and check).
   assert.equal((await mike('GET', '/api/me')).json.needs_payout_setup, true);
   assert.equal((await mike('GET', '/api/requests')).status, 200);
+  // If Stripe refuses, the owner sees Stripe's reason (to send to HitchPoint), not "Something went wrong".
+  stripeRefusesNextAccount = true;
+  const refused = await mike('POST', '/api/stripe/connect');
+  assert.equal(refused.status, 502);
+  assert.match(refused.json.error, /Stripe couldn’t start your setup\. Stripe said: “The ach_debit_payments capability is not available for this platform\.”/);
   const c = await mike('POST', '/api/stripe/connect');
   assert.match(c.json.url, /connect\.stripe\.test\/setup\/acct_/);
   const acct = c.json.url.split('/').pop();

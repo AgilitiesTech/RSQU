@@ -58,15 +58,24 @@ export function stripeClient(env) {
     return out;
   }
 
+  // Every Stripe request gives up after 20 seconds, so a button never waits forever.
+  async function send(url, opts) {
+    try { return await fetch(url, { ...opts, signal: AbortSignal.timeout(20000) }); }
+    catch (e) {
+      if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) throw Object.assign(new Error('Stripe didn’t answer within 20 seconds.'), { stripe: true });
+      throw Object.assign(new Error(`Couldn’t reach Stripe (${e && e.message ? e.message : 'network error'}).`), { stripe: true });
+    }
+  }
+
   // `account` sends the request on behalf of a business's own Stripe account (Stripe-Account header).
   async function call(method, pathname, body, { idempotencyKey, account } = {}) {
     const headers = { Authorization: `Bearer ${key}` };
     if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
     if (account) headers['Stripe-Account'] = account;
-    const res = await fetch(base + pathname, { method, headers, body: body ? form(body).toString() : undefined });
+    const res = await send(base + pathname, { method, headers, body: body ? form(body).toString() : undefined });
     const json = await res.json().catch(() => ({}));
-    if (!res.ok) throw Object.assign(new Error(json?.error?.message || `Stripe error ${res.status}`), { status: res.status });
+    if (!res.ok) throw Object.assign(new Error(json?.error?.message || `Stripe error ${res.status}`), { status: res.status, stripe: true, code: json?.error?.code });
     return json;
   }
 
@@ -75,9 +84,9 @@ export function stripeClient(env) {
     const headers = { Authorization: `Bearer ${key}`, 'Stripe-Version': v2Version };
     if (body) headers['Content-Type'] = 'application/json';
     const qs = query ? '?' + Object.entries(query).flatMap(([k, v]) => (Array.isArray(v) ? v.map((x, i) => `${k}[${i}]=${encodeURIComponent(x)}`) : [`${k}=${encodeURIComponent(v)}`])).join('&') : '';
-    const res = await fetch(base + pathname + qs, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    const res = await send(base + pathname + qs, { method, headers, body: body ? JSON.stringify(body) : undefined });
     const json = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(json?.error?.message || `Stripe error ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(json?.error?.message || `Stripe error ${res.status}`), { stripe: true, code: json?.error?.code });
     return json;
   }
 
@@ -151,6 +160,9 @@ export function stripeClient(env) {
       return call('POST', `/v1/accounts/${encodeURIComponent(account)}/login_links`, {});
     },
     // The platform's own Stripe account (used to confirm the API key works).
+    // For the Platform page's Stripe check: can this key use Accounts v2 (how businesses' accounts are made)?
+    listMerchantAccounts() { return callV2('GET', '/v2/core/accounts', null, { limit: 1 }); },
+    requestsAch: requestAch,
     platformAccount() {
       return call('GET', '/v1/account');
     },
