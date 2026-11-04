@@ -94,7 +94,7 @@ const stripeMock = http.createServer((req, res) => {
       const s = {
         id, account: onAccount, url: 'https://checkout.stripe.test/' + id, client_reference_id: p.get('client_reference_id'), lines, amount_total: lines.reduce((a, l) => a + l.amount, 0),
         application_fee: p.get('payment_intent_data[application_fee_amount]'), descriptor_suffix: p.get('payment_intent_data[statement_descriptor_suffix]'),
-        terms_version: p.get('metadata[customer_terms_version]'), pi_terms_version: p.get('payment_intent_data[metadata][customer_terms_version]'), payment_status: 'unpaid',
+        terms_version: p.get('metadata[customer_terms_version]'), pi_terms_version: p.get('payment_intent_data[metadata][customer_terms_version]'), payment_status: 'unpaid', origin_context: p.get('origin_context'),
       };
       sessions.set(id, s);
       return ok({ ...s, status: 'open' });
@@ -380,6 +380,7 @@ test('deposit paid online: direct charge on the business account with the 3% app
   assert.equal(sess.application_fee, '387');
   assert.equal(sess.descriptor_suffix, 'MIKE STEVENS EMERGENCY');
   assert.deepEqual([sess.terms_version, sess.pi_terms_version], ['1', '1']);
+  assert.equal(sess.origin_context, 'web', 'a customer in a browser: not Stripe’s app-to-web flow');
 
   sess.payment_status = 'paid';
   const forged = webhook({ type: 'checkout.session.completed', account: mikeAcct, data: { object: sess } });
@@ -411,6 +412,10 @@ test('deposit paid online: direct charge on the business account with the 3% app
   // A payment page loaded before the owner approved new terms can't check out on the old version.
   const dep2 = await mike('POST', `/api/requests/${rid}/deposit`, { method: 'card' });
   assert.equal((await anon('POST', `/api/public/payments/${dep2.json.token}/checkout`, { terms_version: 99 })).status, 409);
+
+  // Started inside the HitchPoint phone app: Stripe's app-to-web checkout (origin_context mobile_app).
+  assert.ok((await anon('POST', `/api/public/payments/${dep2.json.token}/checkout`, {}, { 'User-Agent': 'Mozilla/5.0 (Linux; Android 15) HitchPointApp/1.0' })).json.url);
+  assert.equal([...sessions.values()].find((s) => s.client_reference_id === dep2.json.token).origin_context, 'mobile_app');
 });
 
 test('quote: signed with the business’s terms, paid online with the Processing Fee on the balance', async () => {
@@ -1337,6 +1342,15 @@ test('pay over time: Checkout uses each business’s own payment methods; the no
   cap.close();
   assert.deepEqual([seen[0].url, seen[0].account, seen[0].body.get('mode')], ['/v1/checkout/sessions', 'acct_cap', 'payment']);
   assert.ok(![...seen[0].body.keys()].some((k) => k.startsWith('payment_method_types')));
+  // Checkout Studio settings (Nov 4, 2026). payment_method_collection is subscription-only, so it's absent.
+  const studio = Object.fromEntries(['ui_mode', 'billing_address_collection', 'phone_number_collection[enabled]', 'automatic_tax[enabled]', 'allow_promotion_codes', 'submit_type', 'integration_identifier', 'origin_context'].map((k) => [k, seen[0].body.get(k)]));
+  assert.deepEqual(studio, {
+    ui_mode: 'hosted_page', billing_address_collection: 'auto', 'phone_number_collection[enabled]': 'false', 'automatic_tax[enabled]': 'false',
+    allow_promotion_codes: 'false', submit_type: 'auto', integration_identifier: 'hosted_mobile_app_0001', origin_context: 'web',
+  });
+  assert.equal(seen[0].body.get('payment_method_collection'), null);
+  // HitchPoint's own settings stay: its fee and the link back to the payment.
+  assert.deepEqual([seen[0].body.get('payment_intent_data[application_fee_amount]'), seen[0].body.get('client_reference_id'), seen[0].body.get('metadata[payment_token]')], ['1800', 'tok_cap', 'tok_cap']);
 
   const invoice = async (cents) => {
     const q = (await mike('POST', '/api/invoices', {})).json;

@@ -386,6 +386,7 @@ export function createApp(env = process.env) {
       statementName: t.statement_name || t.name,
       // Which customer terms applied to this payment (also visible in the business's Stripe Dashboard).
       metadata: { customer_terms_version: String(terms.version), customer_terms_sha256: terms.sha256 },
+      fromApp: /HitchPointApp\//.test(String(req.headers['user-agent'] || '')), // Stripe's origin_context
     });
     db.prepare(`UPDATE payments SET stripe_session_id = ?, charge_type = 'direct', stripe_account = ?, customer_terms_version = ? WHERE id = ?`)
       .run(session.id, t.stripe_account_id, terms.version, payment.id);
