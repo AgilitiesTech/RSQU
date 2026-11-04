@@ -1,0 +1,21 @@
+name: Live page check (temporary)
+on:
+  push:
+    branches: [diag-live-check]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the live home page from each address
+        run: |
+          for u in "https://gethitchpoint.com/?nocache=$RANDOM$RANDOM" "https://gethitchpoint.com/" "https://rsqumobilervservice.com/" "https://rsqu-admin.onrender.com/"; do
+            echo "=== $u"
+            curl -sS -D headers.txt -o body.html -H 'Cache-Control: no-cache' "$u" || true
+            grep -iE '^(HTTP/|age:|cache-control:|cf-cache-status:|x-render|rndr-id|server:|date:|cf-ray:)' headers.txt || true
+            echo "mailto links: $(grep -o 'mailto:' body.html | wc -l)"
+            echo "'Or email' text: $(grep -o 'Or email' body.html | wc -l)"
+            echo "new logo img: $(grep -o 'logo-on-dark.svg' body.html | wc -l)"
+            echo "ld email field: $(grep -o '\"email\":' body.html | wc -l)"
+          done
