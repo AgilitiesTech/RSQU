@@ -1,14 +1,31 @@
 apply plugin: 'com.android.application'
 
+// Google Play builds are signed with HitchPoint's upload key. GitHub passes the key file and its password
+// in through these settings (see .github/workflows/mobile.yml); without them a release build is unsigned.
+def uploadKeystore = System.getenv('ANDROID_UPLOAD_KEYSTORE')
+def uploadPassword = System.getenv('ANDROID_UPLOAD_PASSWORD')
+def canSign = uploadKeystore && uploadPassword
+
 android {
+    signingConfigs {
+        if (canSign) {
+            release {
+                storeFile file(uploadKeystore)
+                storePassword uploadPassword
+                keyAlias 'upload'
+                keyPassword uploadPassword
+            }
+        }
+    }
     namespace = "com.gethitchpoint.app"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
         applicationId "com.gethitchpoint.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        // Each Google Play upload needs a higher versionCode; GitHub sets it from the build number.
+        versionCode((System.getenv('VERSION_CODE') ?: '1') as int)
+        versionName(System.getenv('VERSION_NAME') ?: '1.0')
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -18,6 +35,7 @@ android {
     }
     buildTypes {
         release {
+            if (canSign) signingConfig signingConfigs.release
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }

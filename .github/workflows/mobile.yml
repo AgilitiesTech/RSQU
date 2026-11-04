@@ -1,7 +1,14 @@
-# Builds the HitchPoint phone apps (mobile/) to check they compile, and makes an Android test app
-# (an .apk you can install on an Android phone) available to download from the run's page.
-# Nothing here is signed for the stores or uploaded anywhere; store builds come later, once the
-# Apple and Google accounts exist (see mobile/README.md).
+# HitchPoint phone apps (mobile/).
+#
+# Every change: checks both apps build, makes an Android test app (.apk) you can install by hand, and
+# checks that a Google Play build signs (with a throwaway key).
+#
+# On main, or when you click "Run workflow": builds the Google Play app bundle (.aab), signed with
+# HitchPoint's upload key, and saves it on the run's page for uploading to Play Console.
+#   - The upload key is mobile/android/upload-keystore.p12, locked with the ANDROID_UPLOAD_PASSWORD
+#     repository secret (the password lives only in that secret and Aaron's password manager).
+#   - The first run on main after the secret is added creates the key and commits it.
+#   - Without the secret, the Google Play build is skipped with a note; nothing fails.
 name: Phone apps
 
 on:
@@ -43,6 +50,99 @@ jobs:
           name: HitchPoint-android-test
           path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
+      - name: Check a Google Play build signs (throwaway key, not saved)
+        working-directory: mobile/android
+        run: |
+          export ANDROID_UPLOAD_PASSWORD="$(openssl rand -hex 24)"
+          export ANDROID_UPLOAD_KEYSTORE="$RUNNER_TEMP/throwaway.p12"
+          keytool -genkeypair -keystore "$ANDROID_UPLOAD_KEYSTORE" -storetype PKCS12 -alias upload \
+            -keyalg RSA -keysize 2048 -validity 1 -dname "CN=Throwaway" \
+            -storepass:env ANDROID_UPLOAD_PASSWORD -keypass:env ANDROID_UPLOAD_PASSWORD
+          VERSION_CODE=1 ./gradlew bundleRelease --no-daemon
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab | grep -q 'jar verified' || { echo '::error::The Google Play build came out unsigned.'; exit 1; }
+          rm -f "$ANDROID_UPLOAD_KEYSTORE"
+
+  android-release:
+    name: Android app for Google Play
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to commit the upload key the first time
+    concurrency:
+      group: android-release
+      cancel-in-progress: false
+    env:
+      ANDROID_UPLOAD_PASSWORD: ${{ secrets.ANDROID_UPLOAD_PASSWORD }}
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the upload key password is set
+        id: secret
+        run: |
+          if [ -z "$ANDROID_UPLOAD_PASSWORD" ]; then
+            echo "::notice::Skipped the Google Play build: add the ANDROID_UPLOAD_PASSWORD secret (GitHub → Settings → Secrets and variables → Actions), then click Run workflow."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create the upload key (first run only)
+        if: steps.secret.outputs.ready == 'true' && hashFiles('mobile/android/upload-keystore.p12') == ''
+        working-directory: mobile/android
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::The upload key is created on main. Run this workflow on main first."; exit 1
+          fi
+          keytool -genkeypair -keystore upload-keystore.p12 -storetype PKCS12 -alias upload \
+            -keyalg RSA -keysize 4096 -validity 10000 \
+            -dname "CN=HitchPoint, O=Agilities Tech LLC, ST=Utah, C=US" \
+            -storepass:env ANDROID_UPLOAD_PASSWORD -keypass:env ANDROID_UPLOAD_PASSWORD
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f upload-keystore.p12
+          git commit -m "[skip render] Android upload key for Google Play (locked with the ANDROID_UPLOAD_PASSWORD secret)"
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - name: Check the password opens the upload key
+        if: steps.secret.outputs.ready == 'true'
+        working-directory: mobile/android
+        run: |
+          if ! keytool -list -keystore upload-keystore.p12 -storetype PKCS12 -alias upload -storepass:env ANDROID_UPLOAD_PASSWORD > /dev/null 2>&1; then
+            echo "::error::The ANDROID_UPLOAD_PASSWORD secret doesn't open the upload key. Put back the password saved in your password manager."; exit 1
+          fi
+          echo "Upload certificate fingerprints (public; Play Console shows the same):"
+          keytool -list -v -keystore upload-keystore.p12 -storetype PKCS12 -alias upload -storepass:env ANDROID_UPLOAD_PASSWORD | grep -E "SHA1:|SHA256:"
+      - uses: actions/setup-node@v4
+        if: steps.secret.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        if: steps.secret.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: 21
+      - if: steps.secret.outputs.ready == 'true'
+        run: npm ci && npx cap sync android
+      - name: Build the signed app bundle
+        if: steps.secret.outputs.ready == 'true'
+        working-directory: mobile/android
+        env:
+          ANDROID_UPLOAD_KEYSTORE: ${{ github.workspace }}/mobile/android/upload-keystore.p12
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 1.0.${{ github.run_number }}
+        run: |
+          ./gradlew bundleRelease --no-daemon
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab | grep -q 'jar verified' || { echo '::error::The Google Play build came out unsigned.'; exit 1; }
+          echo "::notice::HitchPoint 1.0.${{ github.run_number }} (version code ${{ github.run_number }}) is ready: download HitchPoint-android-release-${{ github.run_number }} under Artifacts and upload app-release.aab in Play Console."
+      - uses: actions/upload-artifact@v4
+        if: steps.secret.outputs.ready == 'true'
+        with:
+          name: HitchPoint-android-release-${{ github.run_number }}
+          path: mobile/android/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 90
 
   ios:
     name: iPhone build check
