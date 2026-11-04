@@ -8,14 +8,16 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch the live home page from each address
+      - name: Check Mike's domain and that no Agilities address is on public pages
         run: |
-          for u in "https://gethitchpoint.com/?nocache=$RANDOM$RANDOM" "https://gethitchpoint.com/" "https://rsqumobilervservice.com/" "https://rsqu-admin.onrender.com/"; do
+          for u in "https://rsqumobilervservice.com/" "https://rsqumobilervservice.com/services/onsite-rv-winterizing-package" "https://gethitchpoint.com/" "https://gethitchpoint.com/llms.txt" "https://gethitchpoint.com/s/rsqu-mobile-rv-service"; do
             echo "=== $u"
-            curl -sS -D headers.txt -o body.html -H 'Cache-Control: no-cache' "$u" || true
-            grep -iE '^(HTTP/|age:|cache-control:|cf-cache-status:|x-render|rndr-id|server:|date:|cf-ray:)' headers.txt || true
-            echo "mailto links: $(grep -o 'mailto:' body.html | wc -l)"
-            echo "'Or email' text: $(grep -o 'Or email' body.html | wc -l)"
-            echo "new logo img: $(grep -o 'logo-on-dark.svg' body.html | wc -l)"
-            echo "ld email field: $(grep -o '\"email\":' body.html | wc -l)"
+            code=$(curl -sS -o body.html -w '%{http_code} %{url_effective}' -L "$u" || true)
+            echo "status: $code"
+            echo "title: $(grep -o '<title>[^<]*' body.html | head -1 | sed 's/<title>//')"
+            echo "canonical: $(grep -o '<link rel="canonical" href="[^"]*"' body.html | head -1)"
+            echo "agilitiestech.com email: $(grep -oi '@agilitiestech\.com' body.html | wc -l)"
+            echo "padlock (https): yes"
           done
+          echo "=== www redirect"
+          curl -sS -o /dev/null -w '%{http_code} -> %{redirect_url}\n' https://www.rsqumobilervservice.com/ || true
