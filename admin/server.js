@@ -2463,13 +2463,21 @@ export function createApp(env = process.env) {
   // Businesses on a legacy Express payout account get a new account here; the old one is kept so
   // payments taken before the switch can still pay out.
   const creatingAccount = new Map(); // tenant id -> in-flight account creation (double-click safety)
+  // Stripe messages that mean HitchPoint's own (platform) Stripe account isn't ready to onboard businesses.
+  const PLATFORM_STRIPE_PROBLEM = /must be activated in order to create accounts|activate your account|complete your platform profile|platform profile|signed up for Connect|Connect is not enabled|isn['’]t enabled for Connect/i;
   // A Stripe failure while an owner connects: log the details for the Render logs, and show the owner Stripe's
   // own reason (instead of "Something went wrong") so they can send it to HitchPoint.
   function stripeSetupError(e, t, step) {
     if (!e || !e.stripe) return e;
     console.error(`[stripe] connect failed for business ${t.id} (${t.slug}) while ${step}: ${e.message}${e.code ? ` [${e.code}]` : ''}`);
+    // Some refusals are about HitchPoint's own Stripe account (whose key makes these calls), not the owner's,
+    // e.g. "Your account must be activated in order to create accounts." Don't send the owner to fix them.
+    if (PLATFORM_STRIPE_PROBLEM.test(String(e.message || ''))) {
+      console.error('[stripe] HitchPoint’s own Stripe account needs attention: see Platform → Check Stripe connection.');
+      return new HttpError(503, `${platformName} is finishing setting up its own Stripe account, so connecting isn’t available yet. Nothing is wrong with your Stripe account, and there’s nothing you need to do. ${platformName} has been told; try again later.`);
+    }
     const said = String(e.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-    return new HttpError(502, `Stripe couldn’t start your setup. Stripe said: “${said}” Send a screenshot of this to HitchPoint and we’ll fix it.`);
+    return new HttpError(502, `Stripe couldn’t start your setup. Stripe said: “${said}” Send a screenshot of this to ${platformName} and we’ll fix it.`);
   }
   route('POST', '/api/stripe/connect', async (req, res, p, url, { tenant: t, user }) => {
     if (!stripe.enabled) throw new HttpError(503, 'Payments aren’t switched on for the platform yet. Contact support.');
@@ -2618,6 +2626,11 @@ export function createApp(env = process.env) {
     const modeNote = onLiveSite && mode === 'test' ? ' Warning: this is a TEST key on the live site, so real customers can’t pay. Use your sk_live_ key here.' : '';
     try {
       const a = await stripe.platformAccount();
+      // Stripe won't let an un-activated platform create businesses' accounts ("Your account must be activated…").
+      const activated = Boolean(a.charges_enabled && a.details_submitted);
+      checks.push({ name: `${platformName}’s Stripe account activated`, ok: activated, message: activated
+        ? `Yes: Stripe has ${platformName}’s business details and can take payments, so businesses can connect.`
+        : `Not yet${a.details_submitted ? ' (details sent; Stripe is still reviewing or needs more)' : ''}. Businesses can’t connect until it is. Signed in to this Stripe account in live mode, finish activation at dashboard.stripe.com/account/onboarding.` });
       // Businesses connect through Accounts v2; if the key can't use it, Connect Stripe fails for every owner.
       await stripe.listMerchantAccounts().then(
         () => checks.push({ name: 'Business Stripe accounts (Accounts v2)', ok: true, message: 'HitchPoint can create and look up businesses’ Stripe accounts.' }),
