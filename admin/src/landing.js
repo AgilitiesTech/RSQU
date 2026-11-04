@@ -53,7 +53,13 @@ export function renderLanding({ origin, name = BRAND.name, email }) {
     { '@context': 'https://schema.org', '@type': 'FAQPage', mainEntity: FAQ.map(([q, a]) => ({ '@type': 'Question', name: q, acceptedAnswer: { '@type': 'Answer', text: a } })) },
   ];
   const ldTags = ld.map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/</g, '\\u003c')}</script>`).join('\n');
-  const logo = (size = 36) => `<svg width="${size}" height="${size}" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#FF7A1A"/><path d="M32 54c-1.2 0-2.2-.6-2.9-1.6C24 45 15 35.4 15 26.5 15 17.4 22.6 10 32 10s17 7.4 17 16.5C49 35.4 40 45 34.9 52.4c-.7 1-1.7 1.6-2.9 1.6z" fill="#10243A"/><circle cx="32" cy="26" r="8" fill="#FF7A1A"/><rect x="29" y="33" width="6" height="9" rx="2" fill="#FF7A1A"/></svg>`;
+  // The HitchPoint mark: a folk pine made of chevrons inside a map pin, with an orange sun (light-on-dark colors).
+  const MARK = '<path d="M32 59C29.6 55.4 13 41.2 13 27a19 19 0 0 1 38 0c0 14.2-16.6 28.4-19 32z" fill="#FBF7F0"/><circle cx="43" cy="17" r="3.2" fill="#FF7A1A"/><path d="M32 10L38.5 19.5L35.62 19.5L32 13.68L28.38 19.5L25.5 19.5ZM32 16L41.5 26.5L38.44 26.5L32 19.91L25.56 26.5L22.5 26.5ZM32 22.5L44.5 34L41.26 34L32 26.64L22.74 34L19.5 34Z" fill="#1F3D35"/><path d="M30.3 31h3.4v10a1.7 1.7 0 0 1-3.4 0z" fill="#FF7A1A"/>';
+  const logo = (size = 36) => `<svg width="${Math.round(size * 40 / 53)}" height="${size}" viewBox="12 7 40 53" aria-hidden="true">${MARK}</svg>`;
+  // The full HitchPoint logo (mark + wordmark) when the platform is HitchPoint; otherwise the mark and the configured name.
+  const brandLogo = (h) => (name === 'HitchPoint'
+    ? `<img src="/static/brand/logo-on-dark.svg" alt="HitchPoint" width="${Math.round(h * 620 / 114)}" height="${h}">`
+    : `${logo(h)}<span>${esc(name)}</span>`);
   // Line icons (24px grid, stroke = currentColor)
   const I = {
     trailer: '<rect x="2" y="6" width="15" height="10" rx="4"/><path d="M17 13h5M5 9h4v3H5z"/><circle cx="8" cy="17.5" r="2"/>',
@@ -127,7 +133,7 @@ header.top .wrap{display:flex;align-items:center;justify-content:space-between;g
 .logo{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none;font-family:var(--head);font-weight:800;font-size:24px;letter-spacing:-.01em}
 nav.main{display:flex;align-items:center;gap:4px}nav.main a{color:#D9E3EC;text-decoration:none;font-weight:600;padding:10px 12px;min-height:44px;display:inline-flex;align-items:center}
 nav.main a{white-space:nowrap}nav.main a:hover{color:#fff}nav.main .btn{min-height:44px;padding:0 18px;font-size:16px;color:var(--night);margin-left:6px}
-@media(max-width:480px){.logo{font-size:20px}.logo svg{width:30px;height:30px}nav.main .btn{padding:0 14px;font-size:15px}nav.main a{padding:10px 8px}}
+@media(max-width:480px){.logo{font-size:20px}.logo svg{width:24px;height:32px}.logo img{width:auto;height:30px}nav.main .btn{padding:0 14px;font-size:15px}nav.main a{padding:10px 8px}}
 @media(max-width:820px){nav.main a.hide{display:none}}
 /* hero */
 .hero{position:relative;background:var(--night);color:#fff;overflow:hidden}
@@ -208,7 +214,7 @@ footer{background:#0A1A16;color:#AFC0B8;padding:8px 0 40px;font-size:15px}footer
 </head>
 <body>
 <header class="top"><div class="wrap">
-  <a class="logo" href="/">${logo()}<span>${esc(name)}</span></a>
+  <a class="logo" href="/">${brandLogo(38)}</a>
   <nav class="main" aria-label="Main">
     <a class="hide" href="#how">How it works</a><a class="hide" href="#pricing">Pricing</a><a class="hide" href="#faq">FAQ</a>
     <a href="/admin/">Log in</a><a class="btn btn-o" href="/signup">Start free</a>
@@ -340,7 +346,7 @@ ${ridge('#16302A')}
 
 <div style="background:#16302A">${ridge('#0A1A16')}</div>
 <footer><div class="wrap">
-  <div><a class="logo" href="/" style="font-size:20px">${logo(28)}<span>${esc(name)}</span></a><p style="margin:8px 0 0">${esc(BRAND.tagline)}. ${esc(name)} is a d/b/a of Agilities.</p></div>
+  <div><a class="logo" href="/" style="font-size:20px">${brandLogo(32)}</a><p style="margin:8px 0 0">${esc(BRAND.tagline)}. ${esc(name)} is a d/b/a of Agilities.</p></div>
   <div><a href="/legal/terms">Terms</a> · <a href="/legal/privacy">Privacy</a> · <a href="/legal/payment-terms">Payment terms</a> · <a href="/admin/">Log in</a>${email ? ` · <a href="mailto:${esc(email)}">${esc(email)}</a>` : ''}</div>
 </div></footer>
 <script src="/static/landing.js"></script>

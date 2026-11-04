@@ -94,7 +94,7 @@ a(f'''<g>
 <rect x="{vx+8}" y="{vy-12}" width="134" height="6" rx="2" fill="#8C939A"/>
 <rect x="{vx+16}" y="{vy-12}" width="4" height="12" fill="#8C939A"/><rect x="{vx+130}" y="{vy-12}" width="4" height="12" fill="#8C939A"/>
 <rect x="{vx+40}" y="{vy-20}" width="40" height="8" rx="3" fill="#FF7A1A"/>
-<g transform="translate({vx+52},{vy+12}) scale(.42)"><rect width="64" height="64" rx="14" fill="#FF7A1A"/><path d="M32 54c-1.2 0-2.2-.6-2.9-1.6C24 45 15 35.4 15 26.5 15 17.4 22.6 10 32 10s17 7.4 17 16.5C49 35.4 40 45 34.9 52.4c-.7 1-1.7 1.6-2.9 1.6z" fill="#10243A"/><circle cx="32" cy="26" r="8" fill="#FF7A1A"/><rect x="29" y="33" width="6" height="9" rx="2" fill="#FF7A1A"/></g>
+<g transform="translate({vx+52},{vy+12}) scale(.42)"><rect width="64" height="64" rx="14" fill="#1F3D35"/><path d="M32 59C29.6 55.4 13 41.2 13 27a19 19 0 0 1 38 0c0 14.2-16.6 28.4-19 32z" fill="#FBF7F0"/><circle cx="43" cy="17" r="3.2" fill="#FF7A1A"/><path d="M32 10L38.5 19.5L35.62 19.5L32 13.68L28.38 19.5L25.5 19.5ZM32 16L41.5 26.5L38.44 26.5L32 19.91L25.56 26.5L22.5 26.5ZM32 22.5L44.5 34L41.26 34L32 26.64L22.74 34L19.5 34Z" fill="#1F3D35"/><path d="M30.3 31h3.4v10a1.7 1.7 0 0 1-3.4 0z" fill="#FF7A1A"/></g>
 <circle cx="{vx+44}" cy="{vy+84}" r="20" fill="#111"/><circle cx="{vx+44}" cy="{vy+84}" r="8" fill="#8C939A"/>
 <circle cx="{vx+190}" cy="{vy+84}" r="20" fill="#111"/><circle cx="{vx+190}" cy="{vy+84}" r="8" fill="#8C939A"/>
 <rect x="{vx+228}" y="{vy+58}" width="10" height="8" rx="2" fill="#FFE3A8"/>

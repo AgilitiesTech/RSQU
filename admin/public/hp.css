@@ -1,0 +1,102 @@
+/* HitchPoint brand for HitchPoint's own pages: the dashboards (owners, team members, Agilities admin,
+   affiliates), sign-in and sign-up, the offline page and the legal pages. It matches the home page:
+   pine and night-sky greens and navies, campfire orange, cream and sand, Bitter headings, Barlow text.
+   Loaded after app.css. Customer-facing business pages (proposals, payment pages, business websites)
+   don't load this file, so they keep each business's own name, logo and colors. */
+:root {
+  --night: #0E2236; --navy: #10243A; --pine: #1F3D35; --pine2: #16302A; --pine3: #0F241F;
+  --orange: #FF7A1A; --ember: #FF9A3C; --rust: #B4500B; --sand: #F4EBDD; --cream: #FBF7F0;
+
+  /* app.css tokens, remapped to the HitchPoint palette */
+  --red: var(--orange); --red-dark: var(--rust); --red-deep: #C25A0E;
+  --gold: var(--ember); --ink: #16212B; --text: #2B3640; --muted: #566370;
+  --line: #E2D7C5; --field: #9AA4AD; --bg: var(--cream); --card: #FFFFFF;
+  --ok: #1F5E3B; --ok-bg: #E2F0E6; --warn-bg: #FCE9E4; --warn: #8A2A12;
+  --display: 'Bitter', Rockwell, 'Roboto Slab', Georgia, serif;
+  --head: 'Bitter', Rockwell, 'Roboto Slab', Georgia, serif;
+  --cond: 'Barlow', 'Helvetica Neue', Arial, sans-serif;
+  --body: 'Barlow', 'Helvetica Neue', Arial, sans-serif;
+}
+body { background: var(--cream); color: var(--text); }
+a { color: var(--rust); }
+:focus-visible { outline: 3px solid var(--orange); outline-offset: 2px; }
+h1, h2, h3, .item-title, .big-num, .totals .big { font-family: var(--head); font-weight: 700; letter-spacing: -.005em; }
+h1 { font-weight: 800; font-size: 30px; }
+h2 { font-size: 22px; } h3 { font-size: 18px; }
+label, dl.facts dt, table.items th { font-family: var(--body); font-weight: 700; }
+dl.facts dt { color: var(--pine); }
+
+/* top bar: night pine with the HitchPoint mark */
+.topbar { background: var(--pine2); color: var(--cream); box-shadow: inset 0 -3px 0 var(--pine3); }
+.brand { font-family: var(--head); font-weight: 800; font-size: 19px; color: var(--cream); gap: 12px; }
+.brand small { font-family: var(--body); font-weight: 600; font-size: 13px; color: #B9CBC2; letter-spacing: .02em; }
+.brand .hp-mark { width: 26px; height: 34px; flex: none; }
+.brand .hp-lockup { height: 30px; width: auto; }
+.brand img.biz-logo { height: 34px; border-radius: 6px; background: #fff; }
+.topnav a { color: #DCE6E0; font-family: var(--body); font-weight: 600; border-radius: 999px; padding: 8px 14px; }
+.topnav a:hover { color: #fff; background: rgba(255,255,255,.08); }
+.topnav a[aria-current="page"] { background: var(--cream); color: var(--pine2); }
+.badge { background: var(--orange); color: var(--night); }
+.topnav a[aria-current="page"] .badge { background: var(--orange); }
+@media (max-width: 720px) {
+  .bottomnav { background: var(--pine2); box-shadow: inset 0 3px 0 var(--pine3); }
+  .bottomnav a { color: #C7D5CE; font-family: var(--body); font-weight: 600; font-size: 13px; }
+  .bottomnav a[aria-current="page"] { color: var(--ember); }
+  .brand { font-size: 17px; }
+}
+
+/* cards, lists */
+.card { border-color: var(--line); border-radius: 14px; box-shadow: 0 1px 0 rgba(16,36,58,.04); }
+.list { border-radius: 14px; border-color: var(--line); }
+.list a.item:hover { background: #FDF9F3; }
+.item-title { font-size: 18px; }
+.empty { font-size: 17px; }
+
+/* buttons: rounded like the home page; orange for the main action */
+.btn { border-radius: 999px; font-family: var(--body); font-weight: 700; font-size: 17px; border-color: var(--pine); color: var(--pine); padding: 0 20px; }
+.btn:hover { background: #F2F6F3; }
+.btn.primary { background: var(--orange); border-color: var(--orange); color: var(--night); box-shadow: 0 3px 0 #C25A0E; }
+.btn.primary:hover { background: #FF8D3D; border-color: #FF8D3D; }
+.btn.gold { background: var(--ember); border-color: var(--ember); color: var(--night); }
+.btn.ghost { border-color: var(--line); color: var(--ink); background: #fff; }
+.btn.sm { font-size: 15px; }
+.linkbtn { color: var(--rust); }
+
+/* forms */
+input, textarea, select { border-radius: 10px; border-color: var(--field); }
+input:focus, textarea:focus, select:focus { border-color: var(--pine); outline: none; box-shadow: 0 0 0 3px rgba(31,61,53,.2); }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--pine); }
+[aria-invalid="true"] { border-color: #C2410C !important; box-shadow: 0 0 0 3px rgba(194,65,12,.18); }
+.alert { border-radius: 10px; }
+
+/* tags and tabs */
+.tag { border-radius: 999px; padding: 2px 9px; font-size: 12px; letter-spacing: .05em; background: #EFE7DA; }
+.tag.new { background: var(--orange); color: var(--night); }
+.tag.repair { background: #F6E3C3; color: #5A3B00; }
+.tag.winterize, .tag.booking { background: #DCE8F2; color: var(--navy); }
+.tabs button { border-radius: 999px; font-family: var(--body); }
+.tabs button[aria-pressed="true"] { background: var(--pine); border-color: var(--pine); color: #fff; }
+
+/* admin "viewing a business" bar and Stripe banner */
+.viewas { background: var(--ember); color: var(--night); }
+.viewas .btn.gold { background: var(--night); border-color: var(--night); color: var(--cream); }
+.aff-quote { border-left-color: var(--orange); background: #FDF6EC; }
+.join-steps li[aria-current="step"] { border-color: var(--orange); }
+.sched-day.today { border-left-color: var(--orange); }
+.sched-day.today .list { border-color: var(--orange); }
+.sticky-actions { background: var(--cream); }
+code { background: #EFE7DA; }
+
+/* sign in, sign up and password pages: the logo on a sand topo background */
+body.hp-auth { background-color: var(--sand); background-image: url(/static/brand/topo.svg); background-size: 800px 800px; }
+.login { margin: 6vh auto 10vh; border-radius: 18px; padding: 24px; box-shadow: 0 18px 40px rgba(14,34,54,.12); }
+.login .hp-logo-link { display: block; margin: 0 0 6px; }
+.login .hp-logo-link img { height: 40px; width: auto; }
+
+/* HitchPoint documents (legal pages, offline page) */
+.hp-doc-head { background: var(--night); }
+.hp-doc-head-in { max-width: 760px; margin: 0 auto; padding: 14px max(16px, env(safe-area-inset-left, 0px)); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.hp-doc-head img { height: 32px; width: auto; display: block; }
+.hp-doc-head a { color: #D9E3EC; font-weight: 600; text-decoration: none; }
+.hp-doc-head a:hover { color: #fff; }
+main.doc h1 { font-family: var(--head); font-weight: 800; }

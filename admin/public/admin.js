@@ -27,6 +27,8 @@
   const STATUS = { new: 'New', contacted: 'Contacted', quoted: 'Quoted', accepted: 'Accepted', paid: 'Paid', closed: 'Closed' };
   const QSTATUS = { draft: 'Draft', sent: 'Sent', signed: 'Signed', paid: 'Paid', void: 'Void' };
   const PLATFORM = 'HitchPoint';
+  // The HitchPoint mark: a folk pine of chevrons inside a map pin, with an orange sun (colors for the dark header).
+  const HP_MARK = '<svg class="hp-mark" viewBox="12 7 40 53" aria-hidden="true"><path d="M32 59C29.6 55.4 13 41.2 13 27a19 19 0 0 1 38 0c0 14.2-16.6 28.4-19 32z" fill="#FBF7F0"/><circle cx="43" cy="17" r="3.2" fill="#FF7A1A"/><path d="M32 10L38.5 19.5L35.62 19.5L32 13.68L28.38 19.5L25.5 19.5ZM32 16L41.5 26.5L38.44 26.5L32 19.91L25.56 26.5L22.5 26.5ZM32 22.5L44.5 34L41.26 34L32 26.64L22.74 34L19.5 34Z" fill="#16302A"/><path d="M30.3 31h3.4v10a1.7 1.7 0 0 1-3.4 0z" fill="#FF7A1A"/></svg>';
   const FEE_TEXT = (bp) => `Stripe’s fee + ${pct(bp)}`;
   const LEGAL = '<a href="/legal/terms" target="_blank" rel="noopener">Terms of Service</a>, <a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a> and <a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a>';
   const isSuper = () => me && me.user.role === 'super';
@@ -98,11 +100,12 @@
     const bn = document.getElementById('bottomnav');
     bn.style.gridTemplateColumns = `repeat(${items.length}, 1fr)`;
     bn.innerHTML = items.map(([k, l, ic]) => `<a href="#/${k}" data-nav="${k}">${svg(ic)}${l}${badge(k)}</a>`).join('');
-    const logo = me.tenant && me.tenant.logo ? `<img src="/media/${esc(me.tenant.slug)}/${esc(me.tenant.logo)}" alt="" style="height:34px;border-radius:4px;background:#fff">` : '';
-    document.getElementById('brand').innerHTML = `${logo}<span>${esc(tenantMode ? me.tenant.name : PLATFORM)}<small>${tenantMode ? PLATFORM + ' dashboard' : affMode ? 'Referral program' : 'Agilities admin'}</small></span>`;
+    // HitchPoint's header on every dashboard. A business sees its own logo (or the HitchPoint mark) and name.
+    const bizLogo = tenantMode && me.tenant.logo ? `<img class="biz-logo" src="/media/${esc(me.tenant.slug)}/${esc(me.tenant.logo)}" alt="">` : HP_MARK;
+    document.getElementById('brand').innerHTML = tenantMode
+      ? `${bizLogo}<span>${esc(me.tenant.name)}<small>${PLATFORM} dashboard</small></span>`
+      : `<span><img class="hp-lockup" src="/static/brand/logo-on-dark.svg" alt="${PLATFORM}" width="163" height="30"><small>${affMode ? 'Referral program' : 'Agilities admin'}</small></span>`;
     document.getElementById('brand').setAttribute('href', tenantMode ? '#/requests' : affMode ? '#/affiliate' : '#/super');
-    const top = document.getElementById('topbar');
-    top.style.background = tenantMode ? (me.tenant.primary_color || '') : '#1F1C17';
     const va = document.getElementById('viewas');
     va.hidden = !me.viewing_as;
     if (me.viewing_as) {
@@ -115,6 +118,7 @@
     document.querySelectorAll('[data-nav]').forEach((a) => { if (a.dataset.nav === name) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   }
   function showChrome(on) {
+    document.body.classList.toggle('hp-auth', !on);
     document.getElementById('topbar').hidden = !on;
     document.getElementById('bottomnav').hidden = !on;
     if (!on) document.getElementById('viewas').hidden = true;
@@ -127,7 +131,7 @@
   }
 
   // ---------- sign in / sign up / reset ----------
-  const brandHead = `<a href="/" class="row" style="gap:10px;text-decoration:none;color:var(--ink);font-family:var(--cond);font-weight:700;font-size:24px"><img src="/favicon.svg" alt="" width="36" height="36">${PLATFORM}</a>`;
+  const brandHead = `<a href="/" class="hp-logo-link"><img src="/static/brand/logo.svg" alt="${PLATFORM} home" width="218" height="40"></a>`;
   function showAuth(mode, token) {
     showChrome(false);
     const legalNote = `<p class="small muted">${PLATFORM} is a d/b/a of Agilities. <a href="/legal/terms">Terms</a> · <a href="/legal/privacy">Privacy</a></p>`;
@@ -203,6 +207,7 @@
     showChrome(false);
     view.innerHTML = `
       <form class="card login stack" id="ag" style="max-width:520px">
+        ${brandHead}
         <h1>Before you start</h1>
         <p>Please review and accept the agreements for using this platform with ${esc(bizName())}.</p>
         <ul class="stack" style="margin:0;padding-left:20px;gap:6px"><li><a href="/legal/terms" target="_blank" rel="noopener">Business Terms of Service</a></li><li><a href="/legal/privacy" target="_blank" rel="noopener">Privacy Policy</a></li><li><a href="/legal/payment-terms" target="_blank" rel="noopener">Payment Processing and Fee Terms</a></li></ul>
