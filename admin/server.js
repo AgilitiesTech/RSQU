@@ -8,7 +8,8 @@ import { hashPassword, verifyPassword, sessions, randomToken, sha256 } from './s
 import { stripeClient, verifyStripeSignature, cleanSecret, stripeSettingProblem } from './src/stripe.js';
 import * as customerTerms from './src/customer-terms.js';
 import { notifier } from './src/notify.js';
-import { renderSite, renderCityPage, renderServicePage, serviceSlug, hasPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
+import { renderSite, renderCityPage, renderServicePage, renderBlogIndex, renderPost, renderQuestions, renderQuestion, serviceSlug, hasPage, sitePages, tenantSitemap, tenantRobots, siteUrls } from './src/site.js';
+import * as community from './src/community.js';
 import * as siteProfile from './src/site-profile.js';
 import { draftProposal, normalizeDraft } from './src/ai-proposal.js';
 import { renderReceipt, renderUnsubscribe, consentText, money as receiptMoney } from './src/receipt.js';
@@ -1624,6 +1625,191 @@ export function createApp(env = process.env) {
     res.end([head.join(','), ...body].join('\n') + '\n');
   }, { auth: 'tenant' });
 
+  // ---------- blog and questions ----------
+  // Each business can turn on a blog and a questions-and-answers board on its website (both off by
+  // default). Visitors' questions stay private until the owner publishes them with an answer.
+  const isoOf = (s) => (s ? String(s).replace(' ', 'T') + 'Z' : undefined);
+  const dated = (t, x) => ({ ...x, date_label: x.published_at ? owner.formatDate(owner.parseUtc(x.published_at), owner.tzOf(t)) : '', iso: isoOf(x.published_at), modified_iso: isoOf(x.updated_at) });
+  const publishedPosts = (t, limit = community.LIMITS.posts) => db.prepare(`SELECT * FROM posts WHERE tenant_id = ? AND status = 'published' ORDER BY published_at DESC, id DESC LIMIT ?`).all(t.id, limit).map((p) => dated(t, p));
+  const publishedQas = (t, limit = 500) => db.prepare(`SELECT id, slug, title, answer, published_at, updated_at FROM questions WHERE tenant_id = ? AND status = 'published' ORDER BY published_at DESC, id DESC LIMIT ?`).all(t.id, limit).map((q) => dated(t, q));
+  // What the website shows: the Blog link only once a post is published; Questions whenever it's on.
+  function communityOf(t, { city = null } = {}) {
+    const posts = t.blog_on ? publishedPosts(t, 3) : [];
+    return {
+      blog: Boolean(t.blog_on) && posts.length > 0, qa: Boolean(t.qa_on), email: notify.emailEnabled, posts,
+      qas: t.qa_on ? publishedQas(t, 3) : [],
+      cityPosts: t.blog_on && city ? db.prepare(`SELECT * FROM posts WHERE tenant_id = ? AND status = 'published' AND city = ? ORDER BY published_at DESC, id DESC LIMIT 6`).all(t.id, city).map((p) => dated(t, p)) : [],
+    };
+  }
+  function communityPages(t, platformBase) {
+    const u = siteUrls(t, platformBase);
+    const posts = t.blog_on ? publishedPosts(t) : [];
+    const qas = t.qa_on ? publishedQas(t) : [];
+    return [...(posts.length ? [u.abs('/blog'), ...posts.map((p) => u.abs('/blog/' + p.slug))] : []),
+      ...(qas.length ? [u.abs('/questions'), ...qas.filter(community.answerIndexable).map((q) => u.abs('/questions/' + q.slug))] : [])];
+  }
+  const htmlHeaders = () => ({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+  const sitePath = (t, onDomain, p) => (onDomain ? p : `/s/${t.slug}${p}`);
+  function serveBlog(req, res, t, onDomain = false) {
+    liveTenant(t);
+    if (!t.blog_on) throw new HttpError(404, 'Not found');
+    res.writeHead(200, htmlHeaders());
+    res.end(renderBlogIndex(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), publishedPosts(t), { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
+  }
+  function servePost(req, res, t, slug, onDomain = false) {
+    liveTenant(t);
+    if (!t.blog_on) throw new HttpError(404, 'Not found');
+    const post = db.prepare(`SELECT * FROM posts WHERE tenant_id = ? AND slug = ? AND status = 'published'`).get(t.id, slug);
+    // A removed or mistyped post link goes to the blog instead of an error page.
+    if (!post) { res.writeHead(302, { Location: sitePath(t, onDomain, '/blog'), 'Cache-Control': 'no-store' }); return res.end(); }
+    const more = publishedPosts(t, 4).filter((p) => p.id !== post.id).slice(0, 3);
+    res.writeHead(200, htmlHeaders());
+    res.end(renderPost(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), dated(t, post), { platformBase: baseUrl(req), onDomain, community: communityOf(t), more }));
+  }
+  function serveQuestions(req, res, t, onDomain = false) {
+    liveTenant(t);
+    if (!t.qa_on) throw new HttpError(404, 'Not found');
+    res.writeHead(200, htmlHeaders());
+    res.end(renderQuestions(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), publishedQas(t), { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
+  }
+  function serveQuestion(req, res, t, slug, onDomain = false) {
+    liveTenant(t);
+    if (!t.qa_on) throw new HttpError(404, 'Not found');
+    const q = db.prepare(`SELECT id, slug, title, answer, published_at, updated_at FROM questions WHERE tenant_id = ? AND slug = ? AND status = 'published'`).get(t.id, slug);
+    if (!q) { res.writeHead(302, { Location: sitePath(t, onDomain, '/questions'), 'Cache-Control': 'no-store' }); return res.end(); }
+    const more = publishedQas(t, 4).filter((x) => x.id !== q.id).slice(0, 3);
+    res.writeHead(200, htmlHeaders());
+    res.end(renderQuestion(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), dated(t, q), { platformBase: baseUrl(req), onDomain, community: communityOf(t), more }));
+  }
+
+  // Owner's side. Reading is for the whole team; writing is owner-only, like the website itself.
+  const citySlugs = (t) => siteProfile.parseProfile(t.site_profile).cities.map((c) => siteProfile.citySlug(c));
+  function communityState(req, t) {
+    const u = siteUrls(t, baseUrl(req));
+    const counts = Object.fromEntries(db.prepare('SELECT status, COUNT(*) AS n FROM questions WHERE tenant_id = ? GROUP BY status').all(t.id).map((r) => [r.status, r.n]));
+    const posts = Object.fromEntries(db.prepare('SELECT status, COUNT(*) AS n FROM posts WHERE tenant_id = ? GROUP BY status').all(t.id).map((r) => [r.status, r.n]));
+    return {
+      blog_on: Boolean(t.blog_on), qa_on: Boolean(t.qa_on), blog_url: u.abs('/blog'), questions_url: u.abs('/questions'),
+      cities: siteProfile.parseProfile(t.site_profile).cities.map((c) => ({ slug: siteProfile.citySlug(c), name: `${c.name}, ${c.state}` })),
+      posts: { published: posts.published || 0, draft: posts.draft || 0 },
+      questions: { new: counts.new || 0, published: counts.published || 0, hidden: counts.hidden || 0 },
+      email_enabled: notify.emailEnabled, sms_alerts: notify.smsEnabled && Boolean(t.notify_phone), limits: community.LIMITS,
+    };
+  }
+  const postOut = (req, t, p) => ({ ...dated(t, p), url: p.status === 'published' ? siteUrls(t, baseUrl(req)).abs('/blog/' + p.slug) : null, image_url: p.image ? `/media/${t.slug}/${p.image}` : null });
+  const removeUpload = (name) => { if (name) fs.rmSync(path.join(uploads, path.basename(name)), { force: true }); };
+  const postSlugTaken = (t, id) => (s) => Boolean(db.prepare('SELECT 1 FROM posts WHERE tenant_id = ? AND slug = ? AND id != ?').get(t.id, s, id || 0));
+
+  route('GET', '/api/community', async (req, res, p, url, { tenant: t }) => send(res, 200, communityState(req, t)), { auth: 'tenant' });
+  route('PUT', '/api/community', async (req, res, p, url, { tenant: t }) => {
+    const b = await json(req);
+    db.prepare('UPDATE tenants SET blog_on = ?, qa_on = ? WHERE id = ?').run(b.blog_on !== undefined ? (b.blog_on ? 1 : 0) : t.blog_on, b.qa_on !== undefined ? (b.qa_on ? 1 : 0) : t.qa_on, t.id);
+    send(res, 200, communityState(req, getTenant(t.id)));
+  }, { auth: 'owner' });
+
+  route('GET', '/api/posts', async (req, res, p, url, { tenant: t }) => {
+    const rows = db.prepare(`SELECT id, slug, title, summary, image, city, status, published_at, updated_at, created_at FROM posts WHERE tenant_id = ? ORDER BY CASE status WHEN 'draft' THEN 0 ELSE 1 END, COALESCE(published_at, created_at) DESC, id DESC`).all(t.id);
+    send(res, 200, { ...communityState(req, t), rows: rows.map((r) => postOut(req, t, r)) });
+  }, { auth: 'tenant' });
+  route('POST', '/api/posts', async (req, res, p, url, { tenant: t, user }) => {
+    if (db.prepare('SELECT COUNT(*) AS n FROM posts WHERE tenant_id = ?').get(t.id).n >= community.LIMITS.posts) throw new HttpError(409, `You can have up to ${community.LIMITS.posts} posts. Delete an old one first.`);
+    const b = await json(req, 200_000);
+    let f;
+    try { f = community.cleanPost(b, {}, citySlugs(t)); } catch (e) { throw new HttpError(400, e.message); }
+    const status = b.status === 'published' ? 'published' : 'draft';
+    if (status === 'published') { const why = community.publishProblem(f); if (why) throw new HttpError(400, why); }
+    const slug = community.uniqueSlug(f.title, postSlugTaken(t, 0), 'post');
+    const r = db.prepare('INSERT INTO posts (tenant_id, slug, title, summary, body, city, user_id, status, published_at) VALUES (?,?,?,?,?,?,?,?,?)').run(t.id, slug, f.title, f.summary, f.body, f.city, user.id, status, status === 'published' ? now() : null);
+    send(res, 201, postOut(req, t, db.prepare('SELECT * FROM posts WHERE id = ?').get(Number(r.lastInsertRowid))));
+  }, { auth: 'owner' });
+  route('GET', '/api/posts/:id', async (req, res, p, url, { tenant: t }) => {
+    const post = scoped('posts', Number(p.id), t.id);
+    if (!post) throw new HttpError(404, 'Post not found.');
+    send(res, 200, { ...postOut(req, t, post), ...communityState(req, t) });
+  }, { auth: 'tenant' });
+  route('PUT', '/api/posts/:id', async (req, res, p, url, { tenant: t }) => {
+    const post = scoped('posts', Number(p.id), t.id);
+    if (!post) throw new HttpError(404, 'Post not found.');
+    const b = await json(req, 200_000);
+    let f;
+    try { f = community.cleanPost(b, post, citySlugs(t)); } catch (e) { throw new HttpError(400, e.message); }
+    const status = b.status === 'published' || b.status === 'draft' ? b.status : post.status;
+    if (status === 'published') { const why = community.publishProblem(f); if (why) throw new HttpError(400, why); }
+    // A draft's address follows its title; once published, the address stays put so links keep working.
+    const slug = post.published_at ? post.slug : community.uniqueSlug(f.title, postSlugTaken(t, post.id), 'post');
+    db.prepare(`UPDATE posts SET title = ?, summary = ?, body = ?, city = ?, status = ?, slug = ?, published_at = COALESCE(published_at, CASE WHEN ? = 'published' THEN ? END), updated_at = ? WHERE id = ?`)
+      .run(f.title, f.summary, f.body, f.city, status, slug, status, now(), now(), post.id);
+    send(res, 200, postOut(req, t, scoped('posts', post.id, t.id)));
+  }, { auth: 'owner' });
+  route('POST', '/api/posts/:id/image', async (req, res, p, url, { tenant: t }) => {
+    const post = scoped('posts', Number(p.id), t.id);
+    if (!post) throw new HttpError(404, 'Post not found.');
+    const b = await json(req, 12_000_000);
+    const name = b.image ? saveImage(b.image, `t${t.id}-post`, 8_000_000) : null;
+    if (b.image && !name) throw new HttpError(400, 'Use a JPG, PNG or WebP photo.');
+    db.prepare('UPDATE posts SET image = ?, updated_at = ? WHERE id = ?').run(name, now(), post.id);
+    removeUpload(post.image);
+    send(res, 200, postOut(req, t, scoped('posts', post.id, t.id)));
+  }, { auth: 'owner' });
+  route('DELETE', '/api/posts/:id', async (req, res, p, url, { tenant: t }) => {
+    const post = scoped('posts', Number(p.id), t.id);
+    if (!post) throw new HttpError(404, 'Post not found.');
+    db.prepare('DELETE FROM posts WHERE id = ?').run(post.id);
+    removeUpload(post.image);
+    send(res, 200, { ok: true });
+  }, { auth: 'owner' });
+
+  const questionOut = (req, t, q) => ({ ...dated(t, q), received_label: owner.formatWhen(owner.parseUtc(q.created_at), owner.tzOf(t)), url: q.status === 'published' ? siteUrls(t, baseUrl(req)).abs('/questions/' + q.slug) : null, shown_title: q.title || community.oneLine(q.question, community.LIMITS.questionShown) });
+  route('GET', '/api/questions', async (req, res, p, url, { tenant: t }) => {
+    const status = ['new', 'published', 'hidden'].includes(url.searchParams.get('status')) ? url.searchParams.get('status') : 'new';
+    const rows = db.prepare(`SELECT id, question, name, email, title, answer, slug, status, published_at, created_at, updated_at FROM questions WHERE tenant_id = ? AND status = ? ORDER BY ${status === 'new' ? 'created_at' : 'COALESCE(published_at, updated_at) DESC, created_at'} DESC, id DESC LIMIT 500`).all(t.id, status);
+    send(res, 200, { ...communityState(req, t), status, rows: rows.map((q) => questionOut(req, t, q)) });
+  }, { auth: 'tenant' });
+  route('PUT', '/api/questions/:id', async (req, res, p, url, { tenant: t, user }) => {
+    const q = scoped('questions', Number(p.id), t.id);
+    if (!q) throw new HttpError(404, 'Question not found.');
+    const b = await json(req, 100_000);
+    const f = community.cleanAnswer(b, q);
+    const status = ['published', 'hidden', 'new'].includes(b.status) ? b.status : q.status;
+    if (status === 'published') { const why = community.answerProblem(f); if (why) throw new HttpError(400, why); }
+    const slug = q.slug || (status === 'published' ? community.uniqueSlug(f.title, (s) => Boolean(db.prepare('SELECT 1 FROM questions WHERE tenant_id = ? AND slug = ?').get(t.id, s)), 'question') : null);
+    db.prepare(`UPDATE questions SET title = ?, answer = ?, status = ?, slug = ?, published_at = COALESCE(published_at, CASE WHEN ? = 'published' THEN ? END), answered_by = CASE WHEN ? = 'published' THEN ? ELSE answered_by END, updated_at = ? WHERE id = ?`)
+      .run(f.title, f.answer, status, slug, status, now(), status, user.id, now(), q.id);
+    const saved = scoped('questions', q.id, t.id);
+    // The person who asked hears once, the first time it's published, if they left an email.
+    if (status === 'published' && saved.email && !saved.asker_notified_at && notify.emailEnabled) {
+      const link = siteUrls(t, baseUrl(req)).abs('/questions/' + saved.slug);
+      const first = String(saved.name || '').split(/\s+/)[0];
+      notify.email(saved.email, `${t.name} answered your question`, [`Hi${first ? ' ' + first : ''},`, '', 'Thanks for your question:', `“${community.oneLine(saved.question, 300)}”`, '', `${t.name} answered it here:`, link, '', t.name].join('\n'), { fromName: t.name, replyTo: t.email || undefined })
+        .then((ok) => { if (ok) db.prepare('UPDATE questions SET asker_notified_at = ? WHERE id = ?').run(now(), q.id); }).catch(() => {});
+    }
+    send(res, 200, questionOut(req, t, saved));
+  }, { auth: 'owner' });
+  route('DELETE', '/api/questions/:id', async (req, res, p, url, { tenant: t }) => {
+    const q = scoped('questions', Number(p.id), t.id);
+    if (!q) throw new HttpError(404, 'Question not found.');
+    db.prepare('DELETE FROM questions WHERE id = ?').run(q.id);
+    send(res, 200, { ok: true });
+  }, { auth: 'owner' });
+
+  // A visitor asks from the business's Questions page. Nothing is shown until the owner answers it.
+  route('POST', '/api/public/t/:slug/questions', async (req, res, p) => {
+    const t = getTenantBySlug(p.slug);
+    if (!t || t.status !== 'active' || !t.qa_on) throw new HttpError(404, 'This business isn’t taking questions online. Please call them.');
+    if (limited('ask:' + clientIp(req), 5, 3600_000)) throw new HttpError(429, 'You’ve sent a lot of questions. Please try again later, or call.');
+    const b = await json(req, 20_000);
+    if (b.website) return send(res, 201, { ok: true }); // honeypot
+    let f;
+    try { f = community.cleanQuestion(b); } catch (e) { throw new HttpError(400, e.message); }
+    if (db.prepare(`SELECT COUNT(*) AS n FROM questions WHERE tenant_id = ? AND status = 'new'`).get(t.id).n >= community.LIMITS.pendingQuestions) throw new HttpError(503, 'This business has a lot of questions waiting. Please call them instead.');
+    // The same question sent twice (a double tap, a reload) is kept once.
+    if (!db.prepare(`SELECT 1 FROM questions WHERE tenant_id = ? AND question = ? AND created_at > datetime('now', '-1 day')`).get(t.id, f.question)) {
+      db.prepare('INSERT INTO questions (tenant_id, question, name, email, ip, ua) VALUES (?,?,?,?,?,?)').run(t.id, f.question, f.name, notify.emailEnabled ? f.email : '', clientIp(req), clean(req.headers['user-agent'], 400));
+      notify.sms(t.notify_phone, `New question on your website${f.name ? ' from ' + f.name : ''}: “${community.oneLine(f.question, 140)}”\nAnswer it: ${baseUrl(req)}/admin/#/questions`);
+    }
+    send(res, 201, { ok: true, email: Boolean(f.email && notify.emailEnabled) });
+  });
+
   // Website content and local search (each business edits its own)
   function websiteState(req, t) {
     const profile = siteProfile.parseProfile(t.site_profile);
@@ -2778,7 +2964,7 @@ export function createApp(env = process.env) {
   function serveSite(req, res, t, onDomain = false) {
     liveTenant(t);
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
-    res.end(renderSite(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), { platformBase: baseUrl(req), onDomain }));
+    res.end(renderSite(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
   }
   function serveCity(req, res, t, slug, onDomain = false) {
     liveTenant(t);
@@ -2786,7 +2972,7 @@ export function createApp(env = process.env) {
     const city = siteProfile.cityBySlug(profile, slug);
     if (!city) throw new HttpError(404, 'Not found');
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
-    res.end(renderCityPage(t, activeProducts(t), profile, city, { platformBase: baseUrl(req), onDomain }));
+    res.end(renderCityPage(t, activeProducts(t), profile, city, { platformBase: baseUrl(req), onDomain, community: communityOf(t, { city: slug }) }));
   }
   function serveService(req, res, t, slug, onDomain = false) {
     liveTenant(t);
@@ -2795,7 +2981,7 @@ export function createApp(env = process.env) {
     // An old or mistyped service link goes to the business's services instead of an error page.
     if (!product) { res.writeHead(302, { Location: `${onDomain ? '/' : `/s/${t.slug}`}#services`, 'Cache-Control': 'no-store' }); return res.end(); }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
-    res.end(renderServicePage(t, products, siteProfile.parseProfile(t.site_profile), product, { platformBase: baseUrl(req), onDomain }));
+    res.end(renderServicePage(t, products, siteProfile.parseProfile(t.site_profile), product, { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
   }
   // A PDF the business shares with customers (checklists, guides). Only files listed on its site.
   function serveResource(res, t, file) {
@@ -2923,13 +3109,13 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if (domainTenant && pathname === '/robots.txt') return send(res, 200, tenantRobots(`https://${domainTenant.custom_domain}`), { 'Cache-Control': 'public, max-age=3600' });
       if (domainTenant && pathname === '/sitemap.xml') {
         liveTenant(domainTenant);
-        return send(res, 200, tenantSitemap(sitePages(domainTenant, siteProfile.parseProfile(domainTenant.site_profile), baseUrl(req), activeProducts(domainTenant))), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+        return send(res, 200, tenantSitemap([...sitePages(domainTenant, siteProfile.parseProfile(domainTenant.site_profile), baseUrl(req), activeProducts(domainTenant)), ...communityPages(domainTenant, baseUrl(req))]), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
       }
       if (!domainTenant && pathname === '/robots.txt') return send(res, 200, robotsTxt(siteOrigin(req)), { 'Cache-Control': 'public, max-age=3600' });
       if (!domainTenant && pathname === '/sitemap.xml') {
         // Business sites hosted here (no domain of their own) are listed in the platform sitemap.
         const hosted = db.prepare(`SELECT * FROM tenants WHERE status = 'active' AND (custom_domain IS NULL OR custom_domain = '' OR domain_live_at IS NULL) ORDER BY id`).all()
-          .flatMap((t) => sitePages(t, siteProfile.parseProfile(t.site_profile), baseUrl(req), activeProducts(t)));
+          .flatMap((t) => [...sitePages(t, siteProfile.parseProfile(t.site_profile), baseUrl(req), activeProducts(t)), ...communityPages(t, baseUrl(req))]);
         return send(res, 200, sitemapXml(siteOrigin(req), hosted), { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
       }
       if (!domainTenant && pathname === '/llms.txt') return send(res, 200, llmsTxt(siteOrigin(req)), { 'Cache-Control': 'public, max-age=3600' });
@@ -2944,6 +3130,14 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if (domainTenant && (m = /^\/areas\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveCity(req, res, domainTenant, m[1], true);
       if ((m = /^\/s\/([\w-]+)\/services\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveService(req, res, getTenantBySlug(m[1]), m[2]);
       if (domainTenant && (m = /^\/services\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveService(req, res, domainTenant, m[1], true);
+      if ((m = /^\/s\/([\w-]+)\/blog\/?$/.exec(pathname))) return serveBlog(req, res, getTenantBySlug(m[1]));
+      if (domainTenant && /^\/blog\/?$/.test(pathname)) return serveBlog(req, res, domainTenant, true);
+      if ((m = /^\/s\/([\w-]+)\/blog\/([a-z0-9-]+)\/?$/.exec(pathname))) return servePost(req, res, getTenantBySlug(m[1]), m[2]);
+      if (domainTenant && (m = /^\/blog\/([a-z0-9-]+)\/?$/.exec(pathname))) return servePost(req, res, domainTenant, m[1], true);
+      if ((m = /^\/s\/([\w-]+)\/questions\/?$/.exec(pathname))) return serveQuestions(req, res, getTenantBySlug(m[1]));
+      if (domainTenant && /^\/questions\/?$/.test(pathname)) return serveQuestions(req, res, domainTenant, true);
+      if ((m = /^\/s\/([\w-]+)\/questions\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveQuestion(req, res, getTenantBySlug(m[1]), m[2]);
+      if (domainTenant && (m = /^\/questions\/([a-z0-9-]+)\/?$/.exec(pathname))) return serveQuestion(req, res, domainTenant, m[1], true);
       if ((m = /^\/s\/([\w-]+)\/files\/([\w-]+\.pdf)$/.exec(pathname))) return serveResource(res, getTenantBySlug(m[1]), m[2]);
       if (domainTenant && (m = /^\/files\/([\w-]+\.pdf)$/.exec(pathname))) return serveResource(res, domainTenant, m[1]);
       if ((m = /^\/s\/([\w-]+)\/terms\/?$/.exec(pathname))) return serveTerms(res, getTenantBySlug(m[1]), url);
@@ -2951,7 +3145,8 @@ h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:24px}.muted{color:#5b6475;fon
       if ((m = /^\/media\/([\w-]+)\/([\w.-]+)$/.exec(pathname))) {
         const t = getTenantBySlug(m[1]);
         const B = t ? siteProfile.parseProfile(t.site_profile).banner : {};
-        const shown = t ? [t.logo, t.owner_photo, B.desktop, B.mobile, ...db.prepare('SELECT image FROM products WHERE tenant_id = ? AND image IS NOT NULL').all(t.id).map((r) => r.image)] : [];
+        const shown = t ? [t.logo, t.owner_photo, B.desktop, B.mobile, ...db.prepare('SELECT image FROM products WHERE tenant_id = ? AND image IS NOT NULL').all(t.id).map((r) => r.image),
+          ...db.prepare('SELECT image FROM posts WHERE tenant_id = ? AND image IS NOT NULL').all(t.id).map((r) => r.image)] : [];
         if (!t || !m[2].startsWith(`t${t.id}-`) || !shown.includes(m[2])) throw new HttpError(404, 'Not found');
         return sendUpload(res, m[2]);
       }

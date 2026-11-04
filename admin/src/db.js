@@ -324,6 +324,7 @@ function migrate(db) {
   `);
   migrateAffiliates(db);
   migrateOwnerFeatures(db);
+  migrateCommunity(db);
 }
 
 // Affiliate (referral revenue-share) program. Agilities pays an affiliate business a share of
@@ -577,4 +578,52 @@ function migrateOwnerFeatures(db) {
     }
     db.prepare(`INSERT OR IGNORE INTO platform_settings (key, value) VALUES ('sms_stops_backfilled', datetime('now'))`).run();
   }
+}
+
+// Blog posts and the questions-and-answers board on business websites (src/community.js).
+// Both are off until the owner turns them on.
+function migrateCommunity(db) {
+  addColumn(db, 'tenants', 'blog_on', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn(db, 'tenants', 'qa_on', 'INTEGER NOT NULL DEFAULT 0');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS posts (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      slug TEXT NOT NULL,                           -- its address; fixed once published
+      title TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '',             -- for Google and link previews
+      body TEXT NOT NULL DEFAULT '',
+      image TEXT,                                   -- cover photo (uploads, t<id>-post-…)
+      city TEXT,                                    -- a town page slug it also shows on
+      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published')),
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      published_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS posts_slug ON posts (tenant_id, slug);
+    CREATE INDEX IF NOT EXISTS posts_published ON posts (tenant_id, status, published_at);
+
+    -- Questions visitors send from the business's website. Name, email and the original wording stay
+    -- private; only the owner's title and answer are shown, and only after the owner publishes them.
+    CREATE TABLE IF NOT EXISTS questions (
+      id INTEGER PRIMARY KEY,
+      tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      question TEXT NOT NULL,                       -- as the visitor wrote it
+      name TEXT NOT NULL DEFAULT '',
+      email TEXT NOT NULL DEFAULT '',
+      ip TEXT, ua TEXT,
+      title TEXT,                                   -- the question as shown on the site
+      answer TEXT,
+      slug TEXT,                                    -- set when first published, then fixed
+      status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','published','hidden')),
+      published_at TEXT,
+      answered_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      asker_notified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS questions_slug ON questions (tenant_id, slug) WHERE slug IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS questions_status ON questions (tenant_id, status, created_at);
+  `);
 }

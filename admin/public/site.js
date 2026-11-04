@@ -64,3 +64,20 @@
       .catch(function (ex) { err.textContent = ex.message + ' Please call or text us instead.'; err.hidden = false; btn.disabled = false; btn.textContent = 'Send request'; });
   });
 })();
+
+// Questions page: send a question. Nothing shows on the site until the business answers it.
+(function () {
+  var f = document.getElementById('ask-form'); if (!f) return;
+  var slug = f.getAttribute('data-slug'), err = document.getElementById('ask-err');
+  f.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var v = function (n) { return (f.elements[n] && f.elements[n].value || '').trim(); };
+    if (v('question').length < 10) { err.textContent = 'Type your question (a sentence or two).'; err.hidden = false; f.elements.question.focus(); return; }
+    err.hidden = true;
+    var btn = f.querySelector('button[type=submit]'); btn.disabled = true; btn.textContent = 'Sending…';
+    fetch('/api/public/t/' + encodeURIComponent(slug) + '/questions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: v('question'), name: v('name'), email: v('email'), website: v('website') }) })
+      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || 'Could not send.'); return j; }); })
+      .then(function (j) { f.hidden = true; document.getElementById('ask-sent-email').hidden = !j.email; var s = document.getElementById('ask-sent'); s.hidden = false; s.setAttribute('tabindex', '-1'); s.focus(); })
+      .catch(function (ex) { err.textContent = ex.message; err.hidden = false; btn.disabled = false; btn.textContent = 'Send question'; });
+  });
+})();
