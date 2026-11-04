@@ -1370,8 +1370,10 @@ test('QuickBooks download: paid payments for a date range, every cell quoted, fo
   // The date range uses the business's time zone: a payment at 01:30 Eastern on Nov 3 is in Nov 3, not Nov 2.
   const late = appDb.prepare(`SELECT id FROM payments WHERE paid_at = '2026-11-03 06:30:00' AND tenant_id = ?`).get(mikeId);
   assert.ok((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text.includes(`"11/03/2026"`));
-  assert.ok((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text.includes(`"Receipt #${late.id}`));
-  assert.ok(!(await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-04&to=2026-11-04')).text.includes(`"Receipt #${late.id}`));
+  // Match the whole receipt number: "Receipt #1" must not match Receipt #10 from a payment made today.
+  const lateReceipt = new RegExp(`"Receipt #${late.id}[" ]`);
+  assert.match((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-03&to=2026-11-03')).text, lateReceipt);
+  assert.doesNotMatch((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-04&to=2026-11-04')).text, lateReceipt);
   assert.equal((await mike('GET', '/api/exports/quickbooks.csv?from=2026-11-05&to=2026-11-01')).status, 400);
   assert.equal((await other('GET', url)).text.trim().split('\r\n').length, 1, 'only your own payments');
 });
