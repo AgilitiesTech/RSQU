@@ -13,7 +13,7 @@ jobs:
           echo "healthz: $(curl -sS https://gethitchpoint.com/healthz || true)"
           curl -sS -o site.js https://gethitchpoint.com/static/site.js || true
           echo "site.js hpLeadSource mentions: $(grep -c 'hpLeadSource' site.js); hp-track mentions: $(grep -c 'hp-track' site.js)"
-          curl -sS -o admin.js https://gethitchpoint.com/admin/admin.js || true
+          curl -sS -o admin.js https://gethitchpoint.com/static/admin.js || true
           echo "admin.js requests.csv mentions: $(grep -c 'requests.csv' admin.js); w-ga4 mentions: $(grep -c 'w-ga4' admin.js)"
           for u in "https://rsqumobilervservice.com/" "https://gethitchpoint.com/s/rsqu-mobile-rv-service" "https://rsqumobilervservice.com/services/onsite-rv-winterizing-package"; do
             code=$(curl -sS -D headers.txt -o body.html -w '%{http_code}' "$u" || true)
