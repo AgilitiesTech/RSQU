@@ -18,6 +18,7 @@ import * as AFF from './src/affiliates.js';
 import * as owner from './src/owner-features.js';
 import { sealer } from './src/sealed.js';
 import * as W9 from './src/w9.js';
+import * as leadSource from './src/lead-source.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
@@ -665,11 +666,28 @@ export function createApp(env = process.env) {
     if (!phone || !location) throw new HttpError(400, 'Location and phone are required.');
     const rig = clean(b.rig, 200) || [b.year, b.make, b.model].map((v) => clean(v, 80)).filter(Boolean).join(' ');
     const photo = b.photo ? saveImage(b.photo, `t${t.id}-req`, 8_000_000) : null;
-    const r = db.prepare(`INSERT INTO requests (tenant_id, type, product_id, name, phone, email, location, rig, issue, preferred_date, photo) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(t.id, type, productId, clean(b.name, 120), phone, clean(b.email, 200), location, rig, clean(b.issue, 4000), clean(b.preferred_date, 40), photo);
+    let email = normEmail(clean(b.email, 200));
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) email = '';
+    // Where the visit came from (ad, Google profile, partner link…), as the business's site recorded it.
+    const src = leadSource.cleanSource(b.source, clean(b.heard_about, 60));
+    const r = db.prepare(`INSERT INTO requests (tenant_id, type, product_id, name, phone, email, location, rig, issue, preferred_date, photo,
+      src_source, src_medium, src_campaign, src_term, src_content, src_click_id, src_click_type, src_landing, src_referrer, src_at, heard_about) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(t.id, type, productId, clean(b.name, 120), phone, email || null, location, rig, clean(b.issue, 4000), clean(b.preferred_date, 40), photo,
+        src.src_source, src.src_medium, src.src_campaign, src.src_term, src.src_content, src.src_click_id, src.src_click_type, src.src_landing, src.src_referrer, src.src_at, src.heard_about);
     const id = Number(r.lastInsertRowid);
     const pname = productId ? db.prepare('SELECT name FROM products WHERE id = ?').get(productId)?.name : '';
-    notify.sms(t.notify_phone, `New ${type === 'booking' ? 'BOOKING' + (pname ? ' (' + pname + ')' : '') : 'REPAIR request'} from ${clean(b.name, 60) || 'customer'} ${phone}\n${location.slice(0, 200)}\n${rig}\n${baseUrl(req)}/admin/#/requests/${id}`);
+    const via = leadSource.sourceLabel(src);
+    notify.sms(t.notify_phone, `New ${type === 'booking' ? 'BOOKING' + (pname ? ' (' + pname + ')' : '') : 'REPAIR request'} from ${clean(b.name, 60) || 'customer'} ${phone}\n${location.slice(0, 200)}\n${rig}${via && via !== 'Direct or unknown' ? `\nFrom: ${via}` : ''}\n${baseUrl(req)}/admin/#/requests/${id}`);
+    // A quick "we got it" to the customer: a text to the number they gave (the form says we may text them
+    // about this request) unless it replied STOP, and an email if they gave one. Sent by the background
+    // worker; a text that can't go out within 2 hours (outside texting hours) is dropped, not sent late.
+    // Because anyone can type any number or address into a public form, replies go only to US and Canada
+    // numbers, at most once a day to the same number or address, and at most 100 a day per business.
+    const acked = (to) => db.prepare(`SELECT 1 FROM scheduled_messages WHERE tenant_id = ? AND kind = 'request_ack' AND to_addr = ? AND created_at >= ?`).get(t.id, to, owner.utcString(Date.now() - 864e5));
+    const ackRoom = () => db.prepare(`SELECT COUNT(*) AS n FROM scheduled_messages WHERE tenant_id = ? AND kind = 'request_ack' AND created_at >= ?`).get(t.id, owner.utcString(Date.now() - 864e5)).n < 100;
+    const smsTo = toE164(phone);
+    if (/^\+1\d{10}$/.test(smsTo) && !smsStopped(phone) && !acked(smsTo) && ackRoom()) queueMessage({ t, kind: 'request_ack', channel: 'sms', to: smsTo, refId: id, meta: { until: Date.now() + 2 * 3600_000 } });
+    if (email && !acked(email) && ackRoom()) queueMessage({ t, kind: 'request_ack', channel: 'email', to: email, refId: id });
     send(res, 201, { ok: true, id });
   }
   route('POST', '/api/public/t/:slug/requests', async (req, res, p) => intake(req, res, getTenantBySlug(p.slug)), { cors: true });
@@ -832,10 +850,23 @@ export function createApp(env = process.env) {
   route('GET', '/api/requests', async (req, res, p, url, { tenant: t }) => {
     const f = url.searchParams.get('filter') || 'open';
     const where = f === 'new' ? `AND r.status = 'new'` : f === 'open' ? `AND r.status NOT IN ('paid','closed')` : '';
-    const rows = db.prepare(`SELECT r.id, r.type, r.status, r.name, r.phone, r.location, r.rig, r.issue, r.preferred_date, r.photo IS NOT NULL AS has_photo, r.created_at, pr.name AS product_name
-      FROM requests r LEFT JOIN products pr ON pr.id = r.product_id WHERE r.tenant_id = ? ${where} ORDER BY r.id DESC LIMIT 300`).all(t.id);
+    const rows = db.prepare(`SELECT r.id, r.type, r.status, r.name, r.phone, r.location, r.rig, r.issue, r.preferred_date, r.photo IS NOT NULL AS has_photo, r.created_at, pr.name AS product_name,
+      r.src_source, r.src_medium, r.src_campaign, r.src_click_id, r.src_landing, r.src_referrer, r.src_at
+      FROM requests r LEFT JOIN products pr ON pr.id = r.product_id WHERE r.tenant_id = ? ${where} ORDER BY r.id DESC LIMIT 300`).all(t.id)
+      .map(({ src_source, src_medium, src_campaign, src_click_id, src_landing, src_referrer, src_at, ...row }) => ({ ...row, source_label: leadSource.sourceLabel({ src_source, src_medium, src_campaign, src_click_id, src_landing, src_referrer, src_at }) }));
     const c = db.prepare(`SELECT SUM(status = 'new') AS n, SUM(status NOT IN ('paid','closed')) AS o, COUNT(*) AS a FROM requests WHERE tenant_id = ?`).get(t.id);
     send(res, 200, { rows, counts: { new: c.n || 0, open: c.o || 0, all: c.a || 0 } });
+  }, { auth: 'tenant' });
+
+  // Every website request with where it came from, for a spreadsheet: which ads, pages and partners
+  // bring in work. Google's click ID is included so signed or paid jobs can later be sent back to Google Ads.
+  route('GET', '/api/requests.csv', async (req, res, p, url, { tenant: t }) => {
+    const rows = db.prepare(`SELECT r.*, pr.name AS product_name FROM requests r LEFT JOIN products pr ON pr.id = r.product_id WHERE r.tenant_id = ? ORDER BY r.id`).all(t.id);
+    const cell = (v) => { const x = String(v ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' '); return /[",\r\n]/.test(x) || /^[=+\-@\t]/.test(x) ? `"${(/^[=+\-@\t]/.test(x) ? "'" : '') + x.replace(/"/g, '""')}"` : x; };
+    const head = ['id', 'received', 'type', 'service', 'status', 'name', 'phone', 'email', 'source', 'heard_about', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'click_id', 'click_id_type', 'landing_page', 'referrer', 'first_visit'];
+    const body = rows.map((r) => [r.id, r.created_at, r.type, r.product_name, r.status, r.name, r.phone, r.email, leadSource.sourceLabel(r), r.heard_about, r.src_source, r.src_medium, r.src_campaign, r.src_term, r.src_content, r.src_click_id, r.src_click_type, r.src_landing, r.src_referrer, r.src_at].map(cell).join(','));
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="requests.csv"', 'Cache-Control': 'no-store' });
+    res.end([head.join(','), ...body].join('\n') + '\n');
   }, { auth: 'tenant' });
 
   route('GET', '/api/requests/:id', async (req, res, p, url, { tenant: t }) => {
@@ -844,7 +875,7 @@ export function createApp(env = process.env) {
       .map((q) => ({ id: q.id, token: q.token, title: q.title, status: q.status, created_at: q.created_at, totals: quoteTotals(q, getItems(q.id)) }));
     const payments = db.prepare('SELECT * FROM payments WHERE request_id = ? ORDER BY id DESC').all(r.id);
     const product = r.product_id ? db.prepare('SELECT name, price_cents FROM products WHERE id = ?').get(r.product_id) : null;
-    send(res, 200, { ...r, product, quotes, payments, deposit_paid_cents: paidDeposits(r.id) });
+    send(res, 200, { ...r, product, quotes, payments, deposit_paid_cents: paidDeposits(r.id), source_label: leadSource.sourceLabel(r) });
   }, { auth: 'tenant' });
 
   route('PATCH', '/api/requests/:id', async (req, res, p, url, { tenant: t }) => {
@@ -1187,6 +1218,16 @@ export function createApp(env = process.env) {
       if (!address.ok) return { skip: 'The business mailing address is missing.' };
       const unsub = `${publicBase()}/u/${c.unsub_token}`;
       return { to: m.to_addr, ...owner.campaignEmail({ t, subject: cp.subject, body: cp.body, address, unsubUrl: unsub }), opts: { ...emailOpts, headers: unsubHeaders(unsub) } };
+    }
+    if (m.kind === 'request_ack') {
+      const r = scoped('requests', m.ref_id, t.id);
+      if (!r) return { skip: 'The request was deleted.' };
+      if (m.channel === 'sms') {
+        if (meta.until && at.getTime() > meta.until) return { skip: 'Too late for a “we got it” text.' };
+        if (smsStopped(m.to_addr)) return { skip: 'This number replied STOP.' };
+        return { to: m.to_addr, ...owner.requestAck('sms', { t, r }) };
+      }
+      return { to: m.to_addr, ...owner.requestAck('email', { t, r }), opts: emailOpts };
     }
     return { skip: 'Unknown message.' };
   }
@@ -1648,12 +1689,12 @@ export function createApp(env = process.env) {
     return [...(posts.length ? [u.abs('/blog'), ...posts.map((p) => u.abs('/blog/' + p.slug))] : []),
       ...(qas.length ? [u.abs('/questions'), ...qas.filter(community.answerIndexable).map((q) => u.abs('/questions/' + q.slug))] : [])];
   }
-  const htmlHeaders = () => ({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+  const htmlHeaders = (t) => ({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeadersFor(t) });
   const sitePath = (t, onDomain, p) => (onDomain ? p : `/s/${t.slug}${p}`);
   function serveBlog(req, res, t, onDomain = false) {
     liveTenant(t);
     if (!t.blog_on) throw new HttpError(404, 'Not found');
-    res.writeHead(200, htmlHeaders());
+    res.writeHead(200, htmlHeaders(t));
     res.end(renderBlogIndex(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), publishedPosts(t), { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
   }
   function servePost(req, res, t, slug, onDomain = false) {
@@ -1663,13 +1704,13 @@ export function createApp(env = process.env) {
     // A removed or mistyped post link goes to the blog instead of an error page.
     if (!post) { res.writeHead(302, { Location: sitePath(t, onDomain, '/blog'), 'Cache-Control': 'no-store' }); return res.end(); }
     const more = publishedPosts(t, 4).filter((p) => p.id !== post.id).slice(0, 3);
-    res.writeHead(200, htmlHeaders());
+    res.writeHead(200, htmlHeaders(t));
     res.end(renderPost(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), dated(t, post), { platformBase: baseUrl(req), onDomain, community: communityOf(t), more }));
   }
   function serveQuestions(req, res, t, onDomain = false) {
     liveTenant(t);
     if (!t.qa_on) throw new HttpError(404, 'Not found');
-    res.writeHead(200, htmlHeaders());
+    res.writeHead(200, htmlHeaders(t));
     res.end(renderQuestions(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), publishedQas(t), { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
   }
   function serveQuestion(req, res, t, slug, onDomain = false) {
@@ -1678,7 +1719,7 @@ export function createApp(env = process.env) {
     const q = db.prepare(`SELECT id, slug, title, answer, published_at, updated_at FROM questions WHERE tenant_id = ? AND slug = ? AND status = 'published'`).get(t.id, slug);
     if (!q) { res.writeHead(302, { Location: sitePath(t, onDomain, '/questions'), 'Cache-Control': 'no-store' }); return res.end(); }
     const more = publishedQas(t, 4).filter((x) => x.id !== q.id).slice(0, 3);
-    res.writeHead(200, htmlHeaders());
+    res.writeHead(200, htmlHeaders(t));
     res.end(renderQuestion(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), dated(t, q), { platformBase: baseUrl(req), onDomain, community: communityOf(t), more }));
   }
 
@@ -2959,11 +3000,24 @@ export function createApp(env = process.env) {
     ...securityHeaders,
     'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob: https://i.ytimg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; connect-src 'self'; frame-src https://www.youtube-nocookie.com; form-action 'self'; frame-ancestors 'none'",
   };
+  // A business that added its Google Analytics or Google Ads ID (Website → Google Analytics and Ads) also
+  // allows Google's tag hosts, as Google lists them for GA4 and Ads conversions. Everyone else keeps the
+  // strict policy above, so nothing from Google loads on their pages.
+  const googleTagHeaders = {
+    ...siteHeaders,
+    'Content-Security-Policy': "default-src 'self'; "
+      + "img-src 'self' data: blob: https://i.ytimg.com https://www.googletagmanager.com https://*.google-analytics.com https://*.google.com https://*.g.doubleclick.net https://www.googleadservices.com https://pagead2.googlesyndication.com; "
+      + "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+      + "script-src 'self' https://www.googletagmanager.com https://www.googleadservices.com https://www.google.com; "
+      + "connect-src 'self' https://www.googletagmanager.com https://*.google-analytics.com https://*.analytics.google.com https://*.google.com https://*.g.doubleclick.net https://pagead2.googlesyndication.com https://www.googleadservices.com https://ad.doubleclick.net; "
+      + "frame-src https://www.youtube-nocookie.com https://www.googletagmanager.com https://td.doubleclick.net; form-action 'self'; frame-ancestors 'none'",
+  };
+  const siteHeadersFor = (t) => (siteProfile.trackingConfig(siteProfile.parseProfile(t.site_profile)) ? googleTagHeaders : siteHeaders);
   const activeProducts = (t) => db.prepare('SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY sort, bookable DESC, price_cents DESC, name').all(t.id);
   const liveTenant = (t) => { if (!t || t.status !== 'active') throw new HttpError(404, 'Not found'); return t; };
   function serveSite(req, res, t, onDomain = false) {
     liveTenant(t);
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeadersFor(t) });
     res.end(renderSite(t, activeProducts(t), siteProfile.parseProfile(t.site_profile), { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
   }
   function serveCity(req, res, t, slug, onDomain = false) {
@@ -2971,7 +3025,7 @@ export function createApp(env = process.env) {
     const profile = siteProfile.parseProfile(t.site_profile);
     const city = siteProfile.cityBySlug(profile, slug);
     if (!city) throw new HttpError(404, 'Not found');
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeadersFor(t) });
     res.end(renderCityPage(t, activeProducts(t), profile, city, { platformBase: baseUrl(req), onDomain, community: communityOf(t, { city: slug }) }));
   }
   function serveService(req, res, t, slug, onDomain = false) {
@@ -2980,7 +3034,7 @@ export function createApp(env = process.env) {
     const product = products.find((x) => hasPage(x) && serviceSlug(x, products) === slug);
     // An old or mistyped service link goes to the business's services instead of an error page.
     if (!product) { res.writeHead(302, { Location: `${onDomain ? '/' : `/s/${t.slug}`}#services`, 'Cache-Control': 'no-store' }); return res.end(); }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeaders });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ...siteHeadersFor(t) });
     res.end(renderServicePage(t, products, siteProfile.parseProfile(t.site_profile), product, { platformBase: baseUrl(req), onDomain, community: communityOf(t) }));
   }
   // A PDF the business shares with customers (checklists, guides). Only files listed on its site.

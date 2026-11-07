@@ -57,6 +57,7 @@ export function defaultProfile() {
     service_phrase: '', base_city: '', base_state: '', radius_miles: null,
     cities: [], hours: { always_open: false, note: '', days: {} },
     credentials: [], faqs: [], videos: [], links: {}, search_console: '', resources: [],
+    tracking: { ga4: '', ads: '', ads_request: '', ads_call: '' },
     theme: 'classic', banner: { desktop: '', mobile: '', alt: '' }, highlights: [],
   };
 }
@@ -69,6 +70,7 @@ export function parseProfile(raw) {
   out.hours = { ...d.hours, ...(out.hours || {}) };
   out.hours.days = out.hours.days && typeof out.hours.days === 'object' ? out.hours.days : {};
   out.links = out.links && typeof out.links === 'object' ? out.links : {};
+  out.tracking = { ...d.tracking, ...(out.tracking && typeof out.tracking === 'object' ? out.tracking : {}) };
   for (const k of ['cities', 'credentials', 'faqs', 'videos', 'resources', 'highlights']) if (!Array.isArray(out[k])) out[k] = [];
   if (!THEMES.includes(out.theme)) out.theme = 'classic';
   out.banner = { ...d.banner, ...(out.banner && typeof out.banner === 'object' ? out.banner : {}) };
@@ -157,6 +159,26 @@ export function cleanProfile(input, current) {
   if (sc && !/^[\w-]{20,100}$/.test(sc)) errors.search_console = 'Paste the code from Google Search Console’s “HTML tag” option.';
   else out.search_console = sc;
 
+  // Google Analytics and Google Ads: IDs only, never code. Labels may be pasted as "AW-123/label".
+  // A save that doesn't include them (an older dashboard screen) keeps what's there.
+  const tb = b.tracking && typeof b.tracking === 'object' ? b.tracking : (current.tracking || {});
+  const ga4 = str(tb.ga4, 30).toUpperCase();
+  if (ga4 && !/^G-[A-Z0-9]{4,15}$/.test(ga4)) errors['tracking.ga4'] = 'A Google Analytics ID looks like G-ABC123XYZ9.';
+  else out.tracking.ga4 = ga4;
+  let ads = str(tb.ads, 30).toUpperCase();
+  const labels = {};
+  for (const [k, name] of [['ads_request', 'request'], ['ads_call', 'call button']]) {
+    let v = str(tb[k], 80);
+    const both = /^(AW-\d{6,15})\/([\w-]{4,60})$/i.exec(v);
+    if (both) { if (!ads) ads = both[1].toUpperCase(); v = both[2]; }
+    if (v && !/^[\w-]{4,60}$/.test(v)) errors[`tracking.${k}`] = `Paste the conversion label for the ${name}: the part after the slash in “AW-123456789/AbC-dEf12”.`;
+    else labels[k] = v;
+  }
+  if (/^\d{6,15}$/.test(ads)) ads = 'AW-' + ads;
+  if (ads && !/^AW-\d{6,15}$/.test(ads)) errors['tracking.ads'] = 'A Google Ads ID looks like AW-123456789.';
+  else if (!ads && (labels.ads_request || labels.ads_call)) errors['tracking.ads'] = 'Add your Google Ads ID (AW-…) for the conversion labels to work.';
+  else Object.assign(out.tracking, { ads, ads_request: labels.ads_request || '', ads_call: labels.ads_call || '' });
+
   const existing = new Map((current.resources || []).map((r) => [r.file, r]));
   const kept = new Set();
   list(b.resources, LIMITS.resources).forEach((r) => {
@@ -185,6 +207,12 @@ export function cleanProfile(input, current) {
 
 export function cityBySlug(profile, slug) {
   return profile.cities.find((c) => citySlug(c) === slug) || null;
+}
+// What the business's pages hand to Google's tag (public/site.js), or null when it has none.
+export function trackingConfig(profile) {
+  const tr = profile && profile.tracking;
+  if (!tr || !(tr.ga4 || tr.ads)) return null;
+  return { ga4: tr.ga4 || '', ads: tr.ads || '', request: tr.ads && tr.ads_request ? tr.ads_request : '', call: tr.ads && tr.ads_call ? tr.ads_call : '' };
 }
 export const servicePhrase = (p) => p.service_phrase || 'Mobile RV repair';
 export const cityIndexable = (c) => (c.intro || '').length >= CITY_INTRO_MIN;

@@ -325,6 +325,7 @@ function migrate(db) {
   migrateAffiliates(db);
   migrateOwnerFeatures(db);
   migrateCommunity(db);
+  migrateLeadSource(db);
 }
 
 // Affiliate (referral revenue-share) program. Agilities pays an affiliate business a share of
@@ -577,6 +578,15 @@ function migrateOwnerFeatures(db) {
       if (digits.length >= 10) ins.run(digits.slice(-10), r.text.slice(8).trim().toUpperCase(), r.at);
     }
     db.prepare(`INSERT OR IGNORE INTO platform_settings (key, value) VALUES ('sms_stops_backfilled', datetime('now'))`).run();
+  }
+}
+
+// Where a website request came from (src/lead-source.js): the visit's tracking tags, Google's click ID,
+// the page it landed on, the site that sent it, and what the customer picked for "How did you hear
+// about us?". All empty for call-ins the owner adds and for requests from before this existed.
+function migrateLeadSource(db) {
+  for (const col of ['src_source', 'src_medium', 'src_campaign', 'src_term', 'src_content', 'src_click_id', 'src_click_type', 'src_landing', 'src_referrer', 'src_at', 'heard_about']) {
+    addColumn(db, 'requests', col, 'TEXT');
   }
 }
 
