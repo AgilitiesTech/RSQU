@@ -1006,7 +1006,9 @@ test('scheduling: confirmation, reminder at 9am business time the day before, qu
 
   // "Schedule this job" from a request fills in the customer.
   const rq = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { type: 'repair', name: 'Jo Booker', phone: '801-555-0170', email: 'jo@example.test', location: '12 Elm St, Ogden', issue: 'Slide-out stuck' });
-  const pre = (await mike('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json;
+  // This test counts appointment messages only; the "we got your request" replies have their own test.
+  appDb.prepare(`UPDATE scheduled_messages SET status = 'canceled' WHERE kind = 'request_ack' AND ref_id = ?`).run(rq.json.id);
+  const pre =(await mike('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json;
   assert.deepEqual([pre.customer_name, pre.customer_phone, pre.customer_email, pre.address, pre.request_id], ['Jo Booker', '801-555-0170', 'jo@example.test', '12 Elm St, Ogden', rq.json.id]);
   assert.equal((await other('GET', `/api/jobs/new?request_id=${rq.json.id}`)).json.customer_name, '', 'another business gets nothing');
   assert.equal((await mike('POST', '/api/jobs', { ...pre, date: 'soon', time: '14:00' })).status, 400);
@@ -1997,5 +1999,138 @@ test('static pages, legal pages and seed script', async () => {
   srv3.close();
   assert.equal(winter2.status, 200);
   assert.match(await winter2.text(), /class="price"[^>]*>\$499(\.00)?</);
+
+  // Service pages for Mike's other services: drafts added only where a service has no write-up yet.
+  const services = (...a) => execFileSync(process.execPath, ['--no-warnings', 'scripts/apply-rsqu-services.js', ...a], { cwd: ROOT, env: { ...process.env, DATA_DIR: seedDir } }).toString();
+  const sdb2 = new (await import('node:sqlite')).DatabaseSync(path.join(seedDir, 'rsqu.db'));
+  sdb2.prepare(`UPDATE products SET details = 'Mike wrote his own awning page.' WHERE tenant_id = ? AND name = 'Awnings'`).run(own);
+  assert.match(services('--dry-run'), /^Would add pages for 8 services: Slides, Leveling systems, .*Roof and storm damage\. Kept 1 that already had a page: Awnings\.\n$/);
+  assert.equal(sdb2.prepare(`SELECT details FROM products WHERE tenant_id = ? AND name = 'Slides'`).get(own).details, null, 'a dry run changes nothing');
+  assert.match(services(), /^Added pages for 8 services: .*Kept 1 that already had a page: Awnings\. See them at \/s\/rsqu-mobile-rv-service\/services\/slides/);
+  assert.match(services(), /^Kept 9 that already had a page/);
+  assert.equal(sdb2.prepare(`SELECT details FROM products WHERE tenant_id = ? AND name = 'Awnings'`).get(own).details, 'Mike wrote his own awning page.');
+  assert.match(services('--print'), /==== Air conditioning and heating \(\/services\/air-conditioning-and-heating\) ====/);
+  sdb2.close();
+  const { handler: h4 } = createApp({ DATA_DIR: seedDir, SUPER_ADMIN_EMAIL: 's@seed.test', SUPER_ADMIN_PASSWORD: 'super-secret-pw', BASE_URL: 'https://dash.test' });
+  const srv4 = http.createServer(h4); await new Promise((r) => srv4.listen(0, r));
+  const base4 = `http://localhost:${srv4.address().port}/s/rsqu-mobile-rv-service`;
+  const slides = await fetch(`${base4}/services/slides`);
+  const roadside = await (await fetch(`${base4}/services/roadside-breakdowns`)).text();
+  const home4 = await (await fetch(base4)).text();
+  srv4.close();
+  assert.equal(slides.status, 200);
+  const slidesHtml = await slides.text();
+  assert.match(slidesHtml, /<h1>Slides<\/h1>/);
+  assert.match(slidesHtml, /<h2>Signs your slide-out needs attention<\/h2>/);
+  assert.match(slidesHtml, /<h2>What it costs<\/h2>\n<p>Mike’s diagnosis and onsite review is \$129/);
+  assert.match(roadside, /call 911 first/);
+  for (const p of ['slides', 'leveling-systems', 'black-and-grey-tanks', 'plumbing', 'air-conditioning-and-heating', 'electrical', 'roadside-breakdowns', 'roof-and-storm-damage', 'awnings']) assert.match(home4, new RegExp(`/services/${p}"`), p);
   fs.rmSync(seedDir, { recursive: true, force: true });
+});
+
+test('lead sources: saved with each website request, shown, exported; the customer gets a quick reply; Google tag only when set', async () => {
+  const tz = owner.tzOf(appDb.prepare('SELECT * FROM tenants WHERE id = ?').get(mikeId));
+  // The site sends where the visit came from: an ad click with tags, landing on a service page.
+  const mark = outbox.length;
+  const r = await anon('POST', `/api/public/t/${mikeSlug}/requests`, {
+    type: 'repair', name: 'Pat Lee', phone: '(801) 555-0190', email: 'Pat@Example.test', location: 'Cherry Hill, site 12', issue: 'Slide stuck', heard_about: 'Campground or RV park',
+    source: { utm_source: 'google', utm_medium: 'cpc', utm_campaign: 'Mobile RV repair', utm_term: 'rv slide out repair', gclid: 'Cj0KCQiA_test-click-id', landing: '/services/slides?x=1', referrer: 'www.google.com', t: Date.now() - 3600_000, tagged: true },
+  });
+  assert.equal(r.status, 201);
+  const got = (await mike('GET', '/api/requests/' + r.json.id)).json;
+  assert.deepEqual([got.source_label, got.src_click_id, got.src_click_type, got.src_landing, got.src_referrer, got.src_term, got.heard_about, got.email],
+    ['Google Ads', 'Cj0KCQiA_test-click-id', 'gclid', '/services/slides', 'www.google.com', 'rv slide out repair', 'Campground or RV park', 'pat@example.test']);
+  assert.ok(Math.abs(Date.parse(got.src_at) - (Date.now() - 3600_000)) < 5000);
+  const alertPhone = appDb.prepare('SELECT notify_phone FROM tenants WHERE id = ?').get(mikeId).notify_phone;
+  if (alertPhone) assert.ok(outbox.slice(mark).some((m) => m.to === alertPhone && /From: Google Ads/.test(m.body)), 'the owner’s alert says where it came from');
+  assert.equal((await mike('GET', '/api/requests?filter=all')).json.rows.find((x) => x.id === r.json.id).source_label, 'Google Ads');
+
+  // Junk is dropped, never refused; a Google profile link and a partner link get plain labels.
+  const junk = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { name: '=HYPERLINK("x")', phone: '801-555-0191', location: 'Ogden', heard_about: 'My cousin', source: { gclid: '<script>', landing: '//evil.test/x', referrer: 'bad host!', t: 'soon', utm_source: 'x'.repeat(500) } });
+  const j = (await mike('GET', '/api/requests/' + junk.json.id)).json;
+  assert.deepEqual([j.src_click_id, j.src_landing, j.src_referrer, j.src_at, j.heard_about, j.src_source.length], [null, null, null, null, null, 120]);
+  const gbp = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { phone: '801-555-0192', location: 'Layton', source: { utm_source: 'google', utm_medium: 'organic', utm_campaign: 'gbp', landing: '/' } });
+  assert.equal((await mike('GET', '/api/requests/' + gbp.json.id)).json.source_label, 'Google Business Profile');
+  const partner = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { phone: '801-555-0193', location: 'Kaysville', source: { utm_source: 'cherry-hill', utm_medium: 'referral', landing: '/areas/layton-ut' } });
+  assert.equal((await mike('GET', '/api/requests/' + partner.json.id)).json.source_label, 'Partner: cherry-hill');
+  const plain = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { phone: '801-555-0194', location: 'Ogden' });
+  assert.equal((await mike('GET', '/api/requests/' + plain.json.id)).json.source_label, '', 'an older site that sends nothing');
+
+  // The spreadsheet: every request with its source; formulas neutralized; only the business's own.
+  const csv = await mike('GET', '/api/requests.csv');
+  assert.equal(csv.status, 200);
+  assert.match(csv.headers.get('content-type'), /text\/csv/);
+  assert.match(csv.text, /^id,received,type,service,status,name,phone,email,source,heard_about,utm_source,utm_medium,utm_campaign,utm_term,utm_content,click_id,click_id_type,landing_page,referrer,first_visit\n/);
+  assert.match(csv.text, /Pat Lee,\(801\) 555-0190,pat@example\.test,Google Ads,Campground or RV park,google,cpc,Mobile RV repair,rv slide out repair,,Cj0KCQiA_test-click-id,gclid,\/services\/slides,www\.google\.com,/);
+  assert.match(csv.text, /"'=HYPERLINK\(""x""\)"/);
+  assert.doesNotMatch((await other('GET', '/api/requests.csv')).text, /Pat Lee/);
+  assert.equal((await anon('GET', '/api/requests.csv')).status, 401);
+
+  // The quick reply: a text and an email, sent by the background worker.
+  const ack = (id) => appDb.prepare(`SELECT * FROM scheduled_messages WHERE kind = 'request_ack' AND ref_id = ? ORDER BY id`).all(id);
+  assert.deepEqual(ack(r.json.id).map((m) => `${m.channel}:${m.to_addr}`), ['sms:+18015550190', 'email:pat@example.test']);
+  const noon = localAt(new Date(Date.now() + 864e5), '12:00', tz);
+  appDb.prepare(`UPDATE scheduled_messages SET meta = ? WHERE kind = 'request_ack' AND ref_id = ? AND channel = 'sms'`).run(JSON.stringify({ until: noon.getTime() + 3600_000 }), r.json.id);
+  const m2 = outbox.length;
+  await runDue(noon);
+  const text = sentTo('+18015550190', m2);
+  assert.equal(text.length, 1);
+  assert.match(text[0].body, /: Thanks Pat, we got your request and will call or text you soon\. .*Reply STOP to opt out\.$/);
+  const mail = sentTo('pat@example.test', m2);
+  assert.equal(mail.length, 1);
+  assert.match(mail[0].subject, /^We got your request: /);
+  assert.match(mail[0].text, /^Hi Pat,\n\nThanks for reaching out to .*at \(801\) 555-0190\.\n\nWhere: Cherry Hill, site 12\nWhat’s going on: Slide stuck\n\n/);
+  // A text that couldn't go out within 2 hours is dropped, not sent late.
+  assert.deepEqual(ack(junk.json.id).map((m) => [m.channel, m.status]), [['sms', 'skipped']]);
+  assert.match(ack(junk.json.id)[0].error, /Too late/);
+  // A number that replied STOP gets no text at all.
+  appDb.prepare('INSERT OR REPLACE INTO sms_stops (phone_key, word, at) VALUES (?,?,?)').run('8015550195', 'STOP', new Date().toISOString());
+  const stopped = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { phone: '801-555-0195', location: 'Ogden' });
+  assert.equal(ack(stopped.json.id).length, 0);
+  // Anyone can type any number into a public form: no replies abroad, and one a day per number.
+  const abroad = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { phone: '+44 20 7946 0958', location: 'London' });
+  assert.equal(ack(abroad.json.id).length, 0);
+  const again = await anon('POST', `/api/public/t/${mikeSlug}/requests`, { phone: '801 555 0190', email: 'PAT@example.test', location: 'Same person, second try' });
+  assert.equal(ack(again.json.id).length, 0, 'Pat already got a reply today');
+  // Call-ins the owner adds get no reply.
+  const callIn = await mike('POST', '/api/requests', { name: 'Walk-up', phone: '801-555-0196', location: 'Shop' });
+  assert.equal(ack(callIn.json.id).length, 0);
+
+  // The form asks for an email and "How did you hear about us?"; no Google tag until the owner adds one.
+  let site = await anon('GET', `/s/${mikeSlug}`);
+  assert.match(site.text, /name="email" type="email"/);
+  assert.match(site.text, /<select id="heard" name="heard_about"><option value="">Choose one<\/option><option>Google search<\/option>/);
+  assert.doesNotMatch(site.text, /hp-track/);
+  assert.doesNotMatch(site.headers.get('content-security-policy'), /googletagmanager/);
+  const ws = (await mike('GET', '/api/website')).json.profile;
+  assert.deepEqual(ws.tracking, { ga4: '', ads: '', ads_request: '', ads_call: '' });
+  const bad = await mike('PUT', '/api/website', { ...ws, tracking: { ga4: 'UA-12345-1', ads: '', ads_request: 'AbCdEf12', ads_call: 'no spaces allowed' } });
+  assert.equal(bad.status, 422);
+  assert.deepEqual(Object.keys(bad.json.field_errors).sort(), ['tracking.ads', 'tracking.ads_call', 'tracking.ga4']);
+  const ok = await mike('PUT', '/api/website', { ...ws, tracking: { ga4: 'g-abc123xyz9', ads: '', ads_request: 'AW-123456789/AbC-dEf12', ads_call: '' } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.json));
+  assert.deepEqual((await mike('GET', '/api/website')).json.profile.tracking, { ga4: 'G-ABC123XYZ9', ads: 'AW-123456789', ads_request: 'AbC-dEf12', ads_call: '' });
+  const ws2 = (await mike('GET', '/api/website')).json.profile;
+  const { tracking: _drop, ...noTracking } = ws2;
+  assert.equal((await mike('PUT', '/api/website', noTracking)).status, 200);
+  assert.equal((await mike('GET', '/api/website')).json.profile.tracking.ga4, 'G-ABC123XYZ9', 'a save without the Google section keeps it');
+  site = await anon('GET', `/s/${mikeSlug}`);
+  assert.match(site.text, /<script type="application\/json" id="hp-track">\{"ga4":"G-ABC123XYZ9","ads":"AW-123456789","request":"AbC-dEf12","call":""\}<\/script>\n<script src="\/static\/site\.js"><\/script>/);
+  const csp = site.headers.get('content-security-policy');
+  assert.match(csp, /script-src 'self' https:\/\/www\.googletagmanager\.com https:\/\/www\.googleadservices\.com https:\/\/www\.google\.com;/);
+  assert.match(csp, /connect-src 'self' https:\/\/www\.googletagmanager\.com https:\/\/\*\.google-analytics\.com/);
+  assert.match(csp, /frame-ancestors 'none'/);
+  for (const p of ['/areas/ogden-ut', '/nope']) {
+    const page = await anon('GET', `/s/${mikeSlug}${p}`);
+    if (page.status === 200) assert.match(page.headers.get('content-security-policy'), /googletagmanager/, p);
+  }
+  // Other businesses keep the strict policy.
+  const otherSlug = appDb.prepare(`SELECT slug FROM tenants WHERE name = 'Other Co'`).get().slug;
+  const otherSite = await anon('GET', `/s/${otherSlug}`);
+  if (otherSite.status === 200) assert.doesNotMatch(otherSite.headers.get('content-security-policy'), /googletagmanager/);
+  // Removing the IDs takes Google off the page again.
+  assert.equal((await mike('PUT', '/api/website', { ...ws2, tracking: { ga4: '', ads: '', ads_request: '', ads_call: '' } })).status, 200);
+  site = await anon('GET', `/s/${mikeSlug}`);
+  assert.doesNotMatch(site.text, /hp-track/);
+  assert.doesNotMatch(site.headers.get('content-security-policy'), /googletagmanager/);
 });

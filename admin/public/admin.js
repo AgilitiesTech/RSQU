@@ -312,7 +312,7 @@
     setNewCount(data.counts.new);
     const tab = (k, label, n) => `<button type="button" data-filter="${k}" aria-pressed="${reqFilter === k}">${label} (${n})</button>`;
     view.innerHTML = `
-      <div class="row between"><h1>Requests</h1><a class="btn sm" href="#/requests/new">+ Add a call-in</a></div>
+      <div class="row between"><h1>Requests</h1><div class="row"><a class="btn sm ghost" href="/api/requests.csv" download>Download (CSV)</a><a class="btn sm" href="#/requests/new">+ Add a call-in</a></div></div>
       <div class="tabs" role="group" aria-label="Filter">${tab('new', 'New', data.counts.new)}${tab('open', 'Open', data.counts.open)}${tab('all', 'All', data.counts.all)}</div>
       <div class="list">${data.rows.length ? data.rows.map((r) => `
         <a class="item" href="#/requests/${r.id}">
@@ -320,7 +320,8 @@
             <div class="row" style="gap:8px"><span class="item-title">${esc(r.name || 'No name')}</span>
               <span class="tag ${r.type}">${r.type === 'booking' ? esc(r.product_name ? 'Book: ' + r.product_name : 'Booking') : 'Repair'}</span>
               ${r.status === 'new' ? '<span class="tag new">New</span>' : `<span class="tag ${r.status}">${STATUS[r.status] || r.status}</span>`}
-              ${r.has_photo ? '<span class="tag">Photo</span>' : ''}</div>
+              ${r.has_photo ? '<span class="tag">Photo</span>' : ''}
+              ${r.source_label && r.source_label !== 'Direct or unknown' ? `<span class="tag">${esc(r.source_label)}</span>` : ''}</div>
             <div class="small">${esc((r.location || '').split('\n')[0]).slice(0, 140)}</div>
             <div class="small muted">${esc(r.rig || '')}${r.rig && r.issue ? ' · ' : ''}${esc((r.issue || '').slice(0, 90))}${r.preferred_date ? ' · wants ' + esc(r.preferred_date) : ''}</div>
           </div>
@@ -385,6 +386,8 @@
             ${r.issue ? `<dt>Problem</dt><dd>${esc(r.issue)}</dd>` : ''}
             ${r.preferred_date ? `<dt>Wants</dt><dd>${esc(r.preferred_date)}</dd>` : ''}
             ${r.email ? `<dt>Email</dt><dd>${esc(r.email)}</dd>` : ''}
+            ${r.source_label ? `<dt>Found you</dt><dd>${esc(r.source_label)}${[r.src_campaign && 'campaign ' + r.src_campaign, r.src_term && 'search “' + r.src_term + '”', r.src_landing && 'landed on ' + r.src_landing].filter(Boolean).map((x) => '<br><span class="small muted">' + esc(x) + '</span>').join('')}</dd>` : ''}
+            ${r.heard_about ? `<dt>They said</dt><dd>${esc(r.heard_about)}</dd>` : ''}
           </dl>
           ${r.photo ? `<a href="/api/uploads/${esc(r.photo)}" target="_blank" rel="noopener"><img class="photo" style="margin-top:12px" src="/api/uploads/${esc(r.photo)}" alt="Photo sent by the customer"></a>` : ''}
           <div style="margin-top:14px"><label for="rq-notes">Your notes</label><textarea id="rq-notes" rows="3">${esc(r.notes || '')}</textarea>
@@ -969,6 +972,17 @@
           <div><label for="w-sc">Verification tag</label><input id="w-sc" data-k="search_console" maxlength="300" value="${esc(P.search_console)}" placeholder='<meta name="google-site-verification" content="…">'></div>
         </section>
         <section class="card stack">
+          <h2>Google Analytics and Google Ads</h2>
+          <p class="small">Optional. Add your IDs to count visits in Google Analytics and to tell Google Ads when someone sends a request or taps your call button. Leave them empty and nothing from Google loads on your site. Every request already shows where it came from, either way.</p>
+          <div class="grid2">
+            <div><label for="w-ga4">Google Analytics ID</label><input id="w-ga4" data-k="tracking.ga4" maxlength="30" value="${esc(P.tracking.ga4)}" placeholder="G-ABC123XYZ9" autocomplete="off" spellcheck="false"></div>
+            <div><label for="w-ads">Google Ads ID</label><input id="w-ads" data-k="tracking.ads" maxlength="30" value="${esc(P.tracking.ads)}" placeholder="AW-123456789" autocomplete="off" spellcheck="false"></div>
+            <div><label for="w-adsr">Conversion label: request sent</label><input id="w-adsr" data-k="tracking.ads_request" maxlength="80" value="${esc(P.tracking.ads_request)}" placeholder="AbC-dEf12GhI" autocomplete="off" spellcheck="false"></div>
+            <div><label for="w-adsc">Conversion label: call button tapped (optional)</label><input id="w-adsc" data-k="tracking.ads_call" maxlength="80" value="${esc(P.tracking.ads_call)}" placeholder="XyZ-123abc" autocomplete="off" spellcheck="false"></div>
+          </div>
+          <p class="small muted">In Google Ads, open Goals, then Conversions, then the conversion, and choose “Use Google tag”. The ID is the part before the slash in <code>AW-123456789/AbC-dEf12GhI</code> and the label is the part after. You can paste the whole thing into a label box.</p>
+        </section>
+        <section class="card stack">
           <h2>Checklists and guides (PDFs)</h2>
           <p class="small muted">Files customers can download and print from your site. Up to ${st.limits.resources}, 10 MB each.</p>
           <div class="stack" id="docs"></div>
@@ -1048,6 +1062,7 @@
         hours: { always_open: document.getElementById('w-247').checked, note: document.getElementById('w-hnote').value, days },
         links: Object.fromEntries([...view.querySelectorAll('[data-link]')].map((i) => [i.dataset.link, i.value])),
         search_console: document.getElementById('w-sc').value,
+        tracking: { ga4: document.getElementById('w-ga4').value, ads: document.getElementById('w-ads').value, ads_request: document.getElementById('w-adsr').value, ads_call: document.getElementById('w-adsc').value },
         resources: [...view.querySelectorAll('[data-doc]')].map((d) => ({ file: d.dataset.doc, title: d.querySelector('[data-f=title]').value, description: d.querySelector('[data-f=description]').value })),
       };
       try { await api('/api/website', { method: 'PUT', body }); await websiteView(); flash(document.getElementById('w-msg'), 'Saved. Your website is updated.'); }

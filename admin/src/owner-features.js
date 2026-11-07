@@ -127,6 +127,20 @@ export function jobMessage(kind, channel, { t, job, tz, updated = false, minutes
   };
 }
 
+// The "we got your request" reply a customer gets right after sending the website form.
+export function requestAck(channel, { t, r }) {
+  const hi = first(r.name);
+  const now = t.phone ? ` Need help right now? Call ${t.phone}.` : '';
+  if (channel === 'sms') return { text: `${t.name}: Thanks${hi ? ' ' + hi : ''}, we got your request and will call or text you soon.${now} Reply STOP to opt out.` };
+  const facts = [r.location && `Where: ${r.location}`, r.rig && `Vehicle: ${r.rig}`, r.issue && `What’s going on: ${r.issue}`].filter(Boolean);
+  return {
+    subject: `We got your request: ${t.name}`,
+    text: [`Hi${hi ? ' ' + hi : ''},`, '', `Thanks for reaching out to ${t.name}. We got your request and will call or text you soon at ${r.phone}.`,
+      ...(facts.length ? ['', ...facts] : []), '',
+      t.phone ? `Need help right now? Call or text ${t.phone}.` : 'Reply to this email if anything changes.', '', t.name].join('\n'),
+  };
+}
+
 // Emails carry the business's name and mailing address (`address` from postalAddress()), like update emails.
 export function reviewMessage(channel, { t, name, link, message, unsubUrl, address }) {
   const hi = first(name);

@@ -1,7 +1,8 @@
 // Server-rendered, white-label website for a business on the platform: the home page, one page per
 // city it serves, and the files it shares with customers. Local-search markup (schema.org JSON-LD,
 // canonical URLs, sitemaps) is generated from the business's own data.
-import { DAYS, citySlug, cityIndexable, servicePhrase, slugify } from './site-profile.js';
+import { DAYS, citySlug, cityIndexable, servicePhrase, slugify, trackingConfig } from './site-profile.js';
+import { HEARD_ABOUT } from './lead-source.js';
 import { richText, plainText, answerIndexable } from './community.js';
 
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -203,6 +204,8 @@ function requestCard(t, bookable) {
       <label for="photo">Photo (optional)</label><input id="photo" name="photo" type="file" accept="image/*">
       <label for="name">Your name</label><input id="name" name="name" autocomplete="name">
       <label for="phone">Phone <span style="color:var(--p)">(required)</span></label><input id="phone" name="phone" type="tel" autocomplete="tel">
+      <label for="email">Email (optional, for a copy of your request)</label><input id="email" name="email" type="email" autocomplete="email">
+      <label for="heard">How did you hear about us? (optional)</label><select id="heard" name="heard_about"><option value="">Choose one</option>${HEARD_ABOUT.map((h) => `<option>${esc(h)}</option>`).join('')}</select>
       <p class="err" id="err" role="alert" hidden></p>
       <p class="hint" style="margin-top:14px">By sending, you agree we may call or text you about this request. <a href="/legal/privacy">Privacy</a></p>
       <button class="btn btn-p" type="submit" style="margin-top:8px">Send request</button>
@@ -242,9 +245,16 @@ function footer(t, profile, u, cm = NO_COMMUNITY) {
   ${hours || profile.hours.note ? `<div><h2>Hours</h2>${hours}${profile.hours.note ? `<p style="margin:6px 0 0">${esc(profile.hours.note)}</p>` : ''}</div>` : ''}
   ${tel ? `<div><a class="big" href="tel:${tel}">${esc(t.phone)}</a></div>` : ''}
 </div></footer>
-<script src="/static/site.js"></script>
+${trackingTag(profile)}<script src="/static/site.js"></script>
 </body>
 </html>`;
+}
+
+// The business's Google Analytics / Google Ads IDs for public/site.js, which loads Google's tag. Data
+// only (never run as code); the page's security policy allows Google's hosts only when this is present.
+function trackingTag(profile) {
+  const c = trackingConfig(profile);
+  return c ? `<script type="application/json" id="hp-track">${JSON.stringify(c).replace(/</g, '\\u003c')}</script>\n` : '';
 }
 
 function boldCss(t) {
